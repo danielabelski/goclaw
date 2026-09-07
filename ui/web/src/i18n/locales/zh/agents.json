@@ -608,7 +608,12 @@
     "insertContact": "搜索联系人以插入...",
     "contentPlaceholder": "文件内容...",
     "systemPromptPreview": "系统提示词",
-    "tokens": "tokens"
+    "tokens": "tokens",
+    "toolsAvailable": "{{count}} 个可用工具",
+    "toolsSection": "工具",
+    "toolParameters": "参数",
+    "noParameters": "无参数",
+    "noTools": "没有可用工具"
   },
   "fileEditor": {
     "editWithAi": "AI 编辑",
@@ -730,6 +735,7 @@
       "description": "控制子Agent生成限制和行为",
       "maxConcurrent": "最大并发数",
       "maxSpawnDepth": "最大生成深度",
+      "maxSpawnDepthTip": "每个 Agent 自己生成的子 Agent 树的最大深度。通过 Agent Link 委派会开始一棵新树，并使用目标 Agent 的设置。深度为 1 时，Agent 可以生成直接子 Agent，但这些子 Agent 不能继续生成。",
       "maxChildrenPerAgent": "每Agent最大子数",
       "archiveAfter": "归档时间（分钟）",
       "maxRetries": "最大重试次数",
@@ -792,13 +798,17 @@
     },
     "compaction": {
       "title": "压缩",
-      "description": "上下文窗口压缩和压缩前记忆设置",
+      "description": "最终请求上下文保护、历史压缩和记忆刷新设置",
       "maxHistoryShare": "最大历史份额 (0-1)",
-      "maxHistoryShareTip": "上下文窗口用于对话历史的最大比例（如0.85 = 85%）。超过时触发压缩。",
+      "maxHistoryShareTip": "仅用于回合后的历史压缩阈值，不是最终请求的总限制。",
       "keepLastMessages": "保留最后消息数",
       "keepLastMessagesTip": "压缩后保留的最近消息数。旧消息被摘要替换。",
+      "timeoutSeconds": "超时秒数",
+      "timeoutSecondsTip": "等待上下文压缩摘要的最长时间，超时后保留原始历史。",
       "memoryFlush": "压缩前记忆",
-      "memoryFlushTip": "压缩前，Agent可以将重要上下文保存到记忆文件。同时触发知识图谱提取。"
+      "memoryFlushTip": "压缩前，Agent可以将重要上下文保存到记忆文件。同时触发知识图谱提取。",
+      "maxRequestShare": "最大请求份额 (0-1)",
+      "maxRequestShareTip": "最终发送给模型的请求最多可占用智能体上下文窗口的比例。超过时，系统会先缩减上下文再调用模型。"
     },
     "inboundDebounce": {
       "title": "入站防抖",

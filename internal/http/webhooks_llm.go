@@ -14,6 +14,7 @@ import (
 
 	"github.com/nextlevelbuilder/goclaw/internal/agent"
 	"github.com/nextlevelbuilder/goclaw/internal/i18n"
+	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/scheduler"
 	"github.com/nextlevelbuilder/goclaw/internal/security"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
@@ -21,8 +22,9 @@ import (
 )
 
 const (
-	// webhookLLMTimeout is the hard deadline for synchronous LLM invocations.
-	webhookLLMTimeout = 30 * time.Second
+	// webhookLLMTimeout is the default hard deadline for webhook LLM invocations
+	// (sync + admin test). Overridable per-handler via syncTimeout from config.
+	webhookLLMTimeout = 600 * time.Second
 
 	// webhookLLMResponseTruncate is the maximum bytes stored in the audit row response column.
 	webhookLLMResponseTruncate = 32 * 1024
@@ -69,18 +71,23 @@ type webhookInputMessage struct {
 
 // webhookLLMSyncResp is the 200 response for synchronous LLM calls.
 type webhookLLMSyncResp struct {
-	CallID       string           `json:"call_id"`
-	AgentID      string           `json:"agent_id"`
-	Output       string           `json:"output"`
-	Usage        *webhookLLMUsage `json:"usage,omitempty"`
-	FinishReason string           `json:"finish_reason"`
+	CallID       string                `json:"call_id"`
+	AgentID      string                `json:"agent_id"`
+	Output       string                `json:"output"`
+	Usage        *webhookLLMUsage      `json:"usage,omitempty"`
+	FinishReason string                `json:"finish_reason"`
+	Calls        []providers.CallUsage `json:"calls,omitempty"`
+	TotalCostUSD float64               `json:"total_cost_usd,omitempty"`
 }
 
 // webhookLLMUsage mirrors providers.Usage for the response envelope.
 type webhookLLMUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens                      int  `json:"prompt_tokens"`
+	CompletionTokens                  int  `json:"completion_tokens"`
+	TotalTokens                       int  `json:"total_tokens"`
+	CacheReadTokens                   int  `json:"cache_read_input_tokens,omitempty"`
+	CacheCreationTokens               int  `json:"cache_creation_input_tokens,omitempty"`
+	PromptTokensIncludeCachedSegments bool `json:"prompt_tokens_include_cached_segments,omitempty"`
 }
 
 // webhookLLMAsyncResp is the 202 response for asynchronous LLM calls.
@@ -100,8 +107,14 @@ type WebhookLLMHandler struct {
 	limiter     *webhookLimiter
 	lane        *scheduler.Lane
 	encKey      string // AES-256-GCM key for decrypting encrypted_secret at HMAC verify time
-	// syncTimeout overrides webhookLLMTimeout (30s) — set in tests only.
+	// syncTimeout overrides the webhookLLMTimeout default (600s); set from
+	// gateway.webhook_sync_timeout_sec config (and in tests). 0 → use default.
 	syncTimeout time.Duration
+	// stream controls whether sync + test webhook agent runs stream provider
+	// responses so the upstream can populate/serve its prompt cache. The response
+	// returned to the caller is unchanged (assembled JSON). Set from
+	// gateway.webhook_stream config via webhooks.ResolveStream (default true).
+	stream bool
 }
 
 // NewWebhookLLMHandler constructs a WebhookLLMHandler.
@@ -112,6 +125,8 @@ func NewWebhookLLMHandler(
 	webhooks store.WebhookStore,
 	limiter *webhookLimiter,
 	lane *scheduler.Lane,
+	syncTimeout time.Duration,
+	stream bool,
 ) *WebhookLLMHandler {
 	if lane == nil {
 		lane = scheduler.NewLane(webhookLaneName, webhookLaneDefaultConcurrency)
@@ -122,6 +137,8 @@ func NewWebhookLLMHandler(
 		webhooks:    webhooks,
 		limiter:     limiter,
 		lane:        lane,
+		syncTimeout: syncTimeout,
+		stream:      stream,
 	}
 }
 
@@ -297,7 +314,7 @@ func (h *WebhookLLMHandler) handleSync(
 		ChatID:            webhook.ID.String(),
 		RunID:             runID,
 		UserID:            req.UserID,
-		Stream:            false,
+		Stream:            h.stream,
 		ModelOverride:     req.Model,
 		ExtraSystemPrompt: extraSystemPrompt,
 		HistoryLimit:      0,
@@ -404,11 +421,26 @@ func (h *WebhookLLMHandler) handleSync(
 		Output:       out.result.Content,
 		FinishReason: "stop",
 	}
-	if out.result.Usage != nil {
+	if len(out.result.Calls) > 0 {
+		resp.Calls = out.result.Calls
+		resp.TotalCostUSD = providers.SumCallCost(out.result.Calls)
+		sum := providers.SumCallUsage(out.result.Calls)
 		resp.Usage = &webhookLLMUsage{
-			PromptTokens:     out.result.Usage.PromptTokens,
-			CompletionTokens: out.result.Usage.CompletionTokens,
-			TotalTokens:      out.result.Usage.TotalTokens,
+			PromptTokens:                      sum.PromptTokens,
+			CompletionTokens:                  sum.CompletionTokens,
+			TotalTokens:                       sum.TotalTokens,
+			CacheReadTokens:                   sum.CacheReadTokens,
+			CacheCreationTokens:               sum.CacheCreationTokens,
+			PromptTokensIncludeCachedSegments: sum.PromptTokensIncludeCachedSegments,
+		}
+	} else if out.result.Usage != nil {
+		resp.Usage = &webhookLLMUsage{
+			PromptTokens:                      out.result.Usage.PromptTokens,
+			CompletionTokens:                  out.result.Usage.CompletionTokens,
+			TotalTokens:                       out.result.Usage.TotalTokens,
+			CacheReadTokens:                   out.result.Usage.CacheReadTokens,
+			CacheCreationTokens:               out.result.Usage.CacheCreationTokens,
+			PromptTokensIncludeCachedSegments: out.result.Usage.PromptTokensIncludeCachedSegments,
 		}
 	}
 
@@ -509,6 +541,152 @@ func (h *WebhookLLMHandler) handleAsync(
 		CallID: callID.String(),
 		Status: "queued",
 	})
+}
+
+// RunTest performs a synchronous test invocation of an llm-kind webhook on behalf of an
+// admin (POST /v1/webhooks/{id}/test). The caller (WebhooksAdminHandler) has already
+// authorized the request and verified webhook ownership — no webhook secret is involved.
+// It resolves the bound agent, runs it within the standard sync timeout, writes an audit
+// row (mode=sync), and returns the response. Errors are returned (not written to HTTP).
+func (h *WebhookLLMHandler) RunTest(ctx context.Context, wh *store.WebhookData, input, model string) (*webhookLLMSyncResp, error) {
+	if wh == nil || wh.AgentID == nil {
+		return nil, errors.New("webhook has no bound agent")
+	}
+	agentID := wh.AgentID.String()
+
+	ag, agErr := h.agentRouter.Get(ctx, agentID)
+	if agErr != nil {
+		return nil, fmt.Errorf("agent not found: %w", agErr)
+	}
+	// P0 cross-tenant isolation: agent must belong to webhook's tenant.
+	if ag.UUID() != *wh.AgentID {
+		slog.Warn("security.webhook.tenant_mismatch", "webhook_id", wh.ID, "webhook_tenant", wh.TenantID, "agent_id", agentID)
+		return nil, errors.New("agent tenant mismatch")
+	}
+
+	callID := store.GenNewID()
+	deliveryID := store.GenNewID()
+	now := time.Now()
+	runID := uuid.NewString()
+	sessionKey := resolveWebhookSessionKey("", agentID, wh.ID, runID)
+
+	requestPayload, _ := buildAuditPayload(nil, map[string]any{"test": true, "input_len": len(input)})
+	callRecord := &store.WebhookCallData{
+		ID:             callID,
+		TenantID:       wh.TenantID,
+		WebhookID:      wh.ID,
+		AgentID:        wh.AgentID,
+		DeliveryID:     deliveryID,
+		Mode:           "sync",
+		Status:         "running",
+		RequestPayload: requestPayload,
+		CreatedAt:      now,
+		StartedAt:      &now,
+	}
+
+	rr := agent.RunRequest{
+		SessionKey:    sessionKey,
+		Message:       input,
+		Channel:       "webhook",
+		ChatID:        wh.ID.String(),
+		RunID:         runID,
+		Stream:        h.stream,
+		ModelOverride: model,
+		TraceName:     "webhook.llm.test",
+		TraceTags:     []string{"webhook", "test"},
+	}
+
+	timeout := webhookLLMTimeout
+	if h.syncTimeout > 0 {
+		timeout = h.syncTimeout
+	}
+
+	type runOutcome struct {
+		result *agent.RunResult
+		err    error
+	}
+	outCh := make(chan runOutcome, 1)
+
+	laneCtx, laneCancel := context.WithTimeout(ctx, timeout)
+	defer laneCancel()
+
+	submitErr := h.lane.Submit(laneCtx, func() {
+		runCtx, runCancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+		defer runCancel()
+		result, err := ag.Run(runCtx, rr)
+		outCh <- runOutcome{result: result, err: err}
+	})
+	if submitErr != nil {
+		completedAt := time.Now()
+		errMsg := submitErr.Error()
+		callRecord.Status = "failed"
+		callRecord.Attempts = 1
+		callRecord.CompletedAt = &completedAt
+		callRecord.LastError = &errMsg
+		persistWebhookCall(ctx, h.callStore, callRecord, false, "webhook.llm.test_audit_write_failed")
+		return nil, fmt.Errorf("webhook lane saturated: %w", submitErr)
+	}
+
+	var out runOutcome
+	select {
+	case out = <-outCh:
+	case <-laneCtx.Done():
+		out = runOutcome{err: context.DeadlineExceeded}
+	}
+
+	if out.err != nil {
+		completedAt := time.Now()
+		errMsg := out.err.Error()
+		callRecord.Status = "failed"
+		callRecord.Attempts = 1
+		callRecord.CompletedAt = &completedAt
+		callRecord.LastError = &errMsg
+		persistWebhookCall(ctx, h.callStore, callRecord, false, "webhook.llm.test_audit_write_failed")
+		return nil, out.err
+	}
+
+	resp := &webhookLLMSyncResp{
+		CallID:       callID.String(),
+		AgentID:      agentID,
+		Output:       out.result.Content,
+		FinishReason: "stop",
+	}
+	if len(out.result.Calls) > 0 {
+		resp.Calls = out.result.Calls
+		resp.TotalCostUSD = providers.SumCallCost(out.result.Calls)
+		sum := providers.SumCallUsage(out.result.Calls)
+		resp.Usage = &webhookLLMUsage{
+			PromptTokens:                      sum.PromptTokens,
+			CompletionTokens:                  sum.CompletionTokens,
+			TotalTokens:                       sum.TotalTokens,
+			CacheReadTokens:                   sum.CacheReadTokens,
+			CacheCreationTokens:               sum.CacheCreationTokens,
+			PromptTokensIncludeCachedSegments: sum.PromptTokensIncludeCachedSegments,
+		}
+	} else if out.result.Usage != nil {
+		resp.Usage = &webhookLLMUsage{
+			PromptTokens:                      out.result.Usage.PromptTokens,
+			CompletionTokens:                  out.result.Usage.CompletionTokens,
+			TotalTokens:                       out.result.Usage.TotalTokens,
+			CacheReadTokens:                   out.result.Usage.CacheReadTokens,
+			CacheCreationTokens:               out.result.Usage.CacheCreationTokens,
+			PromptTokensIncludeCachedSegments: out.result.Usage.PromptTokensIncludeCachedSegments,
+		}
+	}
+
+	respBytes, _ := json.Marshal(resp)
+	if len(respBytes) > webhookLLMResponseTruncate {
+		respBytes = respBytes[:webhookLLMResponseTruncate]
+	}
+	completedAt := time.Now()
+	callRecord.Status = "done"
+	callRecord.Attempts = 1
+	callRecord.Response = respBytes
+	callRecord.CompletedAt = &completedAt
+	persistWebhookCall(ctx, h.callStore, callRecord, false, "webhook.llm.test_audit_write_failed")
+
+	slog.Info("webhook.llm.test", "call_id", callID, "agent_id", agentID, "webhook_id", wh.ID, "output_len", len(out.result.Content))
+	return resp, nil
 }
 
 // buildInput parses the raw JSON input into a user message and optional extra system prompt.

@@ -10,12 +10,17 @@ RUNTIME_DIR="/app/data/.runtime"
 mkdir -p "$RUNTIME_DIR/pip" "$RUNTIME_DIR/npm-global/lib" "$RUNTIME_DIR/pip-cache" "$RUNTIME_DIR/bin" || true
 
 # Fix .runtime ownership for split root/goclaw access.
-# .runtime itself must be root-owned so pkg-helper (root) can write apk-packages.
+# .runtime stays root-owned so pkg-helper (root) can write apk-packages, but the
+# group (goclaw) needs write access too: the gateway runs as goclaw and must be
+# able to create the github-package self-update scratch dir (.runtime/tmp) and
+# rewrite the manifest (.runtime/github-packages.json[.tmp], updates-cache.json).
+# 0750 (no group write) makes those updates fail with "permission denied"; 0770
+# keeps root ownership while letting the goclaw group write.
 # Subdirs pip/, npm-global/, pip-cache/ must be goclaw-owned for runtime installs.
 # This also handles upgrades from older images where .runtime was fully goclaw-owned.
 if [ "$(id -u)" = "0" ] && [ -d "$RUNTIME_DIR" ]; then
   chown root:goclaw "$RUNTIME_DIR" 2>/dev/null || true
-  chmod 0750 "$RUNTIME_DIR" 2>/dev/null || true
+  chmod 0770 "$RUNTIME_DIR" 2>/dev/null || true
   chown -R goclaw:goclaw "$RUNTIME_DIR/pip" "$RUNTIME_DIR/npm-global" "$RUNTIME_DIR/pip-cache" "$RUNTIME_DIR/bin" 2>/dev/null || true
 fi
 
@@ -38,7 +43,7 @@ export PIP_CACHE_DIR="$RUNTIME_DIR/pip-cache"
 # NODE_PATH includes both pre-installed system globals and runtime-installed globals.
 export NPM_CONFIG_PREFIX="$RUNTIME_DIR/npm-global"
 export NODE_PATH="/usr/local/lib/node_modules:$RUNTIME_DIR/npm-global/lib/node_modules:${NODE_PATH:-}"
-export PATH="$RUNTIME_DIR/bin:$RUNTIME_DIR/npm-global/bin:$RUNTIME_DIR/pip/bin:$PATH"
+export PATH="/app:$RUNTIME_DIR/bin:$RUNTIME_DIR/npm-global/bin:$RUNTIME_DIR/pip/bin:$PATH"
 
 # System packages: re-install on-demand packages persisted across recreates.
 # After chown above, root owns .runtime and can create this file.

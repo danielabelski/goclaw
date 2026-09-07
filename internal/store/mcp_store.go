@@ -24,7 +24,13 @@ type MCPServerData struct {
 	TimeoutSec  int             `json:"timeout_sec" db:"timeout_sec"`
 	Settings    json.RawMessage `json:"settings,omitempty" db:"settings"`
 	Enabled     bool            `json:"enabled" db:"enabled"`
-	CreatedBy   string          `json:"created_by" db:"created_by"`
+	// RequireUserCredentials marks servers that mint credentials per-user at
+	// message time (e.g. Bitrix24 channel auto-onboard) instead of sharing a
+	// single admin api_key across every caller. Promoted from
+	// settings.require_user_credentials (JSONB) to a top-level column so
+	// channel factories can filter mcp_servers directly.
+	RequireUserCredentials bool   `json:"require_user_credentials" db:"require_user_credentials"`
+	CreatedBy              string `json:"created_by" db:"created_by"`
 }
 
 // MCPAgentGrant represents an MCP server grant to an agent.
@@ -83,6 +89,46 @@ type MCPUserCredentials struct {
 	Env     map[string]string `json:"env,omitempty" db:"-"`     // decrypted
 }
 
+// MCPOAuthToken holds OAuth tokens for an MCP server, either global (UserID="")
+// or per-user (UserID set). Sensitive fields are decrypted before delivery.
+type MCPOAuthToken struct {
+	ID              uuid.UUID  `db:"id"`
+	ServerID        uuid.UUID  `db:"server_id"`
+	TenantID        uuid.UUID  `db:"tenant_id"`
+	UserID          string     `db:"user_id"` // empty = global
+	AccessToken     string     `db:"access_token"`
+	RefreshToken    string     `db:"refresh_token"`
+	TokenType       string     `db:"token_type"`
+	Scopes          string     `db:"scopes"`
+	ExpiresAt       *time.Time `db:"expires_at"`
+	IssuedAt        *time.Time `db:"issued_at"`
+	DCRClientID     string     `db:"dcr_client_id"`
+	DCRClientSecret string     `db:"dcr_client_secret"` // decrypted
+	DCRIssuer       string     `db:"dcr_issuer"`
+	TokenEndpoint   string     `db:"token_endpoint"`
+	ResourceURI     string     `db:"resource_uri"`
+	CreatedAt       time.Time  `db:"created_at"`
+	UpdatedAt       time.Time  `db:"updated_at"`
+}
+
+// MCPOAuthTokenStore manages OAuth tokens for MCP servers.
+type MCPOAuthTokenStore interface {
+	// GetOAuthToken returns the global (tenant-level) OAuth token for a server.
+	GetOAuthToken(ctx context.Context, serverID, tenantID uuid.UUID) (*MCPOAuthToken, error)
+	// GetUserOAuthToken returns the per-user OAuth token for a server.
+	GetUserOAuthToken(ctx context.Context, serverID, tenantID uuid.UUID, userID string) (*MCPOAuthToken, error)
+	// UpsertOAuthToken inserts or replaces an OAuth token record.
+	UpsertOAuthToken(ctx context.Context, token *MCPOAuthToken) error
+	// DeleteOAuthToken deletes the global OAuth token for a server.
+	DeleteOAuthToken(ctx context.Context, serverID, tenantID uuid.UUID) error
+	// DeleteUserOAuthToken deletes the per-user OAuth token for a server.
+	DeleteUserOAuthToken(ctx context.Context, serverID, tenantID uuid.UUID, userID string) error
+	// DeleteServerOAuthTokens deletes ALL OAuth tokens for a server (global +
+	// every per-user row). Used when the server URL or OAuth config changes and
+	// the previously minted tokens are no longer valid for the new resource/AS.
+	DeleteServerOAuthTokens(ctx context.Context, serverID, tenantID uuid.UUID) error
+}
+
 // MCPServerStore manages MCP server configs and access grants.
 type MCPServerStore interface {
 	// Server CRUD
@@ -118,4 +164,22 @@ type MCPServerStore interface {
 	GetUserCredentials(ctx context.Context, serverID uuid.UUID, userID string) (*MCPUserCredentials, error)
 	SetUserCredentials(ctx context.Context, serverID uuid.UUID, userID string, creds MCPUserCredentials) error
 	DeleteUserCredentials(ctx context.Context, serverID uuid.UUID, userID string) error
+
+	// CacheToolDescriptions stores a map of tool name → cached tool info
+	// (description + real parameter schema, when available) into the
+	// server's settings JSONB under the "tool_cache" key.
+	CacheToolDescriptions(ctx context.Context, serverID uuid.UUID, toolInfo map[string]CachedToolInfo) error
+}
+
+// CachedToolInfo is the cached, per-tool information stored under an MCP
+// server's settings "tool_cache" key. It is used to render prompt previews
+// without a live connection to the MCP server.
+type CachedToolInfo struct {
+	// Description is the tool's human-readable description.
+	Description string `json:"description"`
+	// Parameters is the tool's full JSON Schema for its input parameters,
+	// captured from the live MCP connection at cache-write time. It may be
+	// nil for cache entries written before this field existed, or for
+	// servers whose tools genuinely expose no schema.
+	Parameters json.RawMessage `json:"parameters,omitempty"`
 }

@@ -40,16 +40,56 @@ func isDashScopeAPIBase(apiBase string) bool {
 	return strings.Contains(strings.ToLower(apiBase), "dashscope")
 }
 
+// isOllamaEndpoint returns true for local or self-hosted Ollama instances.
+// Ollama models such as qwq and deepseek-r1 have thinking enabled by default;
+// goclaw must send think=false to suppress it unless the user explicitly opts in.
+// Detection uses providerType (DB), name, and apiBase so both ProviderOllama and
+// ProviderOllamaCloud are covered, as well as self-hosted instances behind a proxy.
+func (p *OpenAIProvider) isOllamaEndpoint() bool {
+	pt := strings.ToLower(strings.TrimSpace(p.providerType))
+	if pt == "ollama" || pt == "ollama_cloud" {
+		return true
+	}
+	if strings.Contains(strings.ToLower(p.name), "ollama") {
+		return true
+	}
+	b := strings.ToLower(p.apiBase)
+	return strings.Contains(b, "11434") || strings.Contains(b, "ollama")
+}
+
 // dashScopePassthroughKeys is true when enable_thinking / thinking_budget may be added to the JSON body.
-// Uses URL, provider_type, and name so httptest DashScope URLs still work in tests.
+// Uses the same DashScope/Bailian route detection as prompt-cache wrapping.
 func (p *OpenAIProvider) dashScopePassthroughKeys() bool {
+	return p.isDashScope()
+}
+
+// ollamaNativeURL returns the full URL for Ollama's native /api/chat endpoint.
+// Ollama's OpenAI-compat shim at /v1/chat/completions silently ignores options.num_ctx,
+// while the native /api/chat endpoint honors it. The apiBase may include a /v1 suffix
+// (e.g. "http://localhost:11434/v1") — it is stripped before appending /api/chat.
+func (p *OpenAIProvider) ollamaNativeURL() string {
+	base := strings.TrimRight(strings.TrimSuffix(strings.TrimRight(p.apiBase, "/"), "/v1"), "/")
+	return base + "/api/chat"
+}
+
+// isDashScope returns true when this provider routes requests to DashScope/Bailian
+// (supports cache_control:ephemeral wire format - verified live 2026-05-08).
+// Uses 3-source detection (URL + providerType + name) to handle reverse-proxied
+// DashScope endpoints. Includes "bailian" because live qwen-richard provider has
+// provider_type=bailian.
+//
+// Used by buildRequestBody to wrap system content with Anthropic-style
+// cache_control blocks for prompt caching (90% discount on cached prefix tokens).
+func (p *OpenAIProvider) isDashScope() bool {
 	if isDashScopeAPIBase(p.apiBase) {
 		return true
 	}
-	if strings.Contains(strings.ToLower(strings.TrimSpace(p.providerType)), "dashscope") {
+	pt := strings.ToLower(strings.TrimSpace(p.providerType))
+	if strings.Contains(pt, "dashscope") || strings.Contains(pt, "bailian") {
 		return true
 	}
-	if strings.Contains(strings.ToLower(p.name), "dashscope") {
+	name := strings.ToLower(p.name)
+	if strings.Contains(name, "dashscope") || strings.Contains(name, "bailian") {
 		return true
 	}
 	return false

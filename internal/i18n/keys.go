@@ -53,8 +53,9 @@ const (
 	MsgInstanceNotFound   = "error.instance_not_found"   // "instance not found"
 
 	// --- Cron ---
-	MsgJobNotFound     = "error.job_not_found"     // "job not found"
-	MsgInvalidCronExpr = "error.invalid_cron_expr" // "invalid cron expression: %s"
+	MsgJobNotFound         = "error.job_not_found"         // "job not found"
+	MsgInvalidCronExpr     = "error.invalid_cron_expr"     // "invalid cron expression: %s"
+	MsgCommandCronDisabled = "error.command_cron_disabled" // "command cron jobs are disabled on this gateway"
 
 	// --- Config ---
 	MsgConfigHashMismatch = "error.config_hash_mismatch" // "config has changed (hash mismatch)"
@@ -208,8 +209,10 @@ const (
 	MsgFailedToDeleteFile    = "error.failed_to_delete_file"    // "failed to delete"
 
 	// --- OAuth ---
-	MsgNoPendingOAuth    = "error.no_pending_oauth"     // "no pending OAuth flow"
-	MsgFailedToSaveToken = "error.failed_to_save_token" // "failed to save token"
+	MsgNoPendingOAuth       = "error.no_pending_oauth"     // "no pending OAuth flow"
+	MsgFailedToSaveToken    = "error.failed_to_save_token" // "failed to save token"
+	MsgOAuthCallbackSuccess = "oauth.callback_success"     // "Authorization successful. You may close this window."
+	MsgOAuthCallbackFailed  = "oauth.callback_failed"      // "Authorization failed. You may close this window."
 
 	// --- Intent Classify (channel-facing status replies) ---
 	MsgStatusWorking       = "status.working"         // "🔄 I'm working on your request... Please wait."
@@ -268,6 +271,10 @@ const (
 	MsgSkillNudge70Pct      = "skill.nudge_70_pct"
 	MsgSkillNudge90Pct      = "skill.nudge_90_pct"
 
+	// Empty reply fallback (user-facing) — shown when a run finishes with no text
+	// output and no deliverable media, replacing the old meaningless "...".
+	MsgEmptyReplyFallback = "chat.empty_reply_fallback"
+
 	// Tool progress announcements (user-facing)
 	MsgToolAnnouncementSingle = "progress.tool_announcement.single" // "I'll use %s to handle the next step."
 	MsgToolAnnouncementMulti  = "progress.tool_announcement.multi"  // "I'll use %s to handle the next step."
@@ -300,28 +307,29 @@ const (
 	MsgTenantScopeRequired = "error.tenant_scope_required" // "tenant scope is required for this operation"
 
 	// --- Webhooks ---
-	MsgWebhookAuthFailed              = "webhook.auth_failed"               // "webhook authentication failed"
-	MsgWebhookHMACInvalid             = "webhook.hmac_invalid"              // "HMAC signature is invalid"
-	MsgWebhookHMACTimestampSkew       = "webhook.hmac_timestamp_skew"       // "request timestamp outside acceptable window"
-	MsgWebhookBearerRequiredHMAC      = "webhook.bearer_required_hmac"      // "this webhook requires HMAC authentication"
-	MsgWebhookRevoked                 = "webhook.revoked"                   // "webhook has been revoked"
-	MsgWebhookKindMismatch            = "webhook.kind_mismatch"             // "request kind does not match webhook configuration"
-	MsgWebhookRateLimited             = "webhook.rate_limited"              // "webhook rate limit exceeded"
-	MsgWebhookBodyTooLarge            = "webhook.body_too_large"            // "request body exceeds size limit"
-	MsgWebhookIdempotencyConflict     = "webhook.idempotency_conflict"      // "idempotency key conflict: request body mismatch"
-	MsgWebhookTenantMismatch          = "webhook.tenant_mismatch"           // "webhook tenant mismatch"
-	MsgWebhookAgentNotFound           = "webhook.agent_not_found"           // "webhook agent not found"
-	MsgWebhookChannelNotFound         = "webhook.channel_not_found"         // "webhook channel not found"
-	MsgWebhookMediaSSRFBlocked        = "webhook.media_ssrf_blocked"        // "media URL blocked by SSRF policy"
-	MsgWebhookMediaTooLarge           = "webhook.media_too_large"           // "media file exceeds size limit"
-	MsgWebhookMediaMIMEDenied         = "webhook.media_mime_denied"         // "media MIME type is not allowed"
-	MsgWebhookCallbackURLInvalid      = "webhook.callback_url_invalid"      // "callback URL is invalid or blocked"
-	MsgWebhookLLMTimeout              = "webhook.llm_timeout"               // "LLM processing timed out"
-	MsgWebhookLaneSaturated           = "webhook.lane_saturated"            // "webhook processing lane is at capacity"
-	MsgWebhookLocalhostOnlyViolation  = "webhook.localhost_only_violation"  // "this webhook is restricted to localhost callers"
-	MsgWebhookMediaChannelUnsupported = "webhook.media_channel_unsupported" // "channel does not support media attachments"
-	MsgWebhookIPDenied                = "webhook.ip_denied"                 // "request origin is not in the IP allowlist"
-	MsgWebhookEncryptionUnavailable   = "webhook.encryption_unavailable"    // "webhook encryption key not configured; set GOCLAW_ENCRYPTION_KEY to enable webhooks"
+	MsgWebhookAuthFailed                  = "webhook.auth_failed"                    // "webhook authentication failed"
+	MsgWebhookHMACInvalid                 = "webhook.hmac_invalid"                   // "HMAC signature is invalid"
+	MsgWebhookHMACTimestampSkew           = "webhook.hmac_timestamp_skew"            // "request timestamp outside acceptable window"
+	MsgWebhookBearerRequiredHMAC          = "webhook.bearer_required_hmac"           // "this webhook requires HMAC authentication"
+	MsgWebhookRevoked                     = "webhook.revoked"                        // "webhook has been revoked"
+	MsgWebhookKindMismatch                = "webhook.kind_mismatch"                  // "request kind does not match webhook configuration"
+	MsgWebhookRateLimited                 = "webhook.rate_limited"                   // "webhook rate limit exceeded"
+	MsgWebhookBodyTooLarge                = "webhook.body_too_large"                 // "request body exceeds size limit"
+	MsgWebhookIdempotencyConflict         = "webhook.idempotency_conflict"           // "idempotency key conflict: request body mismatch"
+	MsgWebhookTenantMismatch              = "webhook.tenant_mismatch"                // "webhook tenant mismatch"
+	MsgWebhookAgentNotFound               = "webhook.agent_not_found"                // "webhook agent not found"
+	MsgWebhookChannelNotFound             = "webhook.channel_not_found"              // "webhook channel not found"
+	MsgWebhookMediaSSRFBlocked            = "webhook.media_ssrf_blocked"             // "media URL blocked by SSRF policy"
+	MsgWebhookMediaTooLarge               = "webhook.media_too_large"                // "media file exceeds size limit"
+	MsgWebhookMediaMIMEDenied             = "webhook.media_mime_denied"              // "media MIME type is not allowed"
+	MsgWebhookCallbackURLInvalid          = "webhook.callback_url_invalid"           // "callback URL is invalid or blocked"
+	MsgWebhookLLMTimeout                  = "webhook.llm_timeout"                    // "LLM processing timed out"
+	MsgWebhookLaneSaturated               = "webhook.lane_saturated"                 // "webhook processing lane is at capacity"
+	MsgWebhookLocalhostOnlyViolation      = "webhook.localhost_only_violation"       // "this webhook is restricted to localhost callers"
+	MsgWebhookMediaChannelUnsupported     = "webhook.media_channel_unsupported"      // "channel does not support media attachments"
+	MsgWebhookIPDenied                    = "webhook.ip_denied"                      // "request origin is not in the IP allowlist"
+	MsgWebhookEncryptionUnavailable       = "webhook.encryption_unavailable"         // "webhook encryption key not configured; set GOCLAW_ENCRYPTION_KEY to enable webhooks"
+	MsgWebhookMessageTestRequiresStandard = "webhook.message_test_requires_standard" // "testing message webhooks requires Standard edition"
 
 	// --- Workstation permissions ---
 	MsgWorkstationCmdDenied    = "error.workstation_cmd_denied"     // "command denied by workstation policy: %s"

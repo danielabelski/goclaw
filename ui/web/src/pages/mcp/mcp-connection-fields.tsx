@@ -90,7 +90,7 @@ export function McpConnectionFields({ form }: McpConnectionFieldsProps) {
             <Label>{t("form.headers")}</Label>
             <KeyValueEditor
               value={headers}
-              onChange={(v) => setValue("headers", v)}
+              onChange={(v) => setValue("headers", v, { shouldDirty: true, shouldValidate: true })}
               keyPlaceholder={t("form.headerKeyPlaceholder")}
               valuePlaceholder={t("form.headerValuePlaceholder")}
               addLabel={t("form.addHeader")}

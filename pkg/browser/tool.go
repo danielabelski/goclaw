@@ -275,6 +275,10 @@ func (t *BrowserTool) handleSnapshot(ctx context.Context, args map[string]any) *
 }
 
 func (t *BrowserTool) handleScreenshot(ctx context.Context, args map[string]any) *tools.Result {
+	if t.manager.Backend() == BackendLightpanda {
+		return tools.ErrorResult("screenshot is not supported on the lightpanda backend (returns a placeholder image); use the 'snapshot' action for an accessibility-tree view of the page")
+	}
+
 	targetID, _ := args["targetId"].(string)
 	fullPage, _ := args["fullPage"].(bool)
 

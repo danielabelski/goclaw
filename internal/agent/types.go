@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
 // Agent is the core abstraction for an AI agent execution loop.
@@ -20,4 +21,21 @@ type Agent interface {
 	Model() string
 	ProviderName() string
 	Provider() providers.Provider
+}
+
+// BudgetedAgent exposes the configured agent-only request budget without adding
+// model/provider authority or expanding the broad Agent test interface.
+type BudgetedAgent interface {
+	ContextWindow() int
+	MaxTokens() int
+}
+
+// WithAgentBudget propagates an agent's configured budget to nested model calls.
+func WithAgentBudget(ctx context.Context, a Agent) context.Context {
+	budgeted, ok := a.(BudgetedAgent)
+	if !ok {
+		return ctx
+	}
+	ctx = store.WithAgentContextWindow(ctx, budgeted.ContextWindow())
+	return store.WithAgentMaxTokens(ctx, budgeted.MaxTokens())
 }

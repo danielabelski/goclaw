@@ -52,8 +52,9 @@ func init() {
 		MsgInstanceNotFound:   "instance not found",
 
 		// Cron
-		MsgJobNotFound:     "job not found",
-		MsgInvalidCronExpr: "invalid cron expression: %s",
+		MsgJobNotFound:         "job not found",
+		MsgInvalidCronExpr:     "invalid cron expression: %s",
+		MsgCommandCronDisabled: "command cron jobs are disabled on this gateway (set cron.command_enabled=true to allow them)",
 
 		// Config
 		MsgConfigHashMismatch: "config has changed (hash mismatch)",
@@ -171,8 +172,10 @@ func init() {
 		MsgFailedToDeleteFile:    "failed to delete",
 
 		// OAuth
-		MsgNoPendingOAuth:    "no pending OAuth flow",
-		MsgFailedToSaveToken: "failed to save token",
+		MsgNoPendingOAuth:       "no pending OAuth flow",
+		MsgFailedToSaveToken:    "failed to save token",
+		MsgOAuthCallbackSuccess: "Authorization successful. You may close this window.",
+		MsgOAuthCallbackFailed:  "Authorization failed. You may close this window.",
 
 		// Intent Classify
 		MsgStatusWorking:       "🔄 I'm working on your request... Please wait.",
@@ -230,6 +233,7 @@ func init() {
 		MsgSkillNudgePostscript: "This task involved several steps. Want me to save the process as a reusable skill? Reply **\"save as skill\"** or **\"skip\"**.",
 		MsgSkillNudge70Pct:      "[System] You are at 70% of your iteration budget. Consider whether any patterns from this session would make a good skill.",
 		MsgSkillNudge90Pct:      "[System] You are at 90% of your iteration budget. If this session involved reusable patterns, consider saving them as a skill before completing.",
+		MsgEmptyReplyFallback:   "⚠️ Agent couldn't generate a response. Note: some tool actions may have already been executed — please verify before retrying",
 
 		MsgInvalidRole: "invalid role: allowed values are owner, admin, operator, member, viewer",
 
@@ -267,28 +271,29 @@ func init() {
 		MsgBackendNotReady:         "workstation backend not ready: %s",
 
 		// Webhooks
-		MsgWebhookAuthFailed:              "webhook authentication failed",
-		MsgWebhookHMACInvalid:             "HMAC signature is invalid",
-		MsgWebhookHMACTimestampSkew:       "request timestamp outside acceptable window",
-		MsgWebhookBearerRequiredHMAC:      "this webhook requires HMAC authentication",
-		MsgWebhookRevoked:                 "webhook has been revoked",
-		MsgWebhookKindMismatch:            "request kind does not match webhook configuration",
-		MsgWebhookRateLimited:             "webhook rate limit exceeded",
-		MsgWebhookBodyTooLarge:            "request body exceeds size limit",
-		MsgWebhookIdempotencyConflict:     "idempotency key conflict: request body mismatch",
-		MsgWebhookTenantMismatch:          "webhook tenant mismatch",
-		MsgWebhookAgentNotFound:           "webhook agent not found",
-		MsgWebhookChannelNotFound:         "webhook channel not found",
-		MsgWebhookMediaSSRFBlocked:        "media URL blocked by SSRF policy",
-		MsgWebhookMediaTooLarge:           "media file exceeds size limit",
-		MsgWebhookMediaMIMEDenied:         "media MIME type is not allowed",
-		MsgWebhookCallbackURLInvalid:      "callback URL is invalid or blocked",
-		MsgWebhookLLMTimeout:              "LLM processing timed out",
-		MsgWebhookLaneSaturated:           "webhook processing lane is at capacity",
-		MsgWebhookLocalhostOnlyViolation:  "this webhook is restricted to localhost callers",
-		MsgWebhookMediaChannelUnsupported: "channel does not support media attachments",
-		MsgWebhookIPDenied:                "request origin is not in the IP allowlist",
-		MsgWebhookEncryptionUnavailable:   "webhook encryption key not configured; set GOCLAW_ENCRYPTION_KEY to enable webhooks",
+		MsgWebhookAuthFailed:                  "webhook authentication failed",
+		MsgWebhookHMACInvalid:                 "HMAC signature is invalid",
+		MsgWebhookHMACTimestampSkew:           "request timestamp outside acceptable window",
+		MsgWebhookBearerRequiredHMAC:          "this webhook requires HMAC authentication",
+		MsgWebhookRevoked:                     "webhook has been revoked",
+		MsgWebhookKindMismatch:                "request kind does not match webhook configuration",
+		MsgWebhookRateLimited:                 "webhook rate limit exceeded",
+		MsgWebhookBodyTooLarge:                "request body exceeds size limit",
+		MsgWebhookIdempotencyConflict:         "idempotency key conflict: request body mismatch",
+		MsgWebhookTenantMismatch:              "webhook tenant mismatch",
+		MsgWebhookAgentNotFound:               "webhook agent not found",
+		MsgWebhookChannelNotFound:             "webhook channel not found",
+		MsgWebhookMediaSSRFBlocked:            "media URL blocked by SSRF policy",
+		MsgWebhookMediaTooLarge:               "media file exceeds size limit",
+		MsgWebhookMediaMIMEDenied:             "media MIME type is not allowed",
+		MsgWebhookCallbackURLInvalid:          "callback URL is invalid or blocked",
+		MsgWebhookLLMTimeout:                  "LLM processing timed out",
+		MsgWebhookLaneSaturated:               "webhook processing lane is at capacity",
+		MsgWebhookLocalhostOnlyViolation:      "this webhook is restricted to localhost callers",
+		MsgWebhookMediaChannelUnsupported:     "channel does not support media attachments",
+		MsgWebhookIPDenied:                    "request origin is not in the IP allowlist",
+		MsgWebhookEncryptionUnavailable:       "webhook encryption key not configured; set GOCLAW_ENCRYPTION_KEY to enable webhooks",
+		MsgWebhookMessageTestRequiresStandard: "testing message webhooks requires Standard edition",
 
 		// Hooks
 		MsgHookInvalidMatcher:          "invalid matcher regex: %s",

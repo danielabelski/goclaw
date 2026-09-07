@@ -151,7 +151,9 @@
     "summaryUploaded": "{{count}} uploaded",
     "summaryWarnings": "{{count}} warning(s)",
     "summaryUnchanged": "{{count}} unchanged",
-    "summaryFailed": "{{count}} failed"
+    "summaryFailed": "{{count}} failed",
+    "securityViolations": "Security violations:",
+    "violationLine": "Line {{line}}: {{reason}}"
   },
   "edit": {
     "title": "Edit Skill",
@@ -225,7 +227,11 @@
     "filesShown": "{{shown}} of {{total}} files",
     "copyLink": "Copy link",
     "copySuccess": "Deeplink copied",
-    "copyFailed": "Failed to copy deeplink"
+    "copyFailed": "Failed to copy deeplink",
+    "editContent": "Edit content",
+    "editContentLoading": "Loading...",
+    "editContentSystemHint": "System skills are read-only and cannot be edited from the web UI.",
+    "editContentLoadFailed": "Failed to load skill content for editing"
   },
   "evolution": {
     "tab": "Evolution",

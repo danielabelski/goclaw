@@ -46,6 +46,12 @@ func (l *Loop) callInternalLLMWithUsage(ctx context.Context, chatReq providers.C
 	if fallbackProvider, ok := l.provider.(*providers.ModelFallbackProvider); ok {
 		before := func(callCtx context.Context, entry providers.FallbackCandidate, actualReq providers.ChatRequest) (providers.FallbackAfterCall, error) {
 			candidatePurpose := fmt.Sprintf("%s:%s:%s", purpose, entry.ProviderName, actualReq.Model)
+			// Mandatory hard-ceiling guard: internal calls (compaction, session
+			// summarization, memory flush) obey the SAME per-agent window as
+			// main-loop calls, per candidate, after all request mutations.
+			if guardErr := l.guardCompleteModelRequest(actualReq, entry.ProviderName, actualReq.Model, candidatePurpose); guardErr != nil {
+				return nil, guardErr
+			}
 			reservation, err := l.reserveInternalLLMUsageFor(callCtx, actualReq, candidatePurpose, entry.ProviderName, actualReq.Model)
 			if err != nil {
 				return nil, err
@@ -57,6 +63,18 @@ func (l *Loop) callInternalLLMWithUsage(ctx context.Context, chatReq providers.C
 			}, nil
 		}
 		return fallbackProvider.ChatWithHook(ctx, chatReq, before)
+	}
+	providerName := ""
+	if l.provider != nil {
+		providerName = l.provider.Name()
+	}
+	callModel := chatReq.Model
+	if callModel == "" {
+		callModel = l.model
+	}
+	// Mandatory hard-ceiling guard for the non-fallback internal call path.
+	if guardErr := l.guardCompleteModelRequest(chatReq, providerName, callModel, purpose); guardErr != nil {
+		return nil, guardErr
 	}
 	reservation, reserveErr := l.reserveInternalLLMUsage(ctx, chatReq, purpose)
 	if reserveErr != nil {

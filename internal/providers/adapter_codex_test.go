@@ -151,6 +151,7 @@ func TestCodexAdapter_FromResponse_TextAndUsage(t *testing.T) {
 			"input_tokens":10,
 			"output_tokens":3,
 			"total_tokens":13,
+			"input_tokens_details":{"cached_tokens":7},
 			"output_tokens_details":{"reasoning_tokens":2}
 		}
 	}`)
@@ -169,6 +170,12 @@ func TestCodexAdapter_FromResponse_TextAndUsage(t *testing.T) {
 	}
 	if resp.Usage == nil || resp.Usage.ThinkingTokens != 2 {
 		t.Errorf("Usage ThinkingTokens = %+v, want 2", resp.Usage)
+	}
+	if resp.Usage == nil || resp.Usage.CacheReadTokens != 7 {
+		t.Errorf("Usage CacheReadTokens = %+v, want 7", resp.Usage)
+	}
+	if resp.Usage == nil || !resp.Usage.PromptTokensIncludeCachedSegments {
+		t.Errorf("Usage PromptTokensIncludeCachedSegments = %+v, want true", resp.Usage)
 	}
 }
 
@@ -351,3 +358,82 @@ func TestCodexAdapter_ToRequest_StreamOption(t *testing.T) {
 
 // ensure the adapter satisfies the interface at compile time.
 var _ ProviderAdapter = (*CodexAdapter)(nil)
+
+func TestCodexAdapter_FromResponse_PromptTokensDetailsAlias(t *testing.T) {
+	a, _ := NewCodexAdapter(ProviderConfig{})
+	raw := []byte(`{
+		"id":"resp_cache_alias",
+		"object":"response",
+		"status":"completed",
+		"output":[
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}
+		],
+		"usage":{
+			"input_tokens":100,
+			"output_tokens":5,
+			"total_tokens":105,
+			"prompt_tokens_details":{"cached_tokens":80}
+		}
+	}`)
+	resp, err := a.FromResponse(raw)
+	if err != nil {
+		t.Fatalf("FromResponse: %v", err)
+	}
+	if resp.Usage == nil || resp.Usage.CacheReadTokens != 80 {
+		t.Fatalf("CacheReadTokens = %+v, want 80", resp.Usage)
+	}
+	if !resp.Usage.PromptTokensIncludeCachedSegments {
+		t.Fatal("PromptTokensIncludeCachedSegments = false, want true")
+	}
+}
+
+func TestCodexAdapter_ToRequestPromptCacheControls(t *testing.T) {
+	req := ChatRequest{
+		Messages: []Message{{Role: "user", Content: "hi"}},
+		Options: map[string]any{
+			OptPromptCacheKey:       "tenant/agent/session",
+			OptPromptCacheRetention: "1h",
+		},
+	}
+
+	// Native OpenAI endpoint accepts prompt cache params.
+	nativeAdapter, _ := NewCodexAdapter(ProviderConfig{BaseURL: "https://api.openai.com/v1"})
+	body, _, err := nativeAdapter.ToRequest(req)
+	if err != nil {
+		t.Fatalf("ToRequest: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if got := payload["prompt_cache_key"]; got != "tenant/agent/session" {
+		t.Fatalf("prompt_cache_key = %v, want tenant/agent/session", got)
+	}
+	if got := payload["prompt_cache_retention"]; got != "1h" {
+		t.Fatalf("prompt_cache_retention = %v, want 1h", got)
+	}
+
+	// Default ChatGPT OAuth backend rejects these params with HTTP 400 — must omit.
+	oauthAdapter, _ := NewCodexAdapter(ProviderConfig{})
+	oauthBody, _, err := oauthAdapter.ToRequest(req)
+	if err != nil {
+		t.Fatalf("ToRequest (oauth): %v", err)
+	}
+	var oauthPayload map[string]any
+	if err := json.Unmarshal(oauthBody, &oauthPayload); err != nil {
+		t.Fatalf("decode oauth body: %v", err)
+	}
+	if _, ok := oauthPayload["prompt_cache_key"]; ok {
+		t.Fatal("prompt_cache_key must not be sent to the ChatGPT OAuth backend")
+	}
+	if _, ok := oauthPayload["prompt_cache_retention"]; ok {
+		t.Fatal("prompt_cache_retention must not be sent to the ChatGPT OAuth backend")
+	}
+}
+
+func TestCodexAdapter_CapabilitiesCacheControl(t *testing.T) {
+	a, _ := NewCodexAdapter(ProviderConfig{})
+	if !a.Capabilities().CacheControl {
+		t.Fatal("CodexAdapter Capabilities().CacheControl = false, want true")
+	}
+}

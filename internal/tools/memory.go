@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,10 +16,10 @@ import (
 
 // MemorySearchTool implements the memory_search tool for hybrid semantic + FTS search.
 type MemorySearchTool struct {
-	memStore      store.MemoryStore              // Postgres-backed
-	episodicStore store.EpisodicStore             // v3 episodic memory (nil = v2 fallback)
-	metricsStore  store.EvolutionMetricsStore     // evolution metrics (nil = disabled)
-	hasKG         bool                           // knowledge_graph_search tool is available
+	memStore      store.MemoryStore           // Postgres-backed
+	episodicStore store.EpisodicStore         // v3 episodic memory (nil = v2 fallback)
+	metricsStore  store.EvolutionMetricsStore // evolution metrics (nil = disabled)
+	hasKG         bool                        // knowledge_graph_search tool is available
 }
 
 func NewMemorySearchTool() *MemorySearchTool {
@@ -48,7 +49,7 @@ func (t *MemorySearchTool) SetHasKG(has bool) {
 func (t *MemorySearchTool) Name() string { return "memory_search" }
 
 func (t *MemorySearchTool) Description() string {
-	return "Mandatory recall step: semantically search MEMORY.md + memory/*.md before answering questions about prior work, decisions, dates, people, preferences, or todos; returns top snippets with path + lines. If response has disabled=true, memory retrieval is unavailable and should be surfaced to the user. IMPORTANT: Always query in the SAME language as the stored memory content. If the user speaks Vietnamese, search in Vietnamese. If memory was written in English, search in English. Matching the language dramatically improves search accuracy. If no relevant results found or confidence is low, tell the user you checked but found nothing — do not fabricate or guess memories."
+	return "Mandatory recall step: search memory documents and episodic memory before answering questions about prior work, decisions, dates, people, preferences, or todos; returns top snippets with path + lines. For recency/date questions such as today, yesterday, last 24h, this week, \"hom nay\", \"hom qua\", or \"24h gan nhat\": do NOT put date words or guessed topics into query. Use query=\"*\" with createdAfter/createdBefore for calendar windows, or query=\"*\" with timeRange for relative windows; then run a second semantic search only if the user asks for a narrower topic. If response has disabled=true, memory retrieval is unavailable and should be surfaced to the user. IMPORTANT: Always query in the SAME language as the stored memory content. If the user speaks Vietnamese, search in Vietnamese. If memory was written in English, search in English. Matching the language dramatically improves search accuracy. If no relevant results found or confidence is low, tell the user you checked but found nothing — do not fabricate or guess memories."
 }
 
 func (t *MemorySearchTool) Parameters() map[string]any {
@@ -57,7 +58,7 @@ func (t *MemorySearchTool) Parameters() map[string]any {
 		"properties": map[string]any{
 			"query": map[string]any{
 				"type":        "string",
-				"description": "Natural language search query. Must be in the same language as the stored memory content (e.g., Vietnamese if memory is in Vietnamese).",
+				"description": "Natural language search query. Must be in the same language as the stored memory content. Use query=\"*\" with timeRange or createdAfter/createdBefore to list episodic memories for a time window; do not put date words such as today/yesterday/hom qua into query.",
 			},
 			"maxResults": map[string]any{
 				"type":        "number",
@@ -72,15 +73,35 @@ func (t *MemorySearchTool) Parameters() map[string]any {
 				"description": "Result depth: l0 (abstracts only), l1 (overview), l2 (full content). Default: l1. Only affects episodic memories.",
 				"enum":        []string{"l0", "l1", "l2"},
 			},
+			"timeRange": map[string]any{
+				"type":        "string",
+				"description": "Optional episodic-only relative created_at filter such as 24h, 7d, or 2w. Use query=\"*\" with timeRange for relative recency requests like last 24h or recent memories. For calendar windows like yesterday/today, prefer createdAfter and createdBefore.",
+			},
+			"createdAfter": map[string]any{
+				"type":        "string",
+				"description": "Optional episodic-only created_at lower bound as an RFC3339 timestamp. Use with query=\"*\" and createdBefore for explicit calendar windows such as yesterday, today, or a named date range.",
+			},
+			"createdBefore": map[string]any{
+				"type":        "string",
+				"description": "Optional episodic-only created_at upper bound as an RFC3339 timestamp. Use with query=\"*\" and createdAfter for explicit calendar windows such as yesterday, today, or a named date range.",
+			},
+			"includeExpired": map[string]any{
+				"type":        "boolean",
+				"description": "Whether episodic search should include memories whose expires_at is in the past. Default false.",
+			},
 		},
-		"required": []string{"query"},
 	}
 }
 
 func (t *MemorySearchTool) Execute(ctx context.Context, args map[string]any) *Result {
 	query, _ := args["query"].(string)
-	if query == "" {
-		return ErrorResult("query parameter is required")
+	query = strings.TrimSpace(query)
+	epTime, err := parseEpisodicTimeFilters(args, time.Now().UTC())
+	if err != nil {
+		return ErrorResult(err.Error())
+	}
+	if query == "" && !epTime.active {
+		return ErrorResult("query parameter is required unless an episodic time filter is provided")
 	}
 
 	var maxResults int
@@ -118,23 +139,30 @@ func (t *MemorySearchTool) Execute(ctx context.Context, args map[string]any) *Re
 		}
 	}
 	agentStr := agentID.String()
-	results, err := t.memStore.Search(ctx, query, agentStr, userID, searchOpts)
-	if err != nil {
-		return ErrorResult(fmt.Sprintf("memory search failed: %v", err))
-	}
-	// Fallback: also search leader's memory for team members and merge results.
-	if leaderID := LeaderAgentIDFromCtx(ctx); leaderID != "" && leaderID != agentStr {
-		leaderResults, lerr := t.memStore.Search(ctx, query, leaderID, userID, searchOpts)
-		if lerr != nil && userID != "" {
-			leaderResults, _ = t.memStore.Search(ctx, query, leaderID, "", searchOpts)
+	var results []store.MemorySearchResult
+	searchDocuments := query != "" && query != "*"
+	if searchDocuments {
+		var err error
+		results, err = t.memStore.Search(ctx, query, agentStr, userID, searchOpts)
+		if err != nil {
+			return ErrorResult(fmt.Sprintf("memory search failed: %v", err))
 		}
-		results = append(results, leaderResults...)
+		// Fallback: also search leader's memory for team members and merge results.
+		if leaderID := LeaderAgentIDFromCtx(ctx); leaderID != "" && leaderID != agentStr {
+			leaderResults, lerr := t.memStore.Search(ctx, query, leaderID, userID, searchOpts)
+			if lerr != nil && userID != "" {
+				leaderResults, _ = t.memStore.Search(ctx, query, leaderID, "", searchOpts)
+			}
+			results = append(results, leaderResults...)
+		}
 	}
 	// V3 episodic memory search (merge with document results)
 	var episodicResults []store.EpisodicSearchResult
 	if t.episodicStore != nil {
 		epOpts := store.EpisodicSearchOptions{
 			MaxResults: maxResults, MinScore: minScore, VectorWeight: 0.3, TextWeight: 0.7,
+			CreatedAfter: epTime.createdAfter, CreatedBefore: epTime.createdBefore,
+			IncludeExpired: epTime.includeExpired,
 		}
 		epResults, epErr := t.episodicStore.Search(ctx, query, agentStr, userID, epOpts)
 		if epErr == nil {
@@ -150,16 +178,21 @@ func (t *MemorySearchTool) Execute(ctx context.Context, args map[string]any) *Re
 	type taggedResult struct {
 		Tier string `json:"tier"`
 		store.MemorySearchResult
-		L0         string `json:"l0_abstract,omitempty"`
-		EpisodicID string `json:"episodic_id,omitempty"`
+		L0         string     `json:"l0_abstract,omitempty"`
+		KeyTopics  []string   `json:"key_topics,omitempty"`
+		EpisodicID string     `json:"episodic_id,omitempty"`
+		CreatedAt  *time.Time `json:"created_at,omitempty"`
+		ExpiresAt  *time.Time `json:"expires_at,omitempty"`
 	}
 	var combined []taggedResult
 	for _, r := range results {
 		combined = append(combined, taggedResult{Tier: "document", MemorySearchResult: r})
 	}
 	for _, r := range episodicResults {
+		createdAt := r.CreatedAt
 		combined = append(combined, taggedResult{
-			Tier: "episodic", EpisodicID: r.EpisodicID, L0: r.L0Abstract,
+			Tier: "episodic", EpisodicID: r.EpisodicID, L0: r.L0Abstract, KeyTopics: r.KeyTopics,
+			CreatedAt: &createdAt, ExpiresAt: r.ExpiresAt,
 			MemorySearchResult: store.MemorySearchResult{
 				Path: "episodic:" + r.SessionKey, Score: r.Score, Snippet: r.L0Abstract, Source: "episodic",
 			},
@@ -186,6 +219,90 @@ func (t *MemorySearchTool) Execute(ctx context.Context, args map[string]any) *Re
 	t.recordEpisodicRecall(ctx, episodicResults)
 
 	return NewResult(string(data))
+}
+
+type episodicTimeFilters struct {
+	createdAfter   *time.Time
+	createdBefore  *time.Time
+	includeExpired bool
+	active         bool
+}
+
+func parseEpisodicTimeFilters(args map[string]any, now time.Time) (episodicTimeFilters, error) {
+	var filters episodicTimeFilters
+	filters.includeExpired = boolArg(args, "includeExpired", "include_expired")
+	if s := stringArg(args, "createdAfter", "created_after"); s != "" {
+		t, err := time.Parse(time.RFC3339Nano, s)
+		if err != nil {
+			return filters, fmt.Errorf("createdAfter must be RFC3339: %w", err)
+		}
+		t = t.UTC()
+		filters.createdAfter = &t
+		filters.active = true
+	}
+	if s := stringArg(args, "createdBefore", "created_before"); s != "" {
+		t, err := time.Parse(time.RFC3339Nano, s)
+		if err != nil {
+			return filters, fmt.Errorf("createdBefore must be RFC3339: %w", err)
+		}
+		t = t.UTC()
+		filters.createdBefore = &t
+		filters.active = true
+	}
+	if s := stringArg(args, "timeRange", "time_range"); s != "" {
+		d, err := parseMemoryTimeRange(s)
+		if err != nil {
+			return filters, err
+		}
+		if filters.createdAfter == nil {
+			t := now.Add(-d).UTC()
+			filters.createdAfter = &t
+		}
+		filters.active = true
+	}
+	return filters, nil
+}
+
+func stringArg(args map[string]any, names ...string) string {
+	for _, name := range names {
+		if v, ok := args[name].(string); ok {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func boolArg(args map[string]any, names ...string) bool {
+	for _, name := range names {
+		if v, ok := args[name].(bool); ok {
+			return v
+		}
+	}
+	return false
+}
+
+func parseMemoryTimeRange(value string) (time.Duration, error) {
+	v := strings.TrimSpace(strings.ToLower(value))
+	if v == "" {
+		return 0, fmt.Errorf("timeRange cannot be empty")
+	}
+	if d, err := time.ParseDuration(v); err == nil {
+		return d, nil
+	}
+	unit := v[len(v)-1]
+	number := strings.TrimSpace(v[:len(v)-1])
+	n, err := strconv.ParseFloat(number, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("timeRange must be a positive duration like 24h, 7d, or 2w")
+	}
+	switch unit {
+	case 'd':
+		return time.Duration(n * float64(24*time.Hour)), nil
+	case 'w':
+		return time.Duration(n * float64(7*24*time.Hour)), nil
+	default:
+		return 0, fmt.Errorf("timeRange must use a supported unit: h, d, or w")
+	}
 }
 
 // recordEpisodicRecall schedules a best-effort RecordRecall update per

@@ -23,7 +23,7 @@ func (m *Manager) reapIdlePages() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.browser == nil {
+	if !m.isRunningLocked() {
 		return
 	}
 
@@ -33,22 +33,13 @@ func (m *Manager) reapIdlePages() {
 			continue
 		}
 
-		page, ok := m.pages[targetID]
-		if !ok {
+		if _, ok := m.pages[targetID]; !ok {
 			delete(m.pageLastUsed, targetID)
 			continue
 		}
 
-		if err := page.Close(); err != nil {
-			m.logger.Warn("reaper: failed to close idle page", "targetId", targetID, "error", err)
-			continue
-		}
-
-		delete(m.pages, targetID)
-		delete(m.console, targetID)
-		delete(m.pageTenants, targetID)
-		delete(m.pageLastUsed, targetID)
-		m.refs.Remove(targetID)
-		m.logger.Info("reaper: closed idle page", "targetId", targetID, "idle", now.Sub(lastUsed).Round(time.Second))
+		idleFor := now.Sub(lastUsed).Round(time.Second)
+		m.closeManagedPageLocked(targetID)
+		m.logger.Info("reaper: closed idle page", "targetId", targetID, "idle", idleFor)
 	}
 }

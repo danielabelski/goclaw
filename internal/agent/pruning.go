@@ -299,6 +299,10 @@ func pruneContextMessages(msgs []providers.Message, contextWindowTokens int, cfg
 			Role:       msg.Role,
 			Content:    trimmed,
 			ToolCallID: msg.ToolCallID,
+			// Preserve ToolName: Gemini needs it to build FunctionResponse.name,
+			// and pruned results are exactly the ones whose assistant tool_call
+			// may already be out of the request window.
+			ToolName: msg.ToolName,
 		}
 		totalTokens += est.estimateTokens(trimmed) - msgTokens
 		if stats != nil {
@@ -352,6 +356,7 @@ func pruneContextMessages(msgs []providers.Message, contextWindowTokens int, cfg
 			Role:       msg.Role,
 			Content:    settings.hardClearPlaceholder,
 			ToolCallID: msg.ToolCallID,
+			ToolName:   msg.ToolName,
 		}
 		afterTokens := est.estimateTokens(settings.hardClearPlaceholder)
 		totalTokens += afterTokens - beforeTokens

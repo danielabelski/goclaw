@@ -8,11 +8,19 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
 
 // mcpClient talks to an MCP server's /api/auto-onboard endpoint.
+//
+// This is Bitrix-specific glue ("Bitrix24 OAuth → existing
+// mcp_user_credentials bridge"), NOT a generic MCP architecture pattern —
+// other channels (Telegram, Discord, …) currently require admins to set
+// per-user MCP credentials manually via the HTTP admin API. Bitrix
+// automates the same flow because Bitrix events naturally carry user
+// OAuth tokens.
 //
 // When a Bitrix24 user sends their first message, the bitrix24 channel
 // doesn't yet know which per-user MCP API key that user should use. It POSTs
@@ -20,10 +28,10 @@ import (
 // integration — with the triggering user's OAuth tokens (access_token +
 // refresh_token + expires_in) harvested from the Bitrix event auth block.
 // The MCP server verifies the access_token against Bitrix `profile` to
-// confirm the caller actually owns bitrix_user_id (Path B — no shared admin
-// secret required), then upserts its own tenants + bitrix_users tables keyed
-// by (domain, bitrix_user_id) and returns the per-user api_key we persist
-// via mcp_user_credentials.
+// confirm the caller actually owns bitrix_user_id — no shared admin secret
+// required — then upserts its own tenants + bitrix_users tables keyed by
+// (domain, bitrix_user_id) and returns the per-user api_key we persist via
+// mcp_user_credentials.
 //
 // The client is deliberately thin:
 //   - No retries on 4xx (auth config wrong → operator must fix).
@@ -48,7 +56,7 @@ var ErrTenantNotInstalled = errors.New("mcp auto-onboard: tenant_not_installed")
 
 // newMCPClient builds a client pointed at baseURL. The MCP server
 // authenticates each auto-onboard call via the caller-supplied Bitrix
-// access_token (Path B) — no shared admin secret is required.
+// access_token — no shared admin secret is required.
 // baseURL MUST be the MCP server root (e.g. https://mcp.example.com) — we
 // append /api/auto-onboard internally so channel config stays minimal.
 func newMCPClient(baseURL string, timeout time.Duration) *mcpClient {
@@ -162,9 +170,9 @@ func (c *mcpClient) autoOnboard(ctx context.Context, req autoOnboardRequest) (*a
 		case resp.StatusCode >= 400 && resp.StatusCode < 500:
 			// Auth / config errors are non-retryable — surface the body so
 			// operators can see the domain / access_token mismatch.
-			return nil, fmt.Errorf("mcp auto-onboard: %d %s: %s", resp.StatusCode, http.StatusText(resp.StatusCode), truncateMCPBody(string(out), 500))
+			return nil, fmt.Errorf("mcp auto-onboard: %d %s: %s", resp.StatusCode, http.StatusText(resp.StatusCode), truncateMCPBody(redactMCPBody(string(out)), 500))
 		default:
-			lastErr = fmt.Errorf("mcp auto-onboard: %d %s: %s", resp.StatusCode, http.StatusText(resp.StatusCode), truncateMCPBody(string(out), 500))
+			lastErr = fmt.Errorf("mcp auto-onboard: %d %s: %s", resp.StatusCode, http.StatusText(resp.StatusCode), truncateMCPBody(redactMCPBody(string(out)), 500))
 			// fall through to retry
 		}
 	}
@@ -198,4 +206,17 @@ func truncateMCPBody(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// mcpTokenRedactRe scrubs OAuth secrets from an MCP response body. The POST we
+// send carries access_token / refresh_token (the Bitrix→MCP onboarding bridge);
+// a naive MCP server that echoes the request back in its 4xx/5xx error body
+// would otherwise leak those tokens into goclaw logs, breaking the package's
+// "log token lengths, never values" discipline.
+var mcpTokenRedactRe = regexp.MustCompile(`(?i)("(?:access_token|refresh_token|client_secret)"\s*:\s*")[^"]*(")`)
+
+// redactMCPBody replaces OAuth secret values in an MCP body with a placeholder
+// before the body is interpolated into an error string / log line.
+func redactMCPBody(s string) string {
+	return mcpTokenRedactRe.ReplaceAllString(s, `${1}[redacted]${2}`)
 }

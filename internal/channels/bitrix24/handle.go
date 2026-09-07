@@ -11,6 +11,9 @@ import (
 	"time"
 
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
+	"github.com/nextlevelbuilder/goclaw/internal/channels/media"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/systemmessages"
 )
 
 // mentionMatcher is the compiled-once regex + rendered tag string used to
@@ -89,12 +92,15 @@ func (c *Channel) DispatchEvent(ctx context.Context, evt *Event) {
 //  2. Group-only: require-mention gate + strip the mention from the text.
 //  3. Skip empty payloads (no text + no media).
 //  4. Policy: DM vs Group via BaseChannel.CheckDMPolicy / CheckGroupPolicy.
-//     Pairing policies trigger a pairing-reply stub (Phase 07 will wire up
-//     the full pairing flow; Phase 03 logs and drops).
+//     Pairing policies send a pairing reply (code + approve instructions) via
+//     sendPairingReply; deny drops silently.
 //  5. Build metadata map with bitrix_* keys so the agent can echo / reply
 //     to the right dialog + message ID later.
 //  6. Forward to BaseChannel.HandleMessage → publishes bus.InboundMessage.
 func (c *Channel) handleMessage(ctx context.Context, evt *Event) {
+	// Inject tenant scope so store queries filter by the correct tenant_id.
+	ctx = store.WithTenantID(ctx, c.TenantID())
+
 	if evt.Params.FromUserID == "" {
 		return // malformed event; router already logged if this matters
 	}
@@ -105,25 +111,76 @@ func (c *Channel) handleMessage(ctx context.Context, evt *Event) {
 		return
 	}
 
-	isGroup := isGroupMessageType(evt.Params.MessageType)
+	// Open Channel (Bitrix24 Lines) carries MESSAGE_TYPE="L" and
+	// CHAT_ENTITY_TYPE="LINES". The session mixes real customers coming in
+	// through a connector (Zalo/FB/...) with internal staff who join to
+	// supervise. Customers can't @-mention the bot from outside; treating the
+	// session as a generic group chat would either spam customers (drop when
+	// require_mention is true, reply to everything when false) or silently
+	// merge into the "direct" path. Recognise it up-front so the gate below
+	// can apply the right policy.
+	isOpenChannel := isOpenChannelParams(&evt.Params)
+	// Force group routing for Open Channel so the existing mention-strip /
+	// readable-mention pipeline below runs, and so the session key includes
+	// the chat id instead of dumping every participant into the "direct"
+	// bucket.
+	isGroup := isGroupMessageType(evt.Params.MessageType) || isOpenChannel
 	text := evt.Params.Message
 	slog.Info("bitrix24 message: handle entry",
 		"from_user_id", evt.Params.FromUserID,
 		"dialog_id", evt.Params.DialogID,
 		"message_type", evt.Params.MessageType,
 		"is_group", isGroup,
+		"is_open_channel", isOpenChannel,
+		"from_connector", evt.Params.FromIsConnector,
 		"require_mention", c.RequireMention(),
 		"message_id", evt.Params.MessageID,
 		"mentioned_list_n", len(evt.Params.MentionedList),
 	)
+	// Open Channel gate (must run BEFORE the generic group block):
+	// Mention is the only criterion — both internal staff and external
+	// customers (IS_CONNECTOR=Y) can trigger the bot when they @-mention
+	// it. The connector side relies on upstream populating MENTIONED_LIST
+	// with the bot id when the customer addresses the bot from Zalo/FB;
+	// without an explicit mention, traffic is dropped so the bot doesn't
+	// spam the customer or interfere with operator handling.
+	if isOpenChannel {
+		// Mention gate is now scoped per-connector: see shouldRequireMentionForOpenline
+		// for the policy (internal staff always gate; external customer gates only
+		// for group-style connectors like Zalo personal; 1-to-1 connectors reply
+		// to every customer message). Connector whitelist is overridable via
+		// BITRIX24_REQUIRE_MENTION_CONNECTORS env so adding e.g. a future Zalo group
+		// connector doesn't need a code change.
+		if shouldRequireMentionForOpenline(evt.Params.FromIsConnector, evt.Params.ChatEntityID) {
+			if !c.isMentionedParams(&evt.Params) {
+				slog.Info("bitrix24 message: dropped OL message without mention",
+					"from_user_id", evt.Params.FromUserID,
+					"from_connector", evt.Params.FromIsConnector,
+					"chat_entity_id", evt.Params.ChatEntityID,
+					"dialog_id", evt.Params.DialogID,
+					"message_id", evt.Params.MessageID)
+				return
+			}
+		}
+	}
 	if isGroup {
+		// Mention DROP CHECK is scoped to native group chats (CRM deal/task,
+		// plain groups) only. Open Channel sessions own their mention policy
+		// via shouldRequireMentionForOpenline above — re-applying the channel-
+		// level RequireMention flag here would silently drop, e.g., every
+		// Facebook Messenger customer turn (whose connector isn't in the
+		// require-mention whitelist) even though the upstream gate let it
+		// through. Text processing below (mention strip + readable rewrite)
+		// stays unconditional so Openline staff messages with bot BBCode tags
+		// still get cleaned up.
+		//
 		// Authority-ordered fallback: structured MENTIONED_LIST → raw
 		// MESSAGE_ORIGINAL → stripped MESSAGE. In group chats Bitrix24 strips
 		// the @mention from MESSAGE before sending the webhook, so checking
 		// MESSAGE alone misses every group mention. See
 		// plans/bitrix24-mcp-refactor/reports/retrospective.md §2 for context.
 		mentioned := c.isMentionedParams(&evt.Params)
-		if c.RequireMention() && !mentioned {
+		if !isOpenChannel && c.RequireMention() && !mentioned {
 			slog.Info("bitrix24 message: dropped missing mention",
 				"from_user_id", evt.Params.FromUserID,
 				"dialog_id", evt.Params.DialogID,
@@ -149,27 +206,70 @@ func (c *Channel) handleMessage(ctx context.Context, evt *Event) {
 		text = bxConvertUserMentionsToReadable(text)
 	}
 	text = strings.TrimSpace(text)
+
+	// Openline relays an external connector user with a sender tag at the start
+	// of the text. We parse it to (a) echo the connector msgId back so the reply
+	// routes to the right external message, and (b) — for the newer 3-token
+	// "[Name] #uid #msgId" layout — derive a stable per-participant identity from
+	// the external person's uid so each customer gets their own USER.md / memory
+	// instead of collapsing into the shared connector proxy.
+	//
+	// Identity is gated on FromIsConnector: only genuine connector relays
+	// (IS_CONNECTOR=Y) may mint a participant identity. An operator who types a
+	// look-alike "[Name] #a #b" tag (observed live) must never be mistaken for a
+	// customer, so for non-connector messages we only strip the tag from the body
+	// the agent sees and derive nothing. Plain group chats / DMs → no-op.
+	var senderTag OpenlineSenderTag
+	var participantSenderID string
+	if isOpenChannel {
+		if evt.Params.FromIsConnector {
+			senderTag = parseOpenlineSenderTag(text)
+			if senderTag.Format == TagFormatThreeToken && senderTag.UID != "" {
+				// Unique per (channel instance, OL chat, person) → one contact and
+				// one USER.md per external customer in the chat. c.Name() is
+				// config-controlled, the uid is digits-only from the regex, and the
+				// DialogID is a validated "chatNN" token — no freeform injection.
+				participantSenderID = fmt.Sprintf("openlines:%s:%s:%s",
+					c.Name(), evt.Params.DialogID, senderTag.UID)
+			}
+			if senderTag.Format != TagFormatNone {
+				text = strings.TrimSpace(senderTag.Rest)
+			}
+		} else if _, rest := extractOpenlineSenderPrefix(text, true); rest != text {
+			// Operator/staff message: strip a look-alike tag from the body for the
+			// LLM, but derive no identity and echo no prefix.
+			text = strings.TrimSpace(rest)
+		}
+	}
+
 	if text == "" && len(evt.Params.Files) == 0 {
 		return
 	}
 
+	// senderID defaults to the connector proxy id (e.g. "960", shared by every
+	// customer in the chat). When a per-participant identity was derived above we
+	// use it instead so contact + memory scope to the individual person.
 	senderID := evt.Params.FromUserID
+	if participantSenderID != "" {
+		senderID = participantSenderID
+	}
 	chatID := evt.Params.DialogID
 	peerKind := "direct"
 	if isGroup {
 		peerKind = "group"
 	}
 
-	// Policy gating. BaseChannel reports PolicyNeedsPairing for unpaired DMs
-	// under the default "pairing" policy. Phase 07 will answer with a real
-	// pairing reply; Phase 03 logs the intent so the flow is visible while
-	// the rest of the channel comes online.
+	// Policy gating. BaseChannel reports PolicyNeedsPairing for unpaired senders
+	// under the "pairing" policy. Answer with a real pairing reply (code + how to
+	// approve) via the v2 chat API, matching the other channels (Discord/Zalo/
+	// WhatsApp/Slack/Feishu). Group pairings are keyed by "group:<chatID>" so the
+	// generated code matches what CheckGroupPolicy.IsPaired later verifies.
 	if peerKind == "direct" {
 		switch c.CheckDMPolicy(ctx, senderID, c.cfg.DMPolicy) {
 		case channels.PolicyDeny:
 			return
 		case channels.PolicyNeedsPairing:
-			c.logPairingNeeded(senderID, chatID, peerKind)
+			c.sendPairingReply(ctx, senderID, chatID, peerKind)
 			return
 		}
 	} else {
@@ -177,20 +277,56 @@ func (c *Channel) handleMessage(ctx context.Context, evt *Event) {
 		case channels.PolicyDeny:
 			return
 		case channels.PolicyNeedsPairing:
-			c.logPairingNeeded(senderID, chatID, peerKind)
+			c.sendPairingReply(ctx, "group:"+chatID, chatID, peerKind)
 			return
 		}
 	}
 
-	meta := map[string]string{
-		"bitrix_dialog_id":  evt.Params.DialogID,
-		"bitrix_portal":     c.portalDomainSafe(),
-		"bitrix_bot_id":     strconv.Itoa(c.BotID()),
-		"bitrix_bot_code":   c.cfg.BotCode,
-		"bitrix_message_id": evt.Params.MessageID,
+	// Visibility: whisper (internal-only) vs public (forwarded to external
+	// connector). Send() uses this to route through imbot.message.add with
+	// SKIP_CONNECTOR=Y (whisper) or imbot.v2.Chat.Message.send (public).
+	// Default to public so legacy events without the marker still publish
+	// to the connector — that matches pre-refactor behavior.
+	visibility := VisibilityPublic
+	if evt.Params.IsHiddenMessage {
+		visibility = VisibilityWhisper
 	}
-	if evt.Params.ReplyToMID != "" {
-		meta["bitrix_reply_to_mid"] = evt.Params.ReplyToMID
+	meta := map[string]string{
+		"bitrix_dialog_id": evt.Params.DialogID,
+		"bitrix_portal":    c.portalDomainSafe(),
+		"bitrix_bot_id":    strconv.Itoa(c.BotID()),
+		"bitrix_bot_code":  c.cfg.BotCode,
+		// Bitrix MESSAGE_ID drives the v2 fields.replyId reply-link. It is a
+		// Bitrix-internal id, distinct from the connector msgId embedded in the
+		// sender tag (echoed via MetaKeySenderPrefix instead), so it must stay the
+		// genuine webhook MESSAGE_ID — a 13-digit connector msgId is not a valid
+		// Bitrix replyId.
+		MetaKeyMessageID:  evt.Params.MessageID,
+		MetaKeyVisibility: visibility,
+		// Generic run-tracking key the gateway consumer reads to thread
+		// streaming / status-reaction events back to this message (all other
+		// channels set it). Distinct from bitrix_message_id above (same value
+		// here, but that key is Bitrix-specific reply-link routing).
+		"message_id": evt.Params.MessageID,
+	}
+	// Echo the connector sender tag back on the reply so the Open Channel
+	// connector routes the answer to the right external message:
+	//   - 3-token   → "#msgId" only (name + uid dropped; connector needs just the id),
+	//   - legacy    → canonical "[name] #msgId" (unchanged from prior behavior),
+	//   - name-only → "[name]".
+	// senderTag is the zero value (TagFormatNone) for operator / non-connector
+	// messages, so this is a no-op there.
+	switch senderTag.Format {
+	case TagFormatThreeToken:
+		meta[MetaKeySenderPrefix] = "#" + senderTag.MsgID
+	case TagFormatLegacy:
+		meta[MetaKeySenderPrefix] = "[" + senderTag.Name + "] #" + senderTag.MsgID
+	case TagFormatNameOnly:
+		meta[MetaKeySenderPrefix] = "[" + senderTag.Name + "]"
+	}
+	// Per-participant identity signal for the consumer (per-person USER.md scope).
+	if participantSenderID != "" {
+		meta[MetaKeyParticipantUserID] = participantSenderID
 	}
 	if evt.Params.ChatID != "" {
 		meta["bitrix_chat_id"] = evt.Params.ChatID
@@ -207,6 +343,17 @@ func (c *Channel) handleMessage(ctx context.Context, evt *Event) {
 		meta["bitrix_chat_entity_id"] = evt.Params.ChatEntityID
 	}
 
+	// Decoded entity context — pull out the per-connector fields from the
+	// raw ENTITY_ID / ENTITY_DATA_* payloads (Openline session state, CRM
+	// linkage, single-token task / workgroup / mail ids) plus CHAT_TITLE
+	// and CHAT_TYPE. Only non-empty keys are emitted so DMs / plain groups
+	// pay no cost. See entity_context.go for parser semantics.
+	if ec, ok := ParseEntityContext(&evt.Params); ok {
+		for k, v := range ec.ToMeta(&evt.Params) {
+			meta[k] = v
+		}
+	}
+
 	// Collect contact for processed messages (matches Telegram pattern at
 	// channels/telegram/handlers.go:617-630). Runs AFTER policy gating so
 	// blocked senders aren't recorded, and BEFORE HandleMessage so the
@@ -219,7 +366,17 @@ func (c *Channel) handleMessage(ctx context.Context, evt *Event) {
 	// missing we still create the contact row with empty fields, which
 	// matches the pre-enrichment behavior and causes no regression.
 	if cc := c.ContactCollector(); cc != nil {
-		contactName, contactUsername := c.resolveContactName(ctx, senderID)
+		var contactName, contactUsername string
+		if participantSenderID != "" && senderTag.Name != "" {
+			// Use the connector-parsed display name directly. resolveContactName
+			// would call user.get(senderID), but senderID is now the synthetic
+			// per-participant id and the numeric proxy (e.g. 960) resolves to the
+			// connector account — not the customer. The parsed name is the only
+			// real signal we have for the external person.
+			contactName = senderTag.Name
+		} else {
+			contactName, contactUsername = c.resolveContactName(ctx, senderID)
+		}
 		cc.EnsureContact(ctx, c.Type(), c.Name(), senderID, senderID, contactName, contactUsername, peerKind, "user", "", "")
 		if isGroup && chatID != "" {
 			cc.EnsureContact(ctx, c.Type(), c.Name(), chatID, "", "", "", "group", "group", "", "")
@@ -231,7 +388,16 @@ func (c *Channel) handleMessage(ctx context.Context, evt *Event) {
 	// the MCP server's tools, which is strictly better UX than the channel
 	// denying the message. The typed errors let tests assert behavior
 	// without string matching.
-	if err := c.provisionIfMissing(ctx, senderID, evt.Auth); err != nil {
+	if err := c.provisionIfMissing(ctx, senderID, evt.Params.FromIsConnector, evt.Auth, chatID); err != nil {
+		// ErrUserAuthRequired carries a URL (not a sentinel value), so it
+		// needs errors.As rather than errors.Is. Checked first and returns
+		// early — the user has no MCP access yet, so there's nothing useful
+		// for the agent to answer with; don't publish to the bus.
+		var authErr *ErrUserAuthRequired
+		if errors.As(err, &authErr) {
+			c.sendOAuthInvite(ctx, senderID, chatID, isGroup, authErr.URL)
+			return
+		}
 		switch {
 		case errors.Is(err, ErrProvisionDisabled),
 			errors.Is(err, ErrProvisionSkippedOpenChannel),
@@ -255,22 +421,62 @@ func (c *Channel) handleMessage(ctx context.Context, evt *Event) {
 		}
 	}
 
-	// Phase 06 will populate media paths after downloading from disk.getExternalLink;
-	// Phase 03 passes an empty slice so text-only flow is correct end-to-end.
-	var media []string
+	// Reply/quote context: when the user replied to an earlier message, Bitrix
+	// ships the quoted text inline (REPLY_MESSAGE); a media-only original carries
+	// only an id, which we resolve via im.dialog.messages.get. resolveReplyContext
+	// returns a short note to prepend so the agent knows what's being answered,
+	// plus any quoted attachment re-injected through the SAME download pipeline as
+	// a direct upload (bounded by media_max_mb, best-effort). No-op when not a reply.
+	replyPrefix, replyMedia := c.resolveReplyContext(ctx, evt)
+
+	// Download any attachments via imbot.v2.File.download and forward them to
+	// the agent with their MIME type preserved. Best-effort: failures are logged
+	// inside downloadEventFiles and never block the text from reaching the agent.
+	mediaFiles := c.downloadEventFiles(ctx, c.BotID(), evt.Params.Files)
+	mediaFiles = append(mediaFiles, replyMedia...)
+	// Prepend <media:*> tags so the LLM sees the attachment alongside the body
+	// text. The agent loop's enrichInputMedia REPLACES tags it finds (it does
+	// NOT insert new ones), so without this step a Bitrix-borne PDF / audio
+	// arrives as bare text — the LLM never realizes an attachment exists and
+	// degrades to "no file attached" or hallucinates a CRM document. Match
+	// the Telegram / Slack / Discord pattern (shared media.BuildMediaTags) so
+	// the tag shape stays uniform across channels.
+	if len(mediaFiles) > 0 {
+		if tags := media.BuildMediaTags(mediaFilesToInfos(mediaFiles)); tags != "" {
+			if text == "" {
+				text = tags
+			} else {
+				text = tags + "\n" + text
+			}
+		}
+	}
+	// Reply note goes at the very front so the agent reads "who/what is being
+	// answered" before the (possibly quoted) media tags and the user's own text.
+	if replyPrefix != "" {
+		text = replyPrefix + text
+	}
 	slog.Info("bitrix24 message: publish to bus",
 		"sender_id", senderID,
 		"chat_id", chatID,
 		"peer_kind", peerKind,
 		"message_id", evt.Params.MessageID,
+		"media_count", len(mediaFiles),
 	)
-	c.HandleMessage(senderID, chatID, text, media, meta, peerKind)
+	c.HandleAuthorizedMessageMedia(senderID, chatID, text, mediaFiles, meta, peerKind)
 }
 
 // handleJoin sends a short welcome the first time the bot is added to a
 // chat. Failure is non-fatal — the agent will still respond to the user's
 // first real message.
 func (c *Channel) handleJoin(ctx context.Context, evt *Event) {
+	// Open Channel sessions are customer-facing. Keep join events silent so
+	// adding the bot does not push an unsolicited greeting to the customer.
+	if isOpenChannelParams(&evt.Params) {
+		slog.Debug("bitrix24: welcome message skipped for open channel",
+			"dialog_id", evt.Params.DialogID)
+		return
+	}
+
 	client := c.Client()
 	botID := c.BotID()
 	if client == nil || botID <= 0 {
@@ -280,15 +486,19 @@ func (c *Channel) handleJoin(ctx context.Context, evt *Event) {
 		return
 	}
 	welcome := fmt.Sprintf("Xin chào! Tôi là %s. Hãy hỏi tôi bất cứ điều gì.", c.cfg.BotName)
-	if _, err := client.Call(ctx, "imbot.message.add", map[string]any{
-		"BOT_ID":    botID,
-		"DIALOG_ID": evt.Params.DialogID,
-		"MESSAGE":   welcome,
-		"SYSTEM":    "N",
+	if _, err := client.Call(ctx, "imbot.v2.Chat.Message.send", map[string]any{
+		"botId":    botID,
+		"dialogId": evt.Params.DialogID,
+		"fields":   map[string]any{"message": welcome},
 	}); err != nil {
 		slog.Warn("bitrix24: welcome message send failed",
 			"dialog_id", evt.Params.DialogID, "err", err)
 	}
+}
+
+func isOpenChannelParams(p *EventParams) bool {
+	return p != nil && (strings.EqualFold(p.MessageType, "L") ||
+		strings.EqualFold(p.ChatEntityType, "LINES"))
 }
 
 // isMentionedParams checks all three sources Bitrix24 may use to convey a
@@ -394,16 +604,45 @@ func (c *Channel) mention() *mentionMatcher {
 	return c.mentionRe
 }
 
-// logPairingNeeded is the Phase 03 stand-in for a real pairing reply.
-// Phase 07 replaces this with a proper pairing message via imbot.message.add;
-// until then we log the intent so operators can see unpaired attempts.
-func (c *Channel) logPairingNeeded(senderID, chatID, peerKind string) {
-	if !c.CanSendPairingNotif(senderID, pairingDebounce) {
+// sendPairingReply requests a pairing code for an unpaired sender and sends it
+// back into the chat via the v2 API (imbot.v2.Chat.Message.send) so an admin can
+// approve access. Mirrors the pairing reply the other channels already send
+// (Discord/Zalo/WhatsApp/Slack/Feishu) using the shared pairing.account_required
+// system message. Debounced per-sender so a spammy sender can't flood the chat.
+//
+// pairingSenderID is the id the pairing is keyed by — the raw senderID for DMs,
+// "group:<chatID>" for groups — so the generated code matches what CheckDMPolicy
+// / CheckGroupPolicy later verify via IsPaired.
+func (c *Channel) sendPairingReply(ctx context.Context, pairingSenderID, chatID, peerKind string) {
+	ps := c.PairingService()
+	if ps == nil {
 		return
 	}
-	c.MarkPairingNotifSent(senderID)
-	slog.Info("bitrix24: pairing required (Phase 07 will send pairing reply)",
-		"sender_id", senderID, "chat_id", chatID, "peer_kind", peerKind,
+	if !c.CanSendPairingNotif(pairingSenderID, pairingDebounce) {
+		return
+	}
+
+	code, err := ps.RequestPairing(ctx, pairingSenderID, c.Name(), chatID, "default", nil)
+	if err != nil {
+		slog.Debug("bitrix24 pairing: request failed",
+			"sender_id", pairingSenderID, "chat_id", chatID, "err", err)
+		return
+	}
+
+	replyText := c.SystemMessage("", systemmessages.KeyPairingAccountRequired, systemmessages.Vars{
+		"platform":  "Bitrix24",
+		"sender_id": pairingSenderID,
+		"code":      code,
+	})
+
+	if err := c.sendChunkV2Public(ctx, chatID, replyText, 0); err != nil {
+		slog.Warn("bitrix24 pairing: reply send failed",
+			"sender_id", pairingSenderID, "chat_id", chatID, "err", err)
+		return
+	}
+	c.MarkPairingNotifSent(pairingSenderID)
+	slog.Info("bitrix24 pairing: reply sent",
+		"sender_id", pairingSenderID, "chat_id", chatID, "peer_kind", peerKind,
 		"portal", c.cfg.Portal)
 }
 
@@ -436,12 +675,18 @@ const pairingDebounce = 60 * time.Second
 //     direct-message handling, which bypasses the require-mention gate
 //     and routes traffic to a `direct:chatNN` session key instead of
 //     `group:chatNN`, mixing per-task context into per-user history.
+//   - "B"             — Bitrix24 workgroup / Collab (SONET_GROUP) chat,
+//     observed with CHAT_TYPE=B and CHAT_ENTITY_TYPE=SONET_GROUP. Same
+//     group semantics as "C" / "X" — multi-user by design, @mention
+//     gating applies. Without this branch the @mention prefix never
+//     renders on the bot's reply (it'd address the wrong member by
+//     name) and per-user history bleeds into one direct session.
 //
 // Anything else (including the empty string) is treated as a direct
 // message so stricter DM policies apply.
 func isGroupMessageType(mt string) bool {
 	switch strings.ToUpper(strings.TrimSpace(mt)) {
-	case "C", "CHAT", "O", "OPEN", "X":
+	case "B", "C", "CHAT", "O", "OPEN", "X":
 		return true
 	default:
 		return false

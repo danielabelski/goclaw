@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -11,6 +12,8 @@ import (
 	mcpclient "github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/client/transport"
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
 // connectAndDiscover creates a client, initializes the MCP handshake, and
@@ -116,6 +119,18 @@ func (m *Manager) connectServer(ctx context.Context, name, transportType, comman
 	registeredNames := m.registerBridgeTools(ss, mcpTools, name, toolPrefix, timeoutSec, serverID, hints, toolAllow, toolDeny)
 	ss.toolNames = registeredNames
 
+	// Cache tool descriptions + parameter schemas for prompt preview (no live connection needed)
+	if serverID != uuid.Nil && m.store != nil && len(mcpTools) > 0 {
+		toolInfo := buildCachedToolInfo(mcpTools)
+		go func(sid uuid.UUID, info map[string]store.CachedToolInfo) {
+			cacheCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := m.store.CacheToolDescriptions(cacheCtx, sid, info); err != nil {
+				slog.Debug("mcp.cache_tool_descriptions.failed", "server_id", sid, "error", err)
+			}
+		}(serverID, toolInfo)
+	}
+
 	// Create health monitoring context
 	hctx, hcancel := context.WithCancel(context.Background())
 	ss.cancel = hcancel
@@ -202,6 +217,18 @@ func (m *Manager) connectViaPool(ctx context.Context, tenantID uuid.UUID, name, 
 
 	// Create per-agent BridgeTools from the pool's shared connection
 	registeredNames := m.registerPoolBridgeTools(entry, name, toolPrefix, timeoutSec, serverID, hints, toolAllow, toolDeny)
+
+	// Cache tool descriptions + parameter schemas for prompt preview (no live connection needed)
+	if serverID != uuid.Nil && m.store != nil && len(entry.tools) > 0 {
+		toolInfo := buildCachedToolInfo(entry.tools)
+		go func(sid uuid.UUID, info map[string]store.CachedToolInfo) {
+			cacheCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := m.store.CacheToolDescriptions(cacheCtx, sid, info); err != nil {
+				slog.Debug("mcp.cache_tool_descriptions.failed", "server_id", sid, "error", err)
+			}
+		}(serverID, toolInfo)
+	}
 
 	// Track server state and per-agent tool names.
 	// poolServers/poolToolNames keyed by plain name for Close() iteration.
@@ -482,4 +509,28 @@ func fullReconnect(ctx context.Context, ss *serverState) bool {
 
 	_ = oldClient.Close()
 	return true
+}
+
+// buildCachedToolInfo converts live-discovered MCP tools into the cache
+// shape stored under a server's settings "tool_cache" key, capturing both
+// the description and the real input JSON Schema (reusing the same
+// conversion the live BridgeTool path uses, see inputSchemaToMap in
+// bridge_tool.go), so preview mode can render accurate parameter schemas
+// without a live connection.
+func buildCachedToolInfo(mcpTools []mcpgo.Tool) map[string]store.CachedToolInfo {
+	toolInfo := make(map[string]store.CachedToolInfo, len(mcpTools))
+	for _, t := range mcpTools {
+		schema := inputSchemaToMap(t.InputSchema)
+		schemaJSON, err := json.Marshal(schema)
+		if err != nil {
+			slog.Debug("mcp.build_cached_tool_info.marshal_schema_failed", "tool", t.Name, "error", err)
+			toolInfo[t.Name] = store.CachedToolInfo{Description: t.Description}
+			continue
+		}
+		toolInfo[t.Name] = store.CachedToolInfo{
+			Description: t.Description,
+			Parameters:  schemaJSON,
+		}
+	}
+	return toolInfo
 }

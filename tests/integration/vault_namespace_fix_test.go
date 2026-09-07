@@ -35,12 +35,12 @@ func TestVaultNamespaceFix_thuyTienScenario(t *testing.T) {
 	ws := t.TempDir()
 	relPath := "KG_03_Danh_Muc_San_Pham.md"
 	body := "Product catalog body"
-	if err := os.WriteFile(filepath.Join(ws, relPath), []byte(body), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(tenantWorkspaceDir(t, ws, tenantID), relPath), []byte(body), 0o644); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
 
 	userID := "kguser-" + agentID.String()[:8]
-	ctx := store.WithUserID(store.WithAgentID(tenantCtx(tenantID), agentID), userID)
+	ctx := store.WithUserID(store.WithAgentID(tenantCtxSlug(tenantID), agentID), userID)
 
 	// Seed vault doc.
 	vdoc := makeSharedVaultDoc(tenantID.String(), relPath, "KG_03 Danh Muc San Pham")

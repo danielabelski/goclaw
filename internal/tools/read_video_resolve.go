@@ -13,6 +13,7 @@ import (
 
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/security"
+	usagecaps "github.com/nextlevelbuilder/goclaw/internal/usage/caps"
 )
 
 // resolveVideoFile finds the video file path from context MediaRefs.
@@ -43,6 +44,7 @@ func (t *ReadVideoTool) resolveVideoFile(ctx context.Context, mediaID string) (p
 
 	// Prefer persisted workspace path; fall back to legacy .media/ lookup.
 	p := ref.Path
+	loadedLegacy := false
 	if p == "" {
 		var err error
 		if t.mediaLoader == nil {
@@ -52,6 +54,16 @@ func (t *ReadVideoTool) resolveVideoFile(ctx context.Context, mediaID string) (p
 		if err != nil {
 			return "", "", fmt.Errorf("video file not found: %v", err)
 		}
+		loadedLegacy = true
+	}
+
+	if loadedLegacy {
+		p, err = resolveLoadedMediaRefPath(ctx, t.mediaLoader, p, "video")
+	} else {
+		p, err = resolveStructuredMediaRefPath(ctx, p, "video")
+	}
+	if err != nil {
+		return "", "", err
 	}
 
 	mime = ref.MimeType
@@ -89,7 +101,17 @@ func (t *ReadVideoTool) callProvider(ctx context.Context, cp credentialProvider,
 			Model:    model,
 			Options:  map[string]any{"max_tokens": 16384},
 		}
-		reservation, reserveErr := reserveToolLLMUsage(ctx, t.usageCaps, t.Name(), providerName, model, chatReq)
+		// The reservation differs by transport. The base64 path has the real
+		// bytes now and counts them. The URL-stream path never buffers the
+		// payload, so it cannot prove completeInput and fails closed under an
+		// agent budget rather than trusting Content-Length.
+		var reservation *usagecaps.Reservation
+		var reserveErr error
+		if videoURL != "" {
+			reservation, reserveErr = reserveToolLLMUsageUnverifiableMedia(ctx, t.usageCaps, t.Name(), providerName, model, chatReq)
+		} else {
+			reservation, reserveErr = reserveToolLLMUsageWithMedia(ctx, t.usageCaps, t.Name(), providerName, model, chatReq, mime, data)
+		}
 		if reserveErr != nil {
 			return nil, nil, reserveErr
 		}

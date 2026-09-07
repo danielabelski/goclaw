@@ -109,6 +109,14 @@
     "behaviorDesc": "Cấu hình hành vi phản hồi",
     "accessControl": "Kiểm soát truy cập",
     "accessControlDesc": "Giới hạn truy cập người dùng",
+    "telegramManagement": "Quản trị Telegram",
+    "telegramManagementDesc": "Bật tool ẩn và chọn quyền thao tác Telegram cho agent chạy qua channel này",
+    "discordMetadata": "Metadata Discord",
+    "discordMetadataDesc": "Làm mới cache tên channel, category, thread và user Discord đã biết từ bot đang chạy.",
+    "refreshDiscordMetadata": "Làm mới metadata Discord",
+    "refreshingDiscordMetadata": "Đang làm mới...",
+    "discordMetadataRefreshed": "Đã làm mới metadata Discord",
+    "discordMetadataRefreshFailed": "Làm mới metadata Discord thất bại",
     "reviewDiagnostics": "Xem chẩn đoán mới nhất của channel này trước khi thay đổi cài đặt.",
     "whatHappened": "Điều gì đã xảy ra",
     "recommendedAction": "Hành động được khuyến nghị",
@@ -201,6 +209,7 @@
       "title": "Trích xuất bộ nhớ thụ động",
       "description": "Trích xuất các sự kiện dài hạn từ traffic nhóm vào hàng chờ duyệt bộ nhớ.",
       "pendingCount": "{{count}} chờ duyệt",
+      "unprocessedCount": "{{count}} tin chưa xử lý",
       "enable": "Bật trích xuất thụ động",
       "reviewMode": "Yêu cầu duyệt trước khi ghi",
       "interval": "Chu kỳ (phút)",
@@ -210,13 +219,29 @@
       "types": "Loại bộ nhớ",
       "excludeUsers": "User loại trừ",
       "excludePatterns": "Pattern loại trừ",
-      "runNow": "Chạy ngay",
+      "channelCustomPrompt": "Prompt trích xuất cấp channel",
+      "excludeGroups": "Channel Discord loại trừ",
+      "excludeGroupsPlaceholder": "Chọn channel cần loại trừ",
+      "manualExcludePlaceholder": "Dán Discord channel ID",
+      "useDiscordChannelId": "Dùng Discord channel ID:",
+      "addExcludedGroup": "Thêm",
+      "noExcludeGroups": "Chưa có lịch sử channel Discord.",
+      "noExcludedGroups": "Chưa loại trừ channel nào.",
+      "removeExcludedGroup": "Bỏ {{group}} khỏi danh sách loại trừ",
+      "runNow": "Chạy nhóm mới nhất",
+      "processAll": "Chạy tất cả nhóm",
       "save": "Lưu",
       "saving": "Đang lưu...",
       "saved": "Đã lưu cấu hình bộ nhớ",
       "saveFailed": "Lưu cấu hình bộ nhớ thất bại",
       "runQueued": "Đã bắt đầu trích xuất bộ nhớ",
+      "runAllDone": "Đã xử lý {{messages}} tin nhắn qua {{runs}} nhóm",
       "runFailed": "Trích xuất bộ nhớ thất bại",
+      "runAllProgress": "Tiến độ chạy tất cả nhóm",
+      "runAllProgressStats": "{{runs}} xong, {{skipped}} bỏ qua, {{errors}} lỗi, {{messages}} tin nhắn",
+      "groupCompleted": "Đã xử lý nhóm {{historyKey}}",
+      "groupSkipped": "Bỏ qua nhóm {{historyKey}} vì chưa đủ số tin nhắn tối thiểu ({{messageCount}} tin nhắn)",
+      "groupFailed": "Nhóm {{historyKey}} lỗi: {{error}}",
       "itemUpdated": "Đã cập nhật mục bộ nhớ",
       "itemFailed": "Thao tác mục bộ nhớ thất bại",
       "reviewQueue": "Hàng chờ duyệt",
@@ -228,6 +253,10 @@
       "approve": "Duyệt",
       "reject": "Từ chối",
       "delete": "Xóa",
+      "debugBadge": {
+        "topic": "Chủ đề",
+        "entity": "Thực thể"
+      },
       "type": {
         "people": "Con người",
         "projects": "Dự án",
@@ -235,7 +264,10 @@
         "todos": "Việc cần làm",
         "preferences": "Sở thích",
         "events": "Sự kiện"
-      }
+      },
+      "groupCustomPrompt": "Prompt trích xuất cấp group",
+      "groupCustomPromptPlaceholder": "Chọn group cần tinh chỉnh",
+      "noPromptGroups": "Chưa có lịch sử channel Discord."
     },
     "timeline": {
       "title": "Dòng thời gian",
@@ -285,45 +317,162 @@
     }
   },
   "fieldConfig": {
-    "token": { "label": "Bot Token", "help": "Từ @BotFather" },
-    "bot_token": { "label": "Bot Token" },
-    "app_token": { "label": "Token cấp ứng dụng", "help": "Token cấp ứng dụng với scope connections:write (bắt buộc cho Socket Mode)" },
-    "user_token": { "label": "Token người dùng (Tùy chọn)", "help": "Tùy chọn: Token OAuth người dùng cho danh tính bot tùy chỉnh. Để trống để dùng danh tính bot mặc định." },
-    "app_id": { "label": "App ID" },
-    "app_secret": { "label": "App Secret" },
-    "encrypt_key": { "label": "Khóa mã hóa", "help": "Cho chế độ webhook" },
-    "verification_token": { "label": "Token xác minh", "help": "Cho chế độ webhook" },
-    "webhook_secret": { "label": "Webhook Secret" },
-    "api_server": { "label": "URL máy chủ API", "help": "Máy chủ API Bot Telegram tùy chỉnh cho tải file lớn (lên đến 2GB). Để trống cho mặc định." },
-    "proxy": { "label": "Proxy HTTP", "help": "Định tuyến lưu lượng bot qua proxy HTTP" },
-    "dm_policy": { "label": "Chính sách DM" },
-    "group_policy": { "label": "Chính sách nhóm" },
-    "require_mention": { "label": "Yêu cầu @đề cập trong nhóm", "disabledHint": "Chế độ đa bot luôn lắng nghe tất cả tin nhắn" },
-    "mention_mode": { "label": "Hành vi phản hồi nhóm", "help": "Cách bot quyết định khi nào phản hồi trong nhóm có nhiều bot." },
-    "history_limit": { "label": "Giới hạn lịch sử nhóm", "help": "Số tin nhắn nhóm chờ tối đa cho ngữ cảnh (0 = tắt)" },
-    "dm_stream": { "label": "Stream DM", "help": "Truyền phản hồi liên tục trong DM" },
-    "group_stream": { "label": "Stream nhóm", "help": "Truyền phản hồi liên tục trong nhóm" },
-    "draft_transport": { "label": "Xem trước nháp", "help": "Dùng bản nháp ẩn cho stream trả lời trong DM — không thông báo mỗi lần chỉnh sửa (cần bật Stream DM)" },
-    "reasoning_delivery": { "label": "Hiện suy luận", "help": "Chọn cách hiển thị suy luận của model trong tin nhắn channel." },
-    "reaction_level": { "label": "Mức độ reaction" },
-    "media_max_mb": { "label": "Kích thước media tối đa (MB)" },
-    "link_preview": { "label": "Xem trước liên kết" },
-    "allow_from": { "label": "Người dùng được phép" },
-    "domain": { "label": "Tên miền" },
-    "connection_mode": { "label": "Chế độ kết nối", "help": "WebSocket không cần IP công khai — chỉ kết nối ra ngoài" },
-    "webhook_port": { "label": "Cổng webhook", "help": "0 = chia sẻ cổng gateway chính (khuyến nghị)" },
-    "webhook_path": { "label": "Đường dẫn webhook", "help": "Đường dẫn trên máy chủ chính cho sự kiện Lark" },
-    "webhook_url": { "label": "URL Webhook" },
-    "topic_session_mode": { "label": "Chế độ phiên chủ đề", "help": "Dùng root_id của luồng để cách ly phiên" },
-    "render_mode": { "label": "Chế độ hiển thị" },
-    "text_chunk_limit": { "label": "Giới hạn ký tự", "help": "Số ký tự tối đa mỗi tin nhắn" },
-    "group_allow_from": { "label": "Người dùng nhóm được phép", "help": "Danh sách cho phép riêng cho người gửi nhóm" },
-    "native_stream": { "label": "Stream gốc (Agents & AI Apps)", "help": "Dùng API ChatStreamer của Slack cho stream gốc. Quay về chỉnh sửa tại chỗ nếu không khả dụng." },
-    "debounce_delay": { "label": "Độ trễ debounce (ms)", "help": "Mili giây chờ trước khi gửi tin nhắn nhanh. Đặt 0 để tắt." },
-    "thread_ttl": { "label": "TTL tham gia luồng (giờ)", "help": "Số giờ trước khi bot ngừng tự động trả lời trong các luồng đã tham gia. 0 = luôn yêu cầu @đề cập." },
-    "skills": { "label": "Bộ lọc skill", "help": "Giới hạn skill khả dụng cho nhóm này" },
-    "tools": { "label": "Danh sách công cụ được phép", "help": "Giới hạn công cụ agent có thể dùng trong nhóm này" },
-    "system_prompt": { "label": "Prompt hệ thống" },
+    "token": {
+      "label": "Bot Token",
+      "help": "Từ @BotFather"
+    },
+    "bot_token": {
+      "label": "Bot Token"
+    },
+    "app_token": {
+      "label": "Token cấp ứng dụng",
+      "help": "Token cấp ứng dụng với scope connections:write (bắt buộc cho Socket Mode)"
+    },
+    "user_token": {
+      "label": "Token người dùng (Tùy chọn)",
+      "help": "Tùy chọn: Token OAuth người dùng cho danh tính bot tùy chỉnh. Để trống để dùng danh tính bot mặc định."
+    },
+    "app_id": {
+      "label": "App ID"
+    },
+    "app_secret": {
+      "label": "App Secret"
+    },
+    "encrypt_key": {
+      "label": "Khóa mã hóa",
+      "help": "Cho chế độ webhook"
+    },
+    "verification_token": {
+      "label": "Token xác minh",
+      "help": "Cho chế độ webhook"
+    },
+    "webhook_secret": {
+      "label": "Webhook Secret"
+    },
+    "api_server": {
+      "label": "URL máy chủ API",
+      "help": "Máy chủ API Bot Telegram tùy chỉnh cho tải file lớn (lên đến 2GB). Để trống cho mặc định."
+    },
+    "proxy": {
+      "label": "Proxy HTTP",
+      "help": "Định tuyến lưu lượng bot qua proxy HTTP"
+    },
+    "dm_policy": {
+      "label": "Chính sách DM"
+    },
+    "group_policy": {
+      "label": "Chính sách nhóm"
+    },
+    "require_mention": {
+      "label": "Yêu cầu @đề cập trong nhóm",
+      "disabledHint": "Chế độ đa bot luôn lắng nghe tất cả tin nhắn"
+    },
+    "mention_mode": {
+      "label": "Hành vi phản hồi nhóm",
+      "help": "Cách bot quyết định khi nào phản hồi trong nhóm có nhiều bot."
+    },
+    "history_limit": {
+      "label": "Giới hạn lịch sử nhóm",
+      "help": "Số tin nhắn nhóm chờ tối đa cho ngữ cảnh (0 = tắt)"
+    },
+    "dm_stream": {
+      "label": "Stream DM",
+      "help": "Truyền phản hồi liên tục trong DM"
+    },
+    "group_stream": {
+      "label": "Stream nhóm",
+      "help": "Truyền phản hồi liên tục trong nhóm"
+    },
+    "draft_transport": {
+      "label": "Xem trước nháp",
+      "help": "Dùng bản nháp ẩn cho stream trả lời trong DM — không thông báo mỗi lần chỉnh sửa (cần bật Stream DM)"
+    },
+    "reasoning_delivery": {
+      "label": "Hiện suy luận",
+      "help": "Chọn cách hiển thị suy luận của model trong tin nhắn channel."
+    },
+    "reaction_level": {
+      "label": "Mức độ reaction"
+    },
+    "activity_indicator": {
+      "label": "Chỉ báo hoạt động",
+      "help": "Hiển thị chỉ báo \"agent đang làm việc\" (đang nghĩ/tìm/tạo…) trong lúc agent xử lý. Tạm thời, không phải tin nhắn."
+    },
+    "media_max_mb": {
+      "label": "Kích thước media tối đa (MB)"
+    },
+    "link_preview": {
+      "label": "Xem trước liên kết"
+    },
+    "allow_from": {
+      "label": "Người dùng được phép"
+    },
+    "telegram_manager": {
+      "enabled": {
+        "label": "Bật công cụ quản trị Telegram",
+        "help": "Chỉ áp dụng cho agent chạy qua channel Telegram này. Tool này là tool ẩn, không hiện trong hồ sơ công cụ chung."
+      },
+      "allowed_actions": {
+        "label": "Quyền quản trị Telegram",
+        "help": "Chọn các thao tác Telegram mà agent được phép dùng. Nếu chưa chọn quyền nào thì tool không được cấp cho agent."
+      }
+    },
+    "domain": {
+      "label": "Tên miền"
+    },
+    "connection_mode": {
+      "label": "Chế độ kết nối",
+      "help": "WebSocket không cần IP công khai — chỉ kết nối ra ngoài"
+    },
+    "webhook_port": {
+      "label": "Cổng webhook",
+      "help": "0 = chia sẻ cổng gateway chính (khuyến nghị)"
+    },
+    "webhook_path": {
+      "label": "Đường dẫn webhook",
+      "help": "Đường dẫn trên máy chủ chính cho sự kiện Lark"
+    },
+    "webhook_url": {
+      "label": "URL Webhook"
+    },
+    "topic_session_mode": {
+      "label": "Chế độ phiên chủ đề",
+      "help": "Dùng root_id của luồng để cách ly phiên"
+    },
+    "render_mode": {
+      "label": "Chế độ hiển thị"
+    },
+    "text_chunk_limit": {
+      "label": "Giới hạn ký tự",
+      "help": "Số ký tự tối đa mỗi tin nhắn"
+    },
+    "group_allow_from": {
+      "label": "Người dùng nhóm được phép",
+      "help": "Danh sách cho phép riêng cho người gửi nhóm"
+    },
+    "native_stream": {
+      "label": "Stream gốc (Agents & AI Apps)",
+      "help": "Dùng API ChatStreamer của Slack cho stream gốc. Quay về chỉnh sửa tại chỗ nếu không khả dụng."
+    },
+    "debounce_delay": {
+      "label": "Độ trễ debounce (ms)",
+      "help": "Mili giây chờ trước khi gửi tin nhắn nhanh. Đặt 0 để tắt."
+    },
+    "thread_ttl": {
+      "label": "TTL tham gia luồng (giờ)",
+      "help": "Số giờ trước khi bot ngừng tự động trả lời trong các luồng đã tham gia. 0 = luôn yêu cầu @đề cập."
+    },
+    "skills": {
+      "label": "Bộ lọc skill",
+      "help": "Giới hạn skill khả dụng cho nhóm này"
+    },
+    "tools": {
+      "label": "Danh sách công cụ được phép",
+      "help": "Giới hạn công cụ agent có thể dùng trong nhóm này"
+    },
+    "system_prompt": {
+      "label": "Prompt hệ thống"
+    },
     "chat_behavior": {
       "enabled": {
         "label": "Hành vi gửi tin tự nhiên",
@@ -396,8 +545,14 @@
         }
       }
     },
-    "platform": { "label": "Nền tảng", "help": "Chọn nền tảng mà trang Pancake này phục vụ." },
-    "tiktok_type": { "label": "Loại tài khoản TikTok", "help": "Chọn loại tài khoản TikTok cho trang này" },
+    "platform": {
+      "label": "Nền tảng",
+      "help": "Chọn nền tảng mà trang Pancake này phục vụ."
+    },
+    "tiktok_type": {
+      "label": "Loại tài khoản TikTok",
+      "help": "Chọn loại tài khoản TikTok cho trang này"
+    },
     "features.private_reply": {
       "label": "Private Reply (Comment → DM)",
       "help": "Gửi tin nhắn riêng cho người bình luận sau khi đã trả lời công khai. Chỉ Facebook/Instagram. Meta cho phép DM trong vòng 7 ngày kể từ khi có bình luận."
@@ -433,6 +588,16 @@
       "streaming_only": "Chỉ khi streaming",
       "always_bubbles": "Luôn thành bubble",
       "off": "Tắt"
+    },
+    "telegram_manager": {
+      "allowed_actions": {
+        "topic": "Quản lý chủ đề",
+        "message": "Quản lý tin nhắn",
+        "member": "Quản lý thành viên",
+        "invite": "Quản lý link mời",
+        "chat": "Thông tin/cài đặt nhóm",
+        "join_request": "Duyệt yêu cầu tham gia"
+      }
     },
     "chat_behavior": {
       "enabled": {
@@ -492,17 +657,17 @@
       "card": "Thẻ"
     },
     "platform": {
-      "facebook":    "Facebook",
-      "instagram":   "Instagram",
-      "threads":     "Threads (Beta)",
-      "tiktok":      "TikTok",
-      "youtube":     "YouTube (Beta)",
-      "shopee":      "Shopee",
-      "line":        "Line",
-      "google":      "Google",
+      "facebook": "Facebook",
+      "instagram": "Instagram",
+      "threads": "Threads (Beta)",
+      "tiktok": "TikTok",
+      "youtube": "YouTube (Beta)",
+      "shopee": "Shopee",
+      "line": "Line",
+      "google": "Google",
       "chat_plugin": "Chat Plugin (Website)",
-      "lazada":      "Lazada",
-      "tokopedia":   "Tokopedia"
+      "lazada": "Lazada",
+      "tokopedia": "Tokopedia"
     }
   },
   "groupOverrides": {
@@ -518,10 +683,22 @@
     "addTopicPlaceholder": "ID luồng chủ đề",
     "addTopic": "Thêm chủ đề",
     "fieldConfig": {
-      "dm_stream": { "label": "Stream DM", "help": "Truyền phản hồi liên tục trong DM" },
-      "group_stream": { "label": "Stream Nhóm", "help": "Truyền phản hồi liên tục trong nhóm" },
-      "draft_transport": { "label": "Xem trước nháp", "help": "Dùng bản nháp ẩn cho stream trả lời trong DM — không thông báo mỗi lần chỉnh sửa (cần bật Stream DM)" },
-      "reasoning_delivery": { "label": "Hiện suy luận", "help": "Chọn cách hiển thị suy luận của model trong tin nhắn channel." }
+      "dm_stream": {
+        "label": "Stream DM",
+        "help": "Truyền phản hồi liên tục trong DM"
+      },
+      "group_stream": {
+        "label": "Stream Nhóm",
+        "help": "Truyền phản hồi liên tục trong nhóm"
+      },
+      "draft_transport": {
+        "label": "Xem trước nháp",
+        "help": "Dùng bản nháp ẩn cho stream trả lời trong DM — không thông báo mỗi lần chỉnh sửa (cần bật Stream DM)"
+      },
+      "reasoning_delivery": {
+        "label": "Hiện suy luận",
+        "help": "Chọn cách hiển thị suy luận của model trong tin nhắn channel."
+      }
     },
     "fields": {
       "groupPolicy": "Chính sách nhóm",
@@ -621,7 +798,15 @@
       "createFirst": "Kết nối portal Bitrix24 đầu tiên",
       "createNew": "Tạo portal mới",
       "pendingBadge": "Chưa authorize — click để resume",
-      "loadError": "Không tải được danh sách portal. Refresh để thử lại."
+      "loadError": "Không tải được danh sách portal. Refresh để thử lại.",
+      "deleteAria": "Xoá portal {{name}}",
+      "deleteConfirm": {
+        "title": "Xoá portal chờ cài đặt",
+        "description": "Xoá portal chờ cài đặt \"{{name}}\"? Portal chưa hoàn tất cài đặt và chưa được channel nào dùng. Không thể hoàn tác.",
+        "confirmLabel": "Xoá",
+        "success": "Đã xoá portal \"{{name}}\"",
+        "error": "Xoá portal thất bại"
+      }
     },
     "errors": {
       "portalRequired": "Vui lòng chọn portal.",

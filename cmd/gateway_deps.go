@@ -5,11 +5,13 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/audio"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/cache"
+	"github.com/nextlevelbuilder/goclaw/internal/channelmemory"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/eventbus"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
 	httpapi "github.com/nextlevelbuilder/goclaw/internal/http"
+	"github.com/nextlevelbuilder/goclaw/internal/memory"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/skills"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
@@ -27,6 +29,7 @@ type gatewayDeps struct {
 	pgStores         *store.Stores
 	providerRegistry *providers.Registry
 	channelMgr       *channels.Manager
+	channelMemorySvc *channelmemory.Service
 	agentRouter      *agent.Router
 	toolsReg         *tools.Registry
 	skillsLoader     *skills.Loader         // optional: enables skill creation in evolution approval
@@ -39,4 +42,5 @@ type gatewayDeps struct {
 	usageCapSvc      *usagecaps.Service
 	audioMgr         *audio.Manager      // nil if TTS not configured; used by TTSHandler
 	ttsHandler       *httpapi.TTSHandler // nil if TTS not configured; for hot-reload
+	teamWorkEmbedder memory.EmbeddingProvider
 }

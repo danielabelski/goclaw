@@ -40,6 +40,19 @@ func (p *OpenAIProvider) buildRequestBody(model string, req ChatRequest, stream 
 	// Matching OpenClaw TS: model-compat.ts → isOpenAINativeEndpoint().
 	useDevRole := isOpenAINativeEndpoint(p.apiBase)
 
+	// A conversation where some assistant turn captured reasoning is running in
+	// thinking mode, so every replayed assistant message must carry the field —
+	// turns that produced no reasoning of their own included. DeepSeek rejects
+	// the gap with HTTP 400 "The `reasoning_content` in the thinking mode must
+	// be passed back to the API." Trace: 01a04c34-a74b-7be7-973e-2cb66ea68f3d.
+	historyHasReasoning := false
+	for _, m := range inputMessages {
+		if m.Role == "assistant" && m.Thinking != "" {
+			historyHasReasoning = true
+			break
+		}
+	}
+
 	// Convert messages to proper OpenAI wire format.
 	// This is necessary because our internal Message/ToolCall structs don't match
 	// the OpenAI API format (tool_calls need type+function wrapper, arguments as JSON string).
@@ -63,12 +76,14 @@ func (p *OpenAIProvider) buildRequestBody(model string, req ChatRequest, stream 
 		// kimi-k2-turbo-preview), assistant tool-call messages MUST carry
 		// reasoning_content even if empty — otherwise upstream returns 400 "thinking
 		// is enabled but reasoning_content is missing in assistant tool call message".
+		// DeepSeek enforces the same rule, but only once the conversation is in
+		// thinking mode (historyHasReasoning).
 		if m.Role == "assistant" && openAIWireAssistantReasoningContent(model) {
 			switch {
 			case m.Thinking != "":
 				msg["reasoning_content"] = m.Thinking
-			case p.providerType == "kimi_coding":
-				// Send empty string rather than omit the field — satisfies Kimi's
+			case p.providerType == "kimi_coding" || historyHasReasoning:
+				// Send empty string rather than omit the field — satisfies the
 				// "must be present" check without inventing reasoning content.
 				msg["reasoning_content"] = ""
 			}
@@ -146,17 +161,40 @@ func (p *OpenAIProvider) buildRequestBody(model string, req ChatRequest, stream 
 			// (FunctionResponse.name). Most other OpenAI-compat hosts (Together, Groq,
 			// vLLM) either ignore or reject unknown fields — gate to Gemini only to
 			// avoid silent 400s on stricter proxies.
-			if supportsThoughtSignature {
-				if name := toolNameByID[m.ToolCallID]; name != "" {
-					msg["name"] = name
-				} else if m.Role == "tool" {
-					slog.Warn("openai: tool msg without matching tool_call",
-						"provider", p.name, "tool_call_id", m.ToolCallID)
+			if supportsThoughtSignature && m.Role == "tool" {
+				// Prefer the name carried on the message: it survives pruning,
+				// truncation and tool_call collapse. Fall back to the reverse index
+				// for history persisted before Message.ToolName existed.
+				name := m.ToolName
+				if name == "" {
+					name = toolNameByID[m.ToolCallID]
 				}
+				if name == "" {
+					// Gemini pairs functionCall↔functionResponse by name and has no
+					// tool_call_id to fall back on, so an empty name is a hard 400
+					// ("Name cannot be empty"). A synthetic name is not an option
+					// either — it would match no prior functionCall. Dropping the
+					// unlabelled result is the only way to keep the request valid.
+					// Reachable only for legacy history whose assistant tool_call is
+					// already out of the window, so nothing dangles by removing it.
+					slog.Warn("openai: dropping tool result with unresolvable tool name",
+						"provider", p.name, "tool_call_id", m.ToolCallID)
+					continue
+				}
+				msg["name"] = name
 			}
 		}
 
 		msgs = append(msgs, msg)
+	}
+
+	// Apply DashScope cache_control wrapping (verified live 2026-05-08).
+	// Uses 3-source detection from p.isDashScope() (URL + providerType + name)
+	// to handle reverse-proxied endpoints. No-op for non-DashScope endpoints
+	// or when env disabled. For native OpenAI, role mapping above renames
+	// "system"→"developer" so wrap is a no-op (role guard).
+	if p.isDashScope() && !dashScopeCacheDisabled() && len(msgs) > 0 {
+		msgs[0] = wrapSystemForDashScopeCache(msgs[0])
 	}
 
 	// Safety net: strip trailing assistant message to prevent HTTP 400 from
@@ -182,6 +220,19 @@ func (p *OpenAIProvider) buildRequestBody(model string, req ChatRequest, stream 
 			body["tool_choice"] = tc
 		} else {
 			body["tool_choice"] = "auto"
+		}
+	}
+
+	// DashScope tool prefix cache: cache_control on last tool definition
+	// caches the entire tools array (descriptions + schemas, ~5-10K tokens).
+	// Combined with system block cache: 2/4 markers used, 99.5% hit rate verified.
+	if p.isDashScope() && !dashScopeCacheDisabled() {
+		if t, ok := body["tools"].([]map[string]any); ok && len(t) > 0 {
+			markersFromSystem := 0
+			if len(msgs) > 0 {
+				markersFromSystem = countCacheControlMarkers(msgs[0])
+			}
+			body["tools"] = applyDashScopeToolPrefixCache(t, markersFromSystem)
 		}
 	}
 
@@ -247,8 +298,55 @@ func (p *OpenAIProvider) buildRequestBody(model string, req ChatRequest, stream 
 		}
 	}
 
+	// Ollama-specific: inject options.num_ctx to set the context window size.
+	// Without this, Ollama defaults to a small context (often 2048) and returns
+	// context-window errors on long conversations.
+	// Priority: user-configured ollamaNumCtx > pre-queried /api/show value > 131072 default.
+	// Also disable thinking by default to prevent bloated chain-of-thought responses
+	// from models like qwq and deepseek-r1 which have thinking enabled by default.
+	if p.isOllamaEndpoint() {
+		numCtx := OllamaDefaultNumCtx
+		numCtxSource := "default"
+		if p.ollamaNumCtx != nil {
+			numCtx = *p.ollamaNumCtx
+			numCtxSource = "configured"
+		}
+		slog.Debug("ollama.request: injecting num_ctx into options",
+			"provider", p.name,
+			"model", model,
+			"num_ctx", numCtx,
+			"source", numCtxSource,
+		)
+		body["options"] = map[string]any{
+			"num_ctx": numCtx,
+		}
+		if bodyBytes, err := json.Marshal(body); err == nil {
+			raw := string(bodyBytes)
+			if len(raw) > 500 {
+				raw = raw[:500] + "..."
+			}
+			slog.Debug("ollama.request: final request body (first 500 chars)", "provider", p.name, "model", model, "body_prefix", raw)
+		}
+		// Thinking visibility: provider-level override (settings.thinking_enabled)
+		// takes precedence; otherwise disable thinking by default (models like
+		// qwq/deepseek-r1 have thinking on by default) unless the caller
+		// explicitly requests a reasoning effort level.
+		switch {
+		case p.thinkingEnabled != nil:
+			body["think"] = *p.thinkingEnabled
+		default:
+			if level, _ := req.Options[OptThinkingLevel].(string); level == "" || level == "off" {
+				body["think"] = false
+			}
+		}
+	}
+
 	// DashScope-specific passthrough keys — never send to other OpenAI-compat hosts.
 	if p.dashScopePassthroughKeys() {
+		if level, ok := req.Options[OptThinkingLevel].(string); ok && level != "" && level != "off" && dashscopeThinkingModels[model] {
+			body[OptEnableThinking] = true
+			body[OptThinkingBudget] = dashscopeThinkingBudget(level)
+		}
 		if v, ok := req.Options[OptEnableThinking]; ok {
 			body[OptEnableThinking] = v
 		}

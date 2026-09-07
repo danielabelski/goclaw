@@ -21,6 +21,8 @@ type SnapshotWorker struct {
 	wg          sync.WaitGroup
 }
 
+const recentUsageRefreshWindow = 2 * time.Hour
+
 func NewSnapshotWorker(db *sql.DB, snapshots store.SnapshotStore, usageEvents store.UsageEventStore) *SnapshotWorker {
 	return &SnapshotWorker{
 		db:          db,
@@ -72,7 +74,7 @@ func (w *SnapshotWorker) loop() {
 	}
 }
 
-// catchUp computes snapshots for all missed hours between latest bucket and current hour.
+// catchUp computes missing buckets and refreshes recent closed buckets that may have late writes.
 func (w *SnapshotWorker) catchUp() {
 	ctx := context.Background()
 	w.catchUpSnapshots(ctx)
@@ -89,13 +91,7 @@ func (w *SnapshotWorker) catchUpSnapshots(ctx context.Context) {
 		return
 	}
 
-	var startHour time.Time
-	if latest == nil {
-		// No snapshots yet — only compute the previous hour (backfill handles history)
-		startHour = targetHour
-	} else {
-		startHour = latest.Add(time.Hour)
-	}
+	startHour := usageCatchUpStartHour(latest, targetHour)
 
 	for h := startHour; !h.After(targetHour); h = h.Add(time.Hour) {
 		start := time.Now()
@@ -120,10 +116,7 @@ func (w *SnapshotWorker) catchUpUsageEvents(ctx context.Context) {
 		return
 	}
 
-	startHour := targetHour
-	if latest != nil {
-		startHour = latest.Add(time.Hour)
-	}
+	startHour := usageCatchUpStartHour(latest, targetHour)
 
 	for h := startHour; !h.After(targetHour); h = h.Add(time.Hour) {
 		start := time.Now()
@@ -133,6 +126,21 @@ func (w *SnapshotWorker) catchUpUsageEvents(ctx context.Context) {
 		}
 		slog.Info("usage event rollup computed", "hour", h.Format(time.RFC3339), "duration_ms", time.Since(start).Milliseconds())
 	}
+}
+
+func usageCatchUpStartHour(latest *time.Time, targetHour time.Time) time.Time {
+	targetHour = targetHour.UTC().Truncate(time.Hour)
+	if latest == nil {
+		// Historical backfill handles older data; steady-state startup should refresh the last closed bucket.
+		return targetHour
+	}
+
+	nextMissing := latest.UTC().Truncate(time.Hour).Add(time.Hour)
+	refreshStart := targetHour.Add(-recentUsageRefreshWindow)
+	if nextMissing.Before(refreshStart) {
+		return nextMissing
+	}
+	return refreshStart
 }
 
 // Backfill populates usage_snapshots from historical trace/span data.
@@ -171,6 +179,23 @@ func (w *SnapshotWorker) Backfill(ctx context.Context) (int, error) {
 		return count, err
 	}
 	return count + eventCount, nil
+}
+
+func (w *SnapshotWorker) RefreshBuckets(ctx context.Context, buckets []time.Time) (int, error) {
+	seen := make(map[time.Time]struct{}, len(buckets))
+	count := 0
+	for _, bucket := range buckets {
+		hour := bucket.UTC().Truncate(time.Hour)
+		if _, ok := seen[hour]; ok {
+			continue
+		}
+		seen[hour] = struct{}{}
+		if err := w.aggregateHour(ctx, hour); err != nil {
+			return count, fmt.Errorf("refresh snapshot bucket %s: %w", hour.Format(time.RFC3339), err)
+		}
+		count++
+	}
+	return count, nil
 }
 
 func (w *SnapshotWorker) backfillUsageEvents(ctx context.Context) (int, error) {
@@ -455,6 +480,27 @@ type agentChannelKey struct {
 	Channel string
 }
 
+// findTotalsSnapshotIndex returns the index of the existing totals row
+// (Provider=="" && Model=="") in snapshots matching key, or -1 if none found.
+func findTotalsSnapshotIndex(snapshots []store.UsageSnapshot, key agentChannelKey) int {
+	for i, snap := range snapshots {
+		if snap.Provider != "" || snap.Model != "" {
+			continue
+		}
+		if snap.Channel != key.Channel {
+			continue
+		}
+		var agentID uuid.UUID
+		if snap.AgentID != nil {
+			agentID = *snap.AgentID
+		}
+		if agentID == key.AgentID {
+			return i
+		}
+	}
+	return -1
+}
+
 func mergeTraceAndSpanRows(
 	bucketStart time.Time,
 	traceRows []traceAggregate,
@@ -501,8 +547,29 @@ func mergeTraceAndSpanRows(
 		snapshots = append(snapshots, snap)
 	}
 
-	// 2. Create detail rows from span data (with actual provider/model)
+	// 2. Create detail rows from span data (with actual provider/model).
+	// Defense in depth: a span row with empty provider/model would collide
+	// with the totals row's conflict-target key (agent_id, provider='',
+	// model='', channel). Instead of appending a duplicate row, merge its
+	// metrics into the existing totals row for that (agent_id, channel).
 	for _, sp := range spanRows {
+		if sp.Provider == "" && sp.Model == "" {
+			key := agentChannelKey{Channel: sp.Channel}
+			if sp.AgentID != nil {
+				key.AgentID = *sp.AgentID
+			}
+			if idx := findTotalsSnapshotIndex(snapshots, key); idx >= 0 {
+				snapshots[idx].LLMCallCount += sp.LLMCallCount
+				snapshots[idx].InputTokens += sp.InputTokens
+				snapshots[idx].OutputTokens += sp.OutputTokens
+				snapshots[idx].TotalCost += sp.TotalCost
+				snapshots[idx].CacheReadTokens += sp.CacheReadTokens
+				snapshots[idx].CacheCreateTokens += sp.CacheCreateTokens
+				snapshots[idx].ThinkingTokens += sp.ThinkingTokens
+				continue
+			}
+		}
+
 		snapshots = append(snapshots, store.UsageSnapshot{
 			BucketHour:        bucketStart,
 			AgentID:           sp.AgentID,

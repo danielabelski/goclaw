@@ -70,7 +70,7 @@ func (h *ProvidersHandler) handleListProviderModels(w http.ResponseWriter, r *ht
 	// Ollama: use native /api/tags for richer metadata (parameter size, quantization, family).
 	// ProviderOllama has no API key; ProviderOllamaCloud requires one but both use the same endpoint.
 	if p.ProviderType == store.ProviderOllama || p.ProviderType == store.ProviderOllamaCloud {
-		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(loadProviderRequestTimeoutSec(r.Context(), h.sysConfigStore))*time.Second)
 		defer cancel()
 		apiBase := h.resolveAPIBase(p)
 		if apiBase == "" {
@@ -91,22 +91,26 @@ func (h *ProvidersHandler) handleListProviderModels(w http.ResponseWriter, r *ht
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(loadProviderRequestTimeoutSec(r.Context(), h.sysConfigStore))*time.Second)
 	defer cancel()
 
 	var models []ModelInfo
 
 	switch p.ProviderType {
-	case "anthropic_native":
+	case store.ProviderAnthropicNative:
 		models, err = fetchAnthropicModels(ctx, p.APIKey, h.resolveAPIBase(p))
-	case "gemini_native":
+	case store.ProviderGeminiNative:
 		models, err = fetchGeminiModels(ctx, p.APIKey)
-	case "bailian":
+	case store.ProviderBailian:
 		models = bailianModels()
-	case "dashscope":
+	case store.ProviderDashScope:
 		models = dashScopeModels()
-	case "minimax_native":
+	case store.ProviderMiniMax:
 		models = minimaxModels()
+	case store.ProviderZai, store.ProviderZaiCoding:
+		models = zaiModels()
+	case store.ProviderAIMLAPI:
+		models = aimlapiModels()
 	default:
 		// All other types use OpenAI-compatible /models endpoint
 		apiBase := openAIModelsAPIBase(p.ProviderType, h.resolveAPIBase(p))
@@ -123,12 +127,23 @@ func (h *ProvidersHandler) handleListProviderModels(w http.ResponseWriter, r *ht
 	respond(withReasoningCapabilities(models))
 }
 
+func aimlapiModels() []ModelInfo {
+	models := providers.AIMLAPIChatModels()
+	result := make([]ModelInfo, 0, len(models))
+	for _, model := range models {
+		result = append(result, ModelInfo{ID: model, Name: model})
+	}
+	return result
+}
+
 func openAIModelsAPIBase(providerType, apiBase string) string {
 	base := strings.TrimRight(apiBase, "/")
 	if base != "" {
 		return base
 	}
 	switch providerType {
+	case store.ProviderAtlasCloud:
+		return store.AtlasCloudDefaultAPIBase
 	case store.ProviderAPIRoute:
 		return store.APIRouteDefaultAPIBase
 	case store.ProviderKimiCoding:

@@ -1,9 +1,27 @@
 package feishu
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
+
+	"github.com/google/uuid"
+
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
+
+type factoryAgentStore struct {
+	store.AgentStore
+	agent     *store.AgentData
+	gotKey    string
+	gotTenant uuid.UUID
+}
+
+func (f *factoryAgentStore) GetByKey(ctx context.Context, agentKey string) (*store.AgentData, error) {
+	f.gotKey = agentKey
+	f.gotTenant = store.TenantIDFromContext(ctx)
+	return f.agent, nil
+}
 
 func TestFactory_MissingAppID(t *testing.T) {
 	creds, _ := json.Marshal(map[string]string{"app_secret": "s"})
@@ -139,5 +157,67 @@ func TestFactoryWithPendingStore_InvalidConfigJSON(t *testing.T) {
 	_, err := factory("feishu-bad", creds, []byte("{bad"), nil, nil)
 	if err == nil {
 		t.Fatal("expected error for invalid config JSON")
+	}
+}
+
+func TestFactoryWithStoresAndAudio_WiresWriterDependencies(t *testing.T) {
+	agentID := uuid.New()
+	tenantID := uuid.New()
+	agentStore := &factoryAgentStore{agent: &store.AgentData{
+		BaseModel: store.BaseModel{ID: agentID},
+		AgentKey:  "writer-agent",
+	}}
+	configPermStore := &fakeConfigPermStore{}
+	factory := FactoryWithStoresAndAudio(agentStore, configPermStore, nil, nil)
+	creds, _ := json.Marshal(map[string]string{
+		"app_id":     "cli_store_app",
+		"app_secret": "store_secret",
+	})
+
+	raw, err := factory("feishu-with-stores", creds, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	ch, ok := raw.(*Channel)
+	if !ok {
+		t.Fatalf("factory returned %T, want *Channel", raw)
+	}
+	if ch.agentStore != agentStore {
+		t.Fatal("agent store was not wired into Feishu channel")
+	}
+	if ch.configPermStore != configPermStore {
+		t.Fatal("config permission store was not wired into Feishu channel")
+	}
+
+	srv, replies := captureReplies(t)
+	ch.client = NewLarkClient("app", "secret", srv.URL)
+	ch.botOpenID = "ou_fake_bot"
+	ch.SetAgentID("writer-agent")
+	ch.SetTenantID(tenantID)
+
+	handled := ch.maybeHandleWriterCommand(context.Background(), &messageContext{
+		ChatID:    "oc_factory_group",
+		MessageID: "om_factory_command",
+		SenderID:  "ou_alice",
+		ChatType:  "group",
+		Content:   "/addwriter @_user_1",
+		Mentions:  []mentionInfo{{Key: "@_user_1", OpenID: "ou_alice", Name: "Alice"}},
+	})
+	if !handled {
+		t.Fatal("expected /addwriter to be handled")
+	}
+	assertReplyContains(t, *replies, "Added Alice as a file writer")
+	if agentStore.gotKey != "writer-agent" {
+		t.Fatalf("agent lookup key = %q, want writer-agent", agentStore.gotKey)
+	}
+	if agentStore.gotTenant != tenantID {
+		t.Fatalf("agent lookup tenant = %s, want %s", agentStore.gotTenant, tenantID)
+	}
+	writers, err := configPermStore.ListFileWriters(context.Background(), agentID, "group:feishu-with-stores:oc_factory_group")
+	if err != nil {
+		t.Fatalf("list file writers: %v", err)
+	}
+	if len(writers) != 1 || writers[0].UserID != "ou_alice" {
+		t.Fatalf("writers = %+v, want ou_alice", writers)
 	}
 }

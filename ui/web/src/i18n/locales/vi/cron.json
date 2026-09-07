@@ -43,7 +43,8 @@
     "messagePlaceholder": "Agent cần làm gì?",
     "cancel": "Hủy",
     "create": "Tạo",
-    "creating": "Đang tạo..."
+    "creating": "Đang tạo...",
+    "payloadType": "Loại payload"
   },
   "enable": {
     "title": "Bật tác vụ định kỳ",
@@ -128,7 +129,26 @@
     "deleteAfterRun": "Xóa sau khi chạy",
     "deleteAfterRunDesc": "Tự động xóa công việc sau lần chạy thành công đầu tiên",
     "timezone": "Múi giờ",
-    "timezoneDesc": "Múi giờ cho biểu thức cron"
+    "timezoneDesc": "Múi giờ cho biểu thức cron",
+    "commandSection": "Lệnh",
+    "commandArgv": "Lệnh",
+    "noCommand": "Chưa cấu hình lệnh",
+    "commandCwd": "Thư mục làm việc",
+    "defaultWorkingDirectory": "Mặc định gateway",
+    "commandTimeout": "Thời gian chờ",
+    "commandOutputLimit": "Giới hạn output",
+    "commandEnv": "Môi trường",
+    "commandInput": "Input",
+    "commandNoOutputTimeout": "Timeout khi không có output",
+    "seconds": "{{count}}s",
+    "bytes": "{{count}} bytes",
+    "defaultValue": "Mặc định",
+    "none": "Không có",
+    "envVars": "{{count}} biến",
+    "commandJson": "JSON lệnh",
+    "commandJsonHelp": "Chỉnh sửa payload lệnh dưới dạng JSON. argv là bắt buộc và phải là mảng chuỗi không rỗng.",
+    "invalidCommandJson": "JSON lệnh không hợp lệ: argv phải là mảng không rỗng.",
+    "commandArgvHelp": "Mỗi dòng là một đối số. Dùng sh / -c / script nếu cần cú pháp shell."
   },
   "stateless": "Không trạng thái",
   "statelessHelp": "Bỏ qua lưu session. Mỗi lần chạy bắt đầu mới. Tiết kiệm token cho các cron không cần context cũ.",
@@ -145,5 +165,9 @@
     "failedRun": "Không thể chạy tác vụ định kỳ",
     "updated": "Đã cập nhật job",
     "failedUpdate": "Cập nhật job thất bại"
+  },
+  "payload": {
+    "agent": "Agent",
+    "command": "Lệnh"
   }
 }

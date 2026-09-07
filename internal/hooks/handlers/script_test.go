@@ -73,6 +73,18 @@ func TestHappyPathAllow(t *testing.T) {
 	}
 }
 
+func TestAllowReturnsAdditionalContext(t *testing.T) {
+	src := `function handle(event) { return {decision: "allow", additionalContext: "Use the required workflow."}; }`
+	h := newTestHandler()
+	dec, err, res := runWithResult(t, h, mkCfg(src), mkEvent(), 500*time.Millisecond)
+	if err != nil || dec != hooks.DecisionAllow {
+		t.Fatalf("decision=%v err=%v", dec, err)
+	}
+	if res.AdditionalContext != "Use the required workflow." {
+		t.Fatalf("additional context=%q", res.AdditionalContext)
+	}
+}
+
 // TestHappyPathBlock verifies block + reason round-trips.
 func TestHappyPathBlock(t *testing.T) {
 	src := `function handle(event) { return {decision: "block", reason: "nope"}; }`

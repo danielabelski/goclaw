@@ -4,12 +4,10 @@ import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { BehaviorUxCard } from "./behavior-ux-card";
 import { BehaviorRateCard } from "./behavior-rate-card";
-import { BehaviorSessionsCard } from "./behavior-sessions-card";
 import { BehaviorSecurityCard } from "./behavior-security-card";
 import { BehaviorPendingCompactionCard, type PendingCompactionValues } from "./behavior-pending-compaction-card";
 import { BehaviorChatCard, type ChatBehaviorValues } from "./behavior-chat-card";
-
- 
+import { BehaviorPassiveMemoryCard } from "./behavior-passive-memory-card";
 
 interface Props {
   config: Record<string, any>;
@@ -17,18 +15,18 @@ interface Props {
   saving: boolean;
 }
 
-/** State container for Behavior tab — composes 4 sub-cards, patches multiple config keys. */
+/** State container for Behavior tab cards and their patch payload. */
 export function BehaviorSection({ config, onPatch, saving }: Props) {
   const { t } = useTranslation("config");
   const gw = config.gateway ?? {};
   const ag = config.agents?.defaults ?? {};
   const tl = config.tools ?? {};
-  const ss = config.sessions ?? {};
   const ch = config.channels ?? {};
 
   // UX toggles (from gateway + agents.defaults)
   const [ux, setUx] = useState({
     intent_classify: ag.intent_classify !== false,
+    team_work_classify: gw.team_work_classify === true,
   });
 
   // Rate limiting (from gateway)
@@ -36,12 +34,6 @@ export function BehaviorSection({ config, onPatch, saving }: Props) {
     max_message_chars: gw.max_message_chars,
     rate_limit_rpm: gw.rate_limit_rpm,
     inbound_debounce_ms: gw.inbound_debounce_ms,
-  });
-
-  // Sessions
-  const [sessions, setSessions] = useState<{ scope?: string; dm_scope?: string }>({
-    scope: ss.scope,
-    dm_scope: ss.dm_scope,
   });
 
   // Security (from gateway + tools)
@@ -62,13 +54,13 @@ export function BehaviorSection({ config, onPatch, saving }: Props) {
   useEffect(() => {
     setUx({
       intent_classify: ag.intent_classify !== false,
+      team_work_classify: gw.team_work_classify === true,
     });
     setRate({
       max_message_chars: gw.max_message_chars,
       rate_limit_rpm: gw.rate_limit_rpm,
       inbound_debounce_ms: gw.inbound_debounce_ms,
     });
-    setSessions({ scope: ss.scope, dm_scope: ss.dm_scope });
     setSecurity({
       injection_action: gw.injection_action,
       scrub_credentials: tl.scrub_credentials,
@@ -82,21 +74,13 @@ export function BehaviorSection({ config, onPatch, saving }: Props) {
     (v: T) => { setter(v); setDirty(true); };
 
   const handleSave = () => {
-    onPatch({
-      gateway: {
-        max_message_chars: rate.max_message_chars,
-        rate_limit_rpm: rate.rate_limit_rpm,
-        inbound_debounce_ms: rate.inbound_debounce_ms,
-        injection_action: security.injection_action,
-        chat_behavior: chatBehavior,
-      },
-      agents: {
-        defaults: { intent_classify: ux.intent_classify },
-      },
-      tools: { scrub_credentials: security.scrub_credentials },
-      sessions,
-      channels: { pending_compaction: pendingCompaction },
-    });
+    onPatch(buildBehaviorPatch({
+      rate,
+      security,
+      chatBehavior,
+      ux,
+      pendingCompaction,
+    })).catch(() => {});
   };
 
   return (
@@ -104,9 +88,9 @@ export function BehaviorSection({ config, onPatch, saving }: Props) {
       <BehaviorUxCard value={ux} onChange={markDirty(setUx)} />
       <BehaviorChatCard value={chatBehavior} onChange={markDirty(setChatBehavior)} />
       <BehaviorRateCard value={rate} onChange={markDirty(setRate)} />
-      <BehaviorSessionsCard value={sessions} onChange={markDirty(setSessions)} />
       <BehaviorSecurityCard value={security} onChange={markDirty(setSecurity)} />
       <BehaviorPendingCompactionCard value={pendingCompaction} onChange={markDirty(setPendingCompaction)} />
+      <BehaviorPassiveMemoryCard />
 
       {dirty && (
         <div className="flex justify-end pt-2">
@@ -117,6 +101,38 @@ export function BehaviorSection({ config, onPatch, saving }: Props) {
       )}
     </div>
   );
+}
+
+export interface BehaviorPatchInput {
+  rate: { max_message_chars?: number; rate_limit_rpm?: number; inbound_debounce_ms?: number };
+  security: { injection_action?: string; scrub_credentials?: boolean };
+  chatBehavior: ChatBehaviorValues;
+  ux: { intent_classify: boolean; team_work_classify: boolean };
+  pendingCompaction: PendingCompactionValues;
+}
+
+export function buildBehaviorPatch({
+  rate,
+  security,
+  chatBehavior,
+  ux,
+  pendingCompaction,
+}: BehaviorPatchInput): Record<string, unknown> {
+  return {
+    gateway: {
+      max_message_chars: rate.max_message_chars,
+      rate_limit_rpm: rate.rate_limit_rpm,
+      inbound_debounce_ms: rate.inbound_debounce_ms,
+      injection_action: security.injection_action,
+      chat_behavior: chatBehavior,
+      team_work_classify: ux.team_work_classify,
+    },
+    agents: {
+      defaults: { intent_classify: ux.intent_classify },
+    },
+    tools: { scrub_credentials: security.scrub_credentials },
+    channels: { pending_compaction: pendingCompaction },
+  };
 }
 
 function normalizeChatBehavior(value: any): ChatBehaviorValues {

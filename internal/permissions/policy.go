@@ -124,6 +124,34 @@ func (pe *PolicyEngine) CanAccessWithScopes(scopes []Scope, method string) bool 
 	return false
 }
 
+// RoleFromTenantRole maps a `tenant_users.role` value to the gateway's
+// permissions.Role used by CanAccess. Used by the WS and HTTP browser-pairing
+// auth paths so a paired session inherits the role the user already has in
+// their tenant instead of a hard-coded operator default. String literals
+// rather than store.TenantRole* constants are used to avoid an import cycle
+// (store depends on this package transitively).
+//
+// Mapping:
+//
+//	owner            → RoleOwner
+//	admin            → RoleAdmin
+//	operator, member → RoleOperator
+//	viewer, ""       → RoleViewer
+func RoleFromTenantRole(tenantRole string) Role {
+	switch tenantRole {
+	case "owner":
+		return RoleOwner
+	case "admin":
+		return RoleAdmin
+	case "operator", "member":
+		return RoleOperator
+	case "viewer":
+		return RoleViewer
+	default:
+		return RoleViewer
+	}
+}
+
 // RoleFromScopes determines the effective role from a set of scopes.
 func RoleFromScopes(scopes []Scope) Role {
 	if slices.Contains(scopes, ScopeAdmin) {
@@ -251,10 +279,10 @@ func isAdminMethod(method string) bool {
 		protocol.MethodTeamsTaskDeleteBulk,
 
 		// Tenants — write paths.
-		"tenants.create",
-		"tenants.update",
-		"tenants.users.add",
-		"tenants.users.remove",
+		protocol.MethodTenantsCreate,
+		protocol.MethodTenantsUpdate,
+		protocol.MethodTenantsUsersAdd,
+		protocol.MethodTenantsUsersRemove,
 
 		// API keys expose secret material — gate list + mutations as admin.
 		protocol.MethodAPIKeysList,
@@ -316,6 +344,7 @@ func isWriteMethod(method string) bool {
 		protocol.MethodCronToggle,
 		protocol.MethodCronRun,
 		protocol.MethodSend,
+		protocol.MethodLLMComplete,
 		protocol.MethodAgentsFileSet,
 		protocol.MethodTeamsTaskApprove,
 		protocol.MethodTeamsTaskReject,
@@ -405,10 +434,10 @@ func isReadMethod(method string) bool {
 		protocol.MethodVoicesList,
 
 		// Tenants read
-		"tenants.list",
-		"tenants.get",
-		"tenants.users.list",
-		"tenants.mine",
+		protocol.MethodTenantsList,
+		protocol.MethodTenantsGet,
+		protocol.MethodTenantsUsersList,
+		protocol.MethodTenantsMine,
 
 		// Teams read
 		protocol.MethodTeamsList,

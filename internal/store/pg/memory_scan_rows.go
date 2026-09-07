@@ -146,11 +146,13 @@ func (r *episodicSummaryRow) toEpisodicSummary() store.EpisodicSummary {
 
 // episodicScoredRow is an sqlx scan struct for ftsSearch/vectorSearch in episodic_search.go.
 type episodicScoredRow struct {
-	ID         string    `db:"id"`
-	SessionKey string    `db:"session_key"`
-	L0Abstract string    `db:"l0_abstract"`
-	Score      float64   `db:"score"`
-	CreatedAt  time.Time `db:"created_at"`
+	ID         string         `db:"id"`
+	SessionKey string         `db:"session_key"`
+	L0Abstract string         `db:"l0_abstract"`
+	KeyTopics  pq.StringArray `db:"key_topics"`
+	Score      float64        `db:"score"`
+	CreatedAt  time.Time      `db:"created_at"`
+	ExpiresAt  *time.Time     `db:"expires_at"`
 }
 
 func (r *episodicScoredRow) toEpisodicScored() episodicScored {
@@ -158,7 +160,9 @@ func (r *episodicScoredRow) toEpisodicScored() episodicScored {
 		id:         r.ID,
 		sessionKey: r.SessionKey,
 		l0:         r.L0Abstract,
+		keyTopics:  []string(r.KeyTopics),
 		score:      r.Score,
 		createdAt:  r.CreatedAt,
+		expiresAt:  r.ExpiresAt,
 	}
 }

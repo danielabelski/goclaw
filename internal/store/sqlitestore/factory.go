@@ -34,6 +34,7 @@ func NewSQLiteStores(cfg store.StoreConfig) (*store.Stores, error) {
 	} else {
 		slog.Warn("securecli: encryption key empty, store disabled")
 	}
+	subagentTasks := NewSQLiteSubagentTaskStore(db)
 
 	sqliteStores := &store.Stores{
 		DB:                     db,
@@ -61,12 +62,14 @@ func NewSQLiteStores(cfg store.StoreConfig) (*store.Stores, error) {
 		Teams:                  NewSQLiteTeamStore(db),
 		Skills:                 NewSQLiteSkillStore(db, cfg.SkillsStorageDir),
 		MCP:                    NewSQLiteMCPServerStore(db, cfg.EncryptionKey),
+		MCPOAuthTokens:         NewSQLiteMCPOAuthTokenStore(db, cfg.EncryptionKey),
 		Activity:               NewSQLiteActivityStore(db),
 		APIKeys:                NewSQLiteAPIKeyStore(db),
 		ConfigPermissions:      NewSQLiteConfigPermissionStore(db),
 		BrowserCookies:         NewSQLiteBrowserCookieStore(db, cfg.EncryptionKey),
 		Memory:                 NewSQLiteMemoryStore(db),
-		SubagentTasks:          NewSQLiteSubagentTaskStore(db),
+		SubagentTasks:          subagentTasks,
+		SubagentTaskRecovery:   subagentTasks,
 		AgentLinks:             NewSQLiteAgentLinkStore(db),
 		SecureCLI:              secureCLI,
 		SecureCLIGrants:        NewSQLiteSecureCLIAgentGrantStore(db, cfg.EncryptionKey),

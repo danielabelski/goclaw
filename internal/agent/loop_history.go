@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"strings"
 
 	"github.com/google/uuid"
@@ -17,7 +18,7 @@ import (
 // buildMessages constructs the full message list for an LLM request.
 // Returns the messages and whether BOOTSTRAP.md was present in context files
 // (used by the caller for auto-cleanup without an extra DB roundtrip).
-func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, summary, userMessage, extraSystemPrompt, sessionKey, channel, channelType, bitrixPortalDomain, chatTitle, chatID, peerKind, userID, senderName string, historyLimit int, skillFilter []string, lightContext bool) ([]providers.Message, bool) {
+func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, summary, userMessage, extraSystemPrompt, sessionKey, channel, channelType, bitrixPortalDomain, chatTitle, chatID, peerKind, userID, senderName string, historyLimit int, skillFilter []string, lightContext bool, telegramManagerPermissions []string) ([]providers.Message, bool) {
 	var messages []providers.Message
 
 	// Build system prompt — 3-layer mode resolution: runtime > auto-detect > config
@@ -46,6 +47,14 @@ func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, s
 		promptWorkspace = tools.ResolveWorkspace(baseWs,
 			tools.UserChatLayer(tools.SanitizePathSegment(userID), shared),
 		)
+	}
+	if tools.IsDelegationArtifactRun(ctx) {
+		promptWorkspace = "."
+		const artifactGuidance = "Delegation workspace: write outputs using ordinary relative paths in the current workspace. Read staged inputs only through inputs/... . Files are returned to the caller only after runtime validation and publication."
+		if extraSystemPrompt != "" {
+			extraSystemPrompt += "\n\n"
+		}
+		extraSystemPrompt += artifactGuidance
 	}
 
 	// Resolve context files once — also detect BOOTSTRAP.md presence.
@@ -130,7 +139,7 @@ func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, s
 	// Build tool list, filtering out skill_manage when skill_evolve is off.
 	// Also applies ChannelAware filtering so channel-specific tools don't
 	// appear in ## Tooling when the current channel doesn't support them.
-	toolNames := l.filteredToolNamesForChannel(channelType)
+	toolNames := l.filteredToolNamesForChannel(channelType, telegramManagerPermissions)
 	if !l.skillEvolve {
 		filtered := toolNames[:0:0]
 		for _, n := range toolNames {
@@ -161,8 +170,13 @@ func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, s
 	// tools. Otherwise lookupMCPDescFromUserTools surfaces descriptions from
 	// any user's cache → LLM sees tools it can't actually call (executeToolForActor
 	// scoped to actorUserID returns "tool not found"). Compute actor via
-	// resolveActorUserID — same key the agent loop uses to fetch per-user MCP creds.
-	actorUserID := resolveActorUserID(userID, store.SenderIDFromContext(ctx), peerKind, channelType)
+	// CredentialUserID (merged tenant_user identity) to match the cache key
+	// used by getUserMCPTools. Fall back to resolveActorUserID for channels
+	// without merge resolution.
+	actorUserID := store.CredentialUserIDFromContext(ctx)
+	if actorUserID == "" {
+		actorUserID = resolveActorUserID(userID, store.SenderIDFromContext(ctx), peerKind, channelType)
+	}
 	mcpToolDescs := l.buildMCPToolDescs(toolNames, actorUserID)
 
 	// Bootstrap DM mode: only restrict tools for open agents (identity being created).
@@ -307,14 +321,14 @@ func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, s
 // but base-only files (like auto-injected delegation info) are preserved.
 func (l *Loop) resolveContextFiles(ctx context.Context, userID string) []bootstrap.ContextFile {
 	if l.contextFileLoader == nil || userID == "" {
-		return l.contextFiles
+		return dropBuiltinUserFileIfPredefined(l.agentType, l.contextFiles)
 	}
 	userFiles := l.contextFileLoader(ctx, l.agentUUID, userID, l.agentType)
 	if len(userFiles) == 0 {
-		return l.contextFiles
+		return dropBuiltinUserFileIfPredefined(l.agentType, l.contextFiles)
 	}
 	if len(l.contextFiles) == 0 {
-		return userFiles
+		return dropBuiltinUserFileIfPredefined(l.agentType, userFiles)
 	}
 
 	// Merge: start with per-user files, then append base-only files
@@ -329,7 +343,36 @@ func (l *Loop) resolveContextFiles(ctx context.Context, userID string) []bootstr
 			merged = append(merged, base)
 		}
 	}
-	return merged
+	return dropBuiltinUserFileIfPredefined(l.agentType, merged)
+}
+
+// dropBuiltinUserFileIfPredefined removes the built-in USER.md entry from the
+// merged context files when the agent is predefined AND has an operator-authored
+// USER_PREDEFINED.md. The operator owns the entire user-context portion of the
+// system prompt in that case, so the built-in USER.md template must never be
+// injected alongside it (per-turn name/timezone/pronoun nag).
+func dropBuiltinUserFileIfPredefined(agentType string, files []bootstrap.ContextFile) []bootstrap.ContextFile {
+	if agentType != store.AgentTypePredefined {
+		return files
+	}
+	hasUserPredefined := false
+	for _, f := range files {
+		if filepath.Base(f.Path) == bootstrap.UserPredefinedFile {
+			hasUserPredefined = true
+			break
+		}
+	}
+	if !hasUserPredefined {
+		return files
+	}
+	filtered := make([]bootstrap.ContextFile, 0, len(files))
+	for _, f := range files {
+		if filepath.Base(f.Path) == bootstrap.UserFile {
+			continue
+		}
+		filtered = append(filtered, f)
+	}
+	return filtered
 }
 
 // mergeContextFallback adds fallback (in-memory) files into contextFiles,

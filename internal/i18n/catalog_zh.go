@@ -52,8 +52,9 @@ func init() {
 		MsgInstanceNotFound:   "未找到实例",
 
 		// Cron
-		MsgJobNotFound:     "未找到任务",
-		MsgInvalidCronExpr: "无效的 cron 表达式：%s",
+		MsgJobNotFound:         "未找到任务",
+		MsgInvalidCronExpr:     "无效的 cron 表达式：%s",
+		MsgCommandCronDisabled: "此网关已禁用命令型 cron 任务（设置 cron.command_enabled=true 以允许）",
 
 		// Config
 		MsgConfigHashMismatch: "配置已更改（hash 不匹配）",
@@ -171,8 +172,10 @@ func init() {
 		MsgFailedToDeleteFile:    "删除失败",
 
 		// OAuth
-		MsgNoPendingOAuth:    "没有待处理的 OAuth 流程",
-		MsgFailedToSaveToken: "保存令牌失败",
+		MsgNoPendingOAuth:       "没有待处理的 OAuth 流程",
+		MsgFailedToSaveToken:    "保存令牌失败",
+		MsgOAuthCallbackSuccess: "授权成功。您可以关闭此窗口。",
+		MsgOAuthCallbackFailed:  "授权失败。您可以关闭此窗口。",
 
 		// Intent Classify
 		MsgStatusWorking:       "🔄 我正在处理您的请求...请稍候。",
@@ -230,6 +233,7 @@ func init() {
 		MsgSkillNudgePostscript: "此任务涉及多个步骤。要我将此过程保存为可重用技能吗？回复 **\"保存技能\"** 或 **\"跳过\"**。",
 		MsgSkillNudge70Pct:      "[System] 您已使用 70% 的迭代预算。请考虑本次会话中的模式是否值得保存为技能。",
 		MsgSkillNudge90Pct:      "[System] 您已使用 90% 的迭代预算。如果本次会话涉及可重用的模式，请考虑在完成前将其保存为技能。",
+		MsgEmptyReplyFallback:   "⚠️ 代理无法生成响应。注意：部分工具操作可能已经执行 — 请先确认后再重试",
 
 		MsgInvalidRole: "无效角色：允许的值为 owner、admin、operator、member、viewer",
 
@@ -257,28 +261,29 @@ func init() {
 		MsgVoiceMessageFallback:      "[语音消息]",
 
 		// Webhooks
-		MsgWebhookAuthFailed:              "Webhook 身份验证失败",
-		MsgWebhookHMACInvalid:             "HMAC 签名无效",
-		MsgWebhookHMACTimestampSkew:       "请求时间戳超出可接受窗口",
-		MsgWebhookBearerRequiredHMAC:      "此 Webhook 需要 HMAC 身份验证",
-		MsgWebhookRevoked:                 "Webhook 已被撤销",
-		MsgWebhookKindMismatch:            "请求类型与 Webhook 配置不匹配",
-		MsgWebhookRateLimited:             "超出 Webhook 速率限制",
-		MsgWebhookBodyTooLarge:            "请求正文超出大小限制",
-		MsgWebhookIdempotencyConflict:     "幂等键冲突：请求正文不匹配",
-		MsgWebhookTenantMismatch:          "Webhook 租户不匹配",
-		MsgWebhookAgentNotFound:           "未找到 Webhook 代理",
-		MsgWebhookChannelNotFound:         "未找到 Webhook 频道",
-		MsgWebhookMediaSSRFBlocked:        "媒体 URL 被 SSRF 策略拦截",
-		MsgWebhookMediaTooLarge:           "媒体文件超出大小限制",
-		MsgWebhookMediaMIMEDenied:         "媒体 MIME 类型不被允许",
-		MsgWebhookCallbackURLInvalid:      "回调 URL 无效或被拦截",
-		MsgWebhookLLMTimeout:              "LLM 处理超时",
-		MsgWebhookLaneSaturated:           "Webhook 处理通道已满",
-		MsgWebhookLocalhostOnlyViolation:  "此 Webhook 仅限本地调用",
-		MsgWebhookMediaChannelUnsupported: "频道不支持媒体附件",
-		MsgWebhookIPDenied:                "请求来源不在 IP 白名单中",
-		MsgWebhookEncryptionUnavailable:   "Webhook 加密密钥未配置；请设置 GOCLAW_ENCRYPTION_KEY 以启用 Webhook",
+		MsgWebhookAuthFailed:                  "Webhook 身份验证失败",
+		MsgWebhookHMACInvalid:                 "HMAC 签名无效",
+		MsgWebhookHMACTimestampSkew:           "请求时间戳超出可接受窗口",
+		MsgWebhookBearerRequiredHMAC:          "此 Webhook 需要 HMAC 身份验证",
+		MsgWebhookRevoked:                     "Webhook 已被撤销",
+		MsgWebhookKindMismatch:                "请求类型与 Webhook 配置不匹配",
+		MsgWebhookRateLimited:                 "超出 Webhook 速率限制",
+		MsgWebhookBodyTooLarge:                "请求正文超出大小限制",
+		MsgWebhookIdempotencyConflict:         "幂等键冲突：请求正文不匹配",
+		MsgWebhookTenantMismatch:              "Webhook 租户不匹配",
+		MsgWebhookAgentNotFound:               "未找到 Webhook 代理",
+		MsgWebhookChannelNotFound:             "未找到 Webhook 频道",
+		MsgWebhookMediaSSRFBlocked:            "媒体 URL 被 SSRF 策略拦截",
+		MsgWebhookMediaTooLarge:               "媒体文件超出大小限制",
+		MsgWebhookMediaMIMEDenied:             "媒体 MIME 类型不被允许",
+		MsgWebhookCallbackURLInvalid:          "回调 URL 无效或被拦截",
+		MsgWebhookLLMTimeout:                  "LLM 处理超时",
+		MsgWebhookLaneSaturated:               "Webhook 处理通道已满",
+		MsgWebhookLocalhostOnlyViolation:      "此 Webhook 仅限本地调用",
+		MsgWebhookMediaChannelUnsupported:     "频道不支持媒体附件",
+		MsgWebhookIPDenied:                    "请求来源不在 IP 白名单中",
+		MsgWebhookEncryptionUnavailable:       "Webhook 加密密钥未配置；请设置 GOCLAW_ENCRYPTION_KEY 以启用 Webhook",
+		MsgWebhookMessageTestRequiresStandard: "测试 message 类型 Webhook 需要 Standard 版本",
 
 		// Hooks
 		// Workstation

@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/nextlevelbuilder/goclaw/internal/security"
 )
 
 // --- In-memory cache (matching TS src/agents/tools/web-shared.ts) ---
@@ -120,6 +122,16 @@ func isPrivateIP(ipStr string) bool {
 		return false
 	}
 
+	// An operator running behind a TUN/fake-IP proxy can un-block the synthetic
+	// range it hands out (GOCLAW_SSRF_ALLOWED_CIDRS). This check duplicates the
+	// range list in internal/security rather than sharing it, so it has to
+	// consult that setting explicitly — otherwise web_fetch keeps rejecting the
+	// addresses the operator just permitted. Cloud metadata can never be
+	// allowlisted, so this cannot open a path to it.
+	if security.IsOperatorAllowed(ip) {
+		return false
+	}
+
 	// IPv4 private ranges
 	privateRanges := []struct {
 		network string
@@ -131,7 +143,9 @@ func isPrivateIP(ipStr string) bool {
 		{"169.254.0.0", 16},  // link-local
 		{"172.16.0.0", 12},   // private
 		{"192.168.0.0", 16},  // private
-		{"100.64.0.0", 10},   // carrier-grade NAT
+		{"100.64.0.0", 10},   // carrier-grade NAT (RFC 6598)
+		{"198.18.0.0", 15},   // benchmarking (RFC 2544)
+		{"240.0.0.0", 4},     // reserved for future use
 	}
 
 	for _, r := range privateRanges {

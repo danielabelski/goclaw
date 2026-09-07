@@ -51,7 +51,11 @@ func (c *Config) ApplySystemConfigs(configs map[string]string) {
 	integer("gateway.inbound_debounce_ms", &c.Gateway.InboundDebounceMs)
 	boolean("gateway.block_reply", &c.Gateway.BlockReply)
 	boolean("gateway.tool_status", &c.Gateway.ToolStatus)
+	boolean("gateway.team_work_classify", &c.Gateway.TeamWorkClassify)
 	integer("gateway.task_recovery_interval_sec", &c.Gateway.TaskRecoveryIntervalSec)
+	integer("gateway.webhook_async_timeout_sec", &c.Gateway.WebhookAsyncTimeoutSec)
+	integer("gateway.webhook_sync_timeout_sec", &c.Gateway.WebhookSyncTimeoutSec)
+	boolean("gateway.webhook_stream", &c.Gateway.WebhookStream)
 
 	// Background workers (vault enrichment, consolidation)
 	str("background.provider", &c.Gateway.BackgroundProvider)
@@ -82,6 +86,9 @@ func (c *Config) ApplySystemConfigs(configs map[string]string) {
 	boolValue(SkillSlashPartialMatchingSystemConfigKey, &c.Skills.SlashCommands.PartialMatching)
 	str(SkillSlashCommandPrefixSystemConfigKey, &c.Skills.SlashCommands.Prefix)
 
+	// Providers
+	integer("providers.request_timeout_sec", &c.Providers.RequestTimeoutSec)
+
 	// TTS
 	str("tts.provider", &c.Tts.Provider)
 	str("tts.auto", &c.Tts.Auto)
@@ -92,6 +99,7 @@ func (c *Config) ApplySystemConfigs(configs map[string]string) {
 	// Cron
 	integer("cron.max_retries", &c.Cron.MaxRetries)
 	str("cron.default_timezone", &c.Cron.DefaultTimezone)
+	boolValue("cron.command_enabled", &c.Cron.CommandEnabled)
 
 	// Pending message compaction
 	if _, ok := configs["compaction.threshold"]; ok {

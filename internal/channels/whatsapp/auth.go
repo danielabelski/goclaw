@@ -6,6 +6,8 @@ import (
 	"log/slog"
 
 	"go.mau.fi/whatsmeow"
+	wastore "go.mau.fi/whatsmeow/store"
+	"go.mau.fi/whatsmeow/types"
 )
 
 // StartQRFlow initiates the QR authentication flow.
@@ -16,35 +18,26 @@ import (
 func (c *Channel) StartQRFlow(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error) {
 	c.reauthMu.Lock()
 	defer c.reauthMu.Unlock()
-	if c.client == nil {
-		// Lazy init: wizard may request QR before Start() is called.
-		c.mu.Lock()
-		if c.client == nil {
-			if c.ctx == nil {
-				c.ctx, c.cancel = context.WithCancel(context.Background())
-			}
-			deviceStore, err := c.container.GetFirstDevice(ctx)
-			if err != nil {
-				c.mu.Unlock()
-				return nil, fmt.Errorf("whatsapp get device: %w", err)
-			}
-			c.client = whatsmeow.NewClient(deviceStore, nil)
-			c.client.AddEventHandler(c.handleEvent)
-		}
+
+	c.mu.Lock()
+	if err := c.ensureQRClientLocked(ctx); err != nil {
 		c.mu.Unlock()
+		return nil, fmt.Errorf("whatsapp get device: %w", err)
 	}
+	client := c.client
+	c.mu.Unlock()
 
 	if c.IsAuthenticated() {
 		return nil, nil // caller checks this
 	}
 
-	qrChan, err := c.client.GetQRChannel(ctx)
+	qrChan, err := client.GetQRChannel(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("whatsapp get QR channel: %w", err)
 	}
 
-	if !c.client.IsConnected() {
-		if err := c.client.Connect(); err != nil {
+	if !client.IsConnected() {
+		if err := client.Connect(); err != nil {
 			return nil, fmt.Errorf("whatsapp connect for QR: %w", err)
 		}
 	}
@@ -90,13 +83,89 @@ func (c *Channel) Reauth() error {
 	}
 	c.ctx, c.cancel = context.WithCancel(parent)
 
-	// Re-create client with fresh device store.
-	deviceStore, err := c.container.GetFirstDevice(context.Background())
-	if err != nil {
+	if err := c.resetClientLocked(context.Background()); err != nil {
 		return fmt.Errorf("whatsapp: get fresh device: %w", err)
+	}
+
+	return nil
+}
+
+// ensureQRClientLocked lazily creates or refreshes the client before QR login.
+// The caller must hold c.mu and c.reauthMu.
+func (c *Channel) ensureQRClientLocked(ctx context.Context) error {
+	if c.client == nil {
+		return c.resetClientLocked(ctx)
+	}
+	if !c.client.Store.Deleted {
+		return nil
+	}
+	c.lastQRMu.Lock()
+	c.waAuthenticated = false
+	c.lastQRB64 = ""
+	c.lastQRMu.Unlock()
+	return c.resetClientLocked(ctx)
+}
+
+// resetClientLocked replaces the whatsmeow client while preserving the channel lifecycle.
+// The caller must hold c.mu.
+func (c *Channel) resetClientLocked(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if c.ctx == nil {
+		parent := c.parentCtx
+		if parent == nil {
+			parent = context.Background()
+		}
+		c.ctx, c.cancel = context.WithCancel(parent)
+	}
+	deviceStore, err := c.resolveDeviceStoreLocked(ctx)
+	if err != nil {
+		return err
 	}
 	c.client = whatsmeow.NewClient(deviceStore, nil)
 	c.client.AddEventHandler(c.handleEvent)
-
 	return nil
+}
+
+func (c *Channel) resolveDeviceStoreLocked(ctx context.Context) (*wastore.Device, error) {
+	if !c.deviceJID.IsEmpty() {
+		deviceStore, err := c.container.GetDevice(ctx, c.deviceJID)
+		if err != nil {
+			return nil, err
+		}
+		if deviceStore != nil && !deviceStore.Deleted {
+			return deviceStore, nil
+		}
+		slog.Info("whatsapp scoped device missing; creating fresh QR device",
+			"channel", c.Name(), "device_hash", hashWhatsAppIdentifier(c.deviceJID.String()))
+		return c.container.NewDevice(), nil
+	}
+
+	if c.legacyFirstDeviceFallback {
+		devices, err := c.container.GetAllDevices(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if len(devices) > 0 {
+			return devices[0], nil
+		}
+	}
+
+	return c.container.NewDevice(), nil
+}
+
+func (c *Channel) currentDeviceJID() types.JID {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.client == nil || c.client.Store == nil {
+		return types.EmptyJID
+	}
+	return c.client.Store.GetJID()
+}
+
+func (c *Channel) setDeviceJID(jid types.JID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deviceJID = jid
 }

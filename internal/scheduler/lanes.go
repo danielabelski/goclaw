@@ -154,6 +154,11 @@ func NewLaneManager(configs []LaneConfig) *LaneManager {
 //	GOCLAW_LANE_SUBAGENT=50
 //	GOCLAW_LANE_TEAM=100
 //	GOCLAW_LANE_CRON=30
+//
+// LaneMain bounds concurrent agent runs across every channel, so on a bot
+// shared by a whole org it is the ceiling on how many people can be answered
+// at once. A run is overwhelmingly blocked on the LLM, not on CPU, so raising
+// it trades provider load for wait time, not local work.
 func DefaultLanes() []LaneConfig {
 	return []LaneConfig{
 		{Name: LaneMain, Concurrency: laneEnv("GOCLAW_LANE_MAIN", 30)},

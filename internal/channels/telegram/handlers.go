@@ -14,15 +14,25 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/typing"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
 
 // handleMessage processes an incoming Telegram update.
 func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
+	// Inject tenant scope so store queries filter by the correct tenant_id.
+	ctx = store.WithTenantID(ctx, c.TenantID())
+
+	// Channel posts arrive as update.ChannelPost (same *telego.Message type) and
+	// are routed through the same group-style gate below.
 	message := update.Message
+	if message == nil {
+		message = update.ChannelPost
+	}
 	if message == nil {
 		return
 	}
+	user, isChannel := resolveMessageSender(message)
 
 	// Proactive migration detection: group upgraded to supergroup.
 	// Must run BEFORE isServiceMessage() — migration messages have no text/media.
@@ -30,6 +40,24 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 		slog.Info("telegram: group migrated to supergroup (inbound)",
 			"old_chat_id", message.Chat.ID, "new_chat_id", message.MigrateToChatID)
 		c.migrateGroupChat(ctx, message.Chat.ID, message.MigrateToChatID)
+		return
+	}
+
+	// Learn forum topics (name → thread id) so the agent can later post to a
+	// topic by name. forum_topic_created is a service message (no content), so
+	// capture it BEFORE the isServiceMessage skip below.
+	if message.ForumTopicCreated != nil && message.MessageThreadID != 0 {
+		if cc := c.ContactCollector(); cc != nil {
+			topicCtx := store.WithTenantID(ctx, c.TenantID())
+			cc.EnsureContact(topicCtx, c.Type(), c.Name(),
+				fmt.Sprintf("%d", message.Chat.ID), "",
+				message.ForumTopicCreated.Name, "",
+				"group", "topic",
+				fmt.Sprintf("%d", message.MessageThreadID), "topic")
+		}
+		slog.Info("telegram: forum topic learned",
+			"chat_id", message.Chat.ID, "thread_id", message.MessageThreadID,
+			"name", message.ForumTopicCreated.Name)
 		return
 	}
 
@@ -45,15 +73,16 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 		return
 	}
 
-	user := message.From
 	if user == nil {
+		// Non-channel message with no sender (e.g. some service posts): drop.
 		return
 	}
 
 	userID := fmt.Sprintf("%d", user.ID)
 	senderID := userID
 
-	isGroup := message.Chat.Type == "group" || message.Chat.Type == "supergroup"
+	// Channels reuse the group path (mention/trigger gate, pairing, history).
+	isGroup := message.Chat.Type == "group" || message.Chat.Type == "supergroup" || isChannel
 
 	slog.Debug("telegram message received",
 		"chat_type", message.Chat.Type,
@@ -292,6 +321,12 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 			wasMentioned = true
 		}
 
+		// Trigger words: naming the bot by one of its agent's IDENTITY.md aliases
+		// (e.g. "Alice") wakes it in groups without an explicit @mention.
+		if !wasMentioned && c.matchesTriggerWords(ctx, message) {
+			wasMentioned = true
+		}
+
 		// Yield mode: skip only if another bot/user is explicitly mentioned (not us).
 		// If nobody is mentioned → respond. If we are mentioned → respond.
 		if mentionMode == "yield" && !wasMentioned {
@@ -347,7 +382,9 @@ func (c *Channel) handleMessage(ctx context.Context, update telego.Update) {
 				// Collect forum topic as a distinct delivery target (including General).
 				if isForum && messageThreadID > 0 {
 					threadStr := fmt.Sprintf("%d", messageThreadID)
-					cc.EnsureContact(ctx, c.Type(), c.Name(), chatIDStr, "", message.Chat.Title, "", "group", "topic", threadStr, "topic")
+					// Empty display_name: don't overwrite the real topic name learned
+					// from forum_topic_created with the group title (COALESCE keeps it).
+					cc.EnsureContact(ctx, c.Type(), c.Name(), chatIDStr, "", "", "", "group", "topic", threadStr, "topic")
 				}
 			}
 
@@ -432,7 +469,12 @@ func (c *Channel) processResolvedMessage(ctx context.Context, rctx resolvedMessa
 		return
 	}
 	rep := members[0]
-	user := rep.From
+	// Channel posts have no From — synthesize a sender from the channel (same as
+	// handleMessage) so the user.* metadata below never nil-derefs.
+	user, _ := resolveMessageSender(rep)
+	if user == nil {
+		return
+	}
 	content := rctx.content
 
 	// --- Media download (only when bot will process the message) ---
@@ -464,7 +506,7 @@ func (c *Channel) processResolvedMessage(ctx context.Context, rctx resolvedMessa
 
 	var mediaFiles []bus.MediaFile
 	if len(mediaList) > 0 {
-		var extraContent string
+		var extraContent strings.Builder
 		for i := range mediaList {
 			m := &mediaList[i]
 			switch m.Type {
@@ -484,7 +526,7 @@ func (c *Channel) processResolvedMessage(ctx context.Context, rctx resolvedMessa
 					if err != nil {
 						slog.Warn("document extraction failed", "file", m.FileName, "error", err)
 					} else if docContent != "" {
-						extraContent += "\n\n" + docContent
+						extraContent.WriteString("\n\n" + docContent)
 					}
 				}
 			case "video", "animation":
@@ -511,8 +553,8 @@ func (c *Channel) processResolvedMessage(ctx context.Context, rctx resolvedMessa
 				content = fullTags
 			}
 		}
-		if extraContent != "" {
-			content += extraContent
+		if extraContent.String() != "" {
+			content += extraContent.String()
 		}
 	}
 
@@ -688,30 +730,77 @@ func (c *Channel) processResolvedMessage(ctx context.Context, rctx resolvedMessa
 			// Collect forum topic as a distinct delivery target (including General).
 			if rctx.isForum && rctx.messageThreadID > 0 {
 				threadStr := fmt.Sprintf("%d", rctx.messageThreadID)
-				cc.EnsureContact(ctx, c.Type(), c.Name(), rctx.chatIDStr, "", rep.Chat.Title, "", "group", "topic", threadStr, "topic")
+				cc.EnsureContact(ctx, c.Type(), c.Name(), rctx.chatIDStr, "", "", "", "group", "topic", threadStr, "topic")
 			}
 		}
 	}
 
+	telegramManagerPermissions := c.telegramManagerPermissions()
 	c.Bus().PublishInbound(bus.InboundMessage{
-		Channel:      c.Name(),
-		SenderID:     rctx.senderID,
-		ChatID:       rctx.chatIDStr,
-		Content:      finalContent,
-		Media:        mediaFiles,
-		PeerKind:     peerKind,
-		UserID:       rctx.userID,
-		AgentID:      targetAgentID,
-		HistoryLimit: c.HistoryLimit(),
-		ToolAllow:    rctx.topicCfg.tools,
-		TenantID:     c.TenantID(),
-		Metadata:     metadata,
+		Channel:                    c.Name(),
+		SenderID:                   rctx.senderID,
+		ChatID:                     rctx.chatIDStr,
+		Content:                    finalContent,
+		Media:                      mediaFiles,
+		PeerKind:                   peerKind,
+		UserID:                     rctx.userID,
+		AgentID:                    targetAgentID,
+		HistoryLimit:               c.HistoryLimit(),
+		ToolAllow:                  telegramToolAllowWithManager(rctx.topicCfg.tools, telegramManagerPermissions),
+		TelegramManagerPermissions: telegramManagerPermissions,
+		TenantID:                   c.TenantID(),
+		Metadata:                   metadata,
 	})
 
 	// Clear pending history after sending to agent.
 	if rctx.isGroup {
 		c.GroupHistory().Clear(rctx.localKey)
 	}
+}
+
+func (c *Channel) telegramManagerPermissions() []string {
+	if c.config.TelegramManager == nil || !c.config.TelegramManager.Enabled {
+		return nil
+	}
+	return normalizeTelegramManagerPermissions(c.config.TelegramManager.AllowedActions)
+}
+
+func normalizeTelegramManagerPermissions(values []string) []string {
+	allowed := map[string]struct{}{
+		"chat":         {},
+		"member":       {},
+		"join_request": {},
+		"invite":       {},
+		"message":      {},
+		"topic":        {},
+	}
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		key := strings.ToLower(strings.TrimSpace(value))
+		if _, ok := allowed[key]; !ok {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, key)
+	}
+	return out
+}
+
+func telegramToolAllowWithManager(toolAllow []string, permissions []string) []string {
+	if len(toolAllow) == 0 || len(permissions) == 0 {
+		return toolAllow
+	}
+	for _, name := range toolAllow {
+		if name == "telegram_manager" {
+			return toolAllow
+		}
+	}
+	merged := append([]string{}, toolAllow...)
+	return append(merged, "telegram_manager")
 }
 
 func (c *Channel) transcribeMediaAudio(ctx context.Context, m MediaInfo) (string, error) {

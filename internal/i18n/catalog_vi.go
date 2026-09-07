@@ -52,8 +52,9 @@ func init() {
 		MsgInstanceNotFound:   "không tìm thấy phiên bản",
 
 		// Cron
-		MsgJobNotFound:     "không tìm thấy tác vụ",
-		MsgInvalidCronExpr: "biểu thức cron không hợp lệ: %s",
+		MsgJobNotFound:         "không tìm thấy tác vụ",
+		MsgInvalidCronExpr:     "biểu thức cron không hợp lệ: %s",
+		MsgCommandCronDisabled: "tác vụ cron dạng lệnh đang bị tắt trên gateway này (đặt cron.command_enabled=true để cho phép)",
 
 		// Config
 		MsgConfigHashMismatch: "cấu hình đã thay đổi (hash không khớp)",
@@ -171,8 +172,10 @@ func init() {
 		MsgFailedToDeleteFile:    "không thể xóa",
 
 		// OAuth
-		MsgNoPendingOAuth:    "không có luồng OAuth đang chờ",
-		MsgFailedToSaveToken: "không thể lưu token",
+		MsgNoPendingOAuth:       "không có luồng OAuth đang chờ",
+		MsgFailedToSaveToken:    "không thể lưu token",
+		MsgOAuthCallbackSuccess: "Ủy quyền thành công. Bạn có thể đóng cửa sổ này.",
+		MsgOAuthCallbackFailed:  "Ủy quyền thất bại. Bạn có thể đóng cửa sổ này.",
 
 		// Intent Classify
 		MsgStatusWorking:       "🔄 Mình đang xử lý yêu cầu của bạn... Vui lòng chờ.",
@@ -230,6 +233,7 @@ func init() {
 		MsgSkillNudgePostscript: "Tác vụ này cần nhiều bước. Bạn muốn tôi lưu quy trình này thành kỹ năng tái sử dụng không? Trả lời **\"lưu kỹ năng\"** hoặc **\"bỏ qua\"**.",
 		MsgSkillNudge70Pct:      "[System] Bạn đã dùng 70% ngân sách vòng lặp. Cân nhắc xem các mẫu trong phiên này có nên lưu thành kỹ năng không.",
 		MsgSkillNudge90Pct:      "[System] Bạn đã dùng 90% ngân sách vòng lặp. Nếu phiên này có quy trình tái sử dụng, hãy cân nhắc lưu thành kỹ năng trước khi hoàn thành.",
+		MsgEmptyReplyFallback:   "⚠️ Agent không thể tạo phản hồi. Lưu ý: một số thao tác công cụ có thể đã được thực hiện — vui lòng kiểm tra trước khi thử lại",
 
 		MsgInvalidRole: "vai trò không hợp lệ: giá trị cho phép là owner, admin, operator, member, viewer",
 
@@ -257,28 +261,29 @@ func init() {
 		MsgVoiceMessageFallback:      "[Tin nhắn thoại]",
 
 		// Webhooks
-		MsgWebhookAuthFailed:              "xác thực webhook thất bại",
-		MsgWebhookHMACInvalid:             "chữ ký HMAC không hợp lệ",
-		MsgWebhookHMACTimestampSkew:       "thời gian yêu cầu nằm ngoài cửa sổ chấp nhận",
-		MsgWebhookBearerRequiredHMAC:      "webhook này yêu cầu xác thực HMAC",
-		MsgWebhookRevoked:                 "webhook đã bị thu hồi",
-		MsgWebhookKindMismatch:            "loại yêu cầu không khớp cấu hình webhook",
-		MsgWebhookRateLimited:             "vượt quá giới hạn tốc độ webhook",
-		MsgWebhookBodyTooLarge:            "nội dung yêu cầu vượt quá giới hạn kích thước",
-		MsgWebhookIdempotencyConflict:     "xung đột idempotency key: nội dung yêu cầu không khớp",
-		MsgWebhookTenantMismatch:          "tenant của webhook không khớp",
-		MsgWebhookAgentNotFound:           "không tìm thấy agent webhook",
-		MsgWebhookChannelNotFound:         "không tìm thấy kênh webhook",
-		MsgWebhookMediaSSRFBlocked:        "URL media bị chặn bởi chính sách SSRF",
-		MsgWebhookMediaTooLarge:           "tệp media vượt quá giới hạn kích thước",
-		MsgWebhookMediaMIMEDenied:         "loại MIME của media không được phép",
-		MsgWebhookCallbackURLInvalid:      "URL callback không hợp lệ hoặc bị chặn",
-		MsgWebhookLLMTimeout:              "LLM xử lý hết thời gian chờ",
-		MsgWebhookLaneSaturated:           "làn xử lý webhook đã đầy",
-		MsgWebhookLocalhostOnlyViolation:  "webhook này chỉ cho phép gọi từ localhost",
-		MsgWebhookMediaChannelUnsupported: "kênh không hỗ trợ tệp đính kèm media",
-		MsgWebhookIPDenied:                "địa chỉ IP không nằm trong danh sách cho phép",
-		MsgWebhookEncryptionUnavailable:   "khóa mã hóa webhook chưa được cấu hình; hãy đặt GOCLAW_ENCRYPTION_KEY để kích hoạt webhook",
+		MsgWebhookAuthFailed:                  "xác thực webhook thất bại",
+		MsgWebhookHMACInvalid:                 "chữ ký HMAC không hợp lệ",
+		MsgWebhookHMACTimestampSkew:           "thời gian yêu cầu nằm ngoài cửa sổ chấp nhận",
+		MsgWebhookBearerRequiredHMAC:          "webhook này yêu cầu xác thực HMAC",
+		MsgWebhookRevoked:                     "webhook đã bị thu hồi",
+		MsgWebhookKindMismatch:                "loại yêu cầu không khớp cấu hình webhook",
+		MsgWebhookRateLimited:                 "vượt quá giới hạn tốc độ webhook",
+		MsgWebhookBodyTooLarge:                "nội dung yêu cầu vượt quá giới hạn kích thước",
+		MsgWebhookIdempotencyConflict:         "xung đột idempotency key: nội dung yêu cầu không khớp",
+		MsgWebhookTenantMismatch:              "tenant của webhook không khớp",
+		MsgWebhookAgentNotFound:               "không tìm thấy agent webhook",
+		MsgWebhookChannelNotFound:             "không tìm thấy kênh webhook",
+		MsgWebhookMediaSSRFBlocked:            "URL media bị chặn bởi chính sách SSRF",
+		MsgWebhookMediaTooLarge:               "tệp media vượt quá giới hạn kích thước",
+		MsgWebhookMediaMIMEDenied:             "loại MIME của media không được phép",
+		MsgWebhookCallbackURLInvalid:          "URL callback không hợp lệ hoặc bị chặn",
+		MsgWebhookLLMTimeout:                  "LLM xử lý hết thời gian chờ",
+		MsgWebhookLaneSaturated:               "làn xử lý webhook đã đầy",
+		MsgWebhookLocalhostOnlyViolation:      "webhook này chỉ cho phép gọi từ localhost",
+		MsgWebhookMediaChannelUnsupported:     "kênh không hỗ trợ tệp đính kèm media",
+		MsgWebhookIPDenied:                    "địa chỉ IP không nằm trong danh sách cho phép",
+		MsgWebhookEncryptionUnavailable:       "khóa mã hóa webhook chưa được cấu hình; hãy đặt GOCLAW_ENCRYPTION_KEY để kích hoạt webhook",
+		MsgWebhookMessageTestRequiresStandard: "kiểm thử webhook loại message yêu cầu bản Standard",
 
 		// Hooks
 		// Workstation

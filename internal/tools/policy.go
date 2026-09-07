@@ -13,14 +13,14 @@ import (
 // builtinToolGroups is const-like seed data for per-Registry tool groups.
 // Do NOT modify at runtime — each Registry gets a deep copy in NewRegistry().
 var builtinToolGroups = map[string][]string{
-	"memory":     {"memory_search", "memory_get"},
+	"memory":     {"memory_search", "memory_get", "memory_expand", "knowledge_graph_search"},
 	"web":        {"web_search", "web_fetch"},
 	"fs":         {"read_file", "write_file", "list_files", "edit"},
 	"runtime":    {"exec", "wait"},
 	"sessions":   {"sessions_list", "sessions_history", "sessions_send", "spawn", "session_status"},
 	"ui":         {"browser"},
 	"automation": {"cron"},
-	"messaging":  {"message", "create_forum_topic", "list_group_members"},
+	"messaging":  {"message", "create_forum_topic", "list_group_members", "zalo_list_groups"},
 	"team":       {"team_tasks"},
 	"vault":      {"vault_search", "vault_read"},
 	// Composite group: all goclaw native tools (excludes MCP/custom plugins).
@@ -32,7 +32,7 @@ var builtinToolGroups = map[string][]string{
 		"sessions_list", "sessions_history", "sessions_send", "spawn", "session_status",
 		"delegate",
 		"cron", "datetime", "heartbeat",
-		"message", "create_forum_topic", "list_group_members",
+		"message", "create_forum_topic", "list_group_members", "zalo_list_groups",
 		"read_image", "read_document", "read_audio", "read_video",
 		"create_image", "create_video", "create_audio",
 		"skill_search", "skill_manage", "publish_skill", "use_skill",
@@ -78,24 +78,39 @@ var leafSubagentDenyList = []string{
 	"sessions_list", "sessions_history", "spawn",
 }
 
+// registryUnwrapper is implemented by ToolExecutor wrappers (e.g. userToolOverlay)
+// that expose the concrete *Registry they wrap, so group-expansion machinery
+// (which needs concrete *Registry, not the ToolExecutor interface) still works
+// when the caller passes a request-scoped overlay instead of the raw registry.
+type registryUnwrapper interface {
+	Unwrap() *Registry
+}
+
+// ResolveConcreteRegistry extracts the concrete *Registry backing a ToolExecutor,
+// for use by group-expansion/capability/deny helpers that need direct access to
+// registry-internal tool groups and metadata. Returns nil when the executor is
+// neither a *Registry nor a registryUnwrapper (e.g. a test mock) — callers must
+// tolerate nil (group expansion falls back to a no-op pass-through).
+func ResolveConcreteRegistry(executor ToolExecutor) *Registry {
+	if reg, ok := executor.(*Registry); ok {
+		return reg
+	}
+	if unwrapper, ok := executor.(registryUnwrapper); ok {
+		return unwrapper.Unwrap()
+	}
+	return nil
+}
+
 // PolicyEngine evaluates tool access based on layered config policies.
 type PolicyEngine struct {
 	globalPolicy     *config.ToolsConfig
-	mu               sync.RWMutex     // protects denyCapabilities + registry
+	mu               sync.RWMutex     // protects denyCapabilities
 	denyCapabilities []ToolCapability // capability-based deny rules (v3)
-	registry         *Registry        // for metadata lookups (nil = skip capability checks)
 }
 
 // NewPolicyEngine creates a policy engine from global config.
 func NewPolicyEngine(cfg *config.ToolsConfig) *PolicyEngine {
 	return &PolicyEngine{globalPolicy: cfg}
-}
-
-// SetRegistry enables capability-based filtering by providing metadata lookups.
-func (pe *PolicyEngine) SetRegistry(r *Registry) {
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
-	pe.registry = r
 }
 
 // DenyCapability adds a capability to the deny list.
@@ -117,16 +132,16 @@ func (pe *PolicyEngine) FilterTools(
 	isSubagent bool,
 	isLeafAgent bool,
 ) []providers.ToolDefinition {
+	reg := ResolveConcreteRegistry(registry)
 	allTools := registry.List()
-	allowed := pe.evaluate(allTools, providerName, agentToolPolicy, groupToolAllow)
+	allowed := pe.evaluate(reg, allTools, providerName, agentToolPolicy, groupToolAllow)
 
 	// Step 8: Capability-based deny (v3 RBAC)
 	pe.mu.RLock()
 	denyCaps := pe.denyCapabilities
-	capReg := pe.registry
 	pe.mu.RUnlock()
-	if len(denyCaps) > 0 && capReg != nil {
-		allowed = filterByCapability(allowed, denyCaps, capReg)
+	if len(denyCaps) > 0 && reg != nil {
+		allowed = filterByCapability(allowed, denyCaps, reg)
 	}
 
 	// Apply subagent restrictions
@@ -185,7 +200,13 @@ func (pe *PolicyEngine) FilterTools(
 }
 
 // evaluate runs the 7-step policy pipeline.
+// reg is the concrete *Registry backing the caller's ToolExecutor (may be nil
+// when the caller passed a mock/test executor with no group data), used for
+// group-expansion ("group:xxx") and deny-spec matching. It is threaded through
+// as an explicit parameter — never stored on pe — because pe is a shared,
+// concurrently-used singleton; mutating a field per-call would be a data race.
 func (pe *PolicyEngine) evaluate(
+	reg *Registry,
 	allTools []string,
 	providerName string,
 	agentToolPolicy *config.ToolPolicySpec,
@@ -193,18 +214,13 @@ func (pe *PolicyEngine) evaluate(
 ) []string {
 	g := pe.globalPolicy
 
-	// Get registry for group expansion (may be nil in early boot)
-	pe.mu.RLock()
-	reg := pe.registry
-	pe.mu.RUnlock()
-
 	// Step 1: Global profile
-	allowed := pe.applyProfile(allTools, g.Profile)
+	allowed := pe.applyProfile(reg, allTools, g.Profile)
 
 	// Step 2: Provider-level profile override
 	if g.ByProvider != nil {
 		if pp, ok := g.ByProvider[providerName]; ok && pp.Profile != "" {
-			allowed = pe.applyProfile(allTools, pp.Profile)
+			allowed = pe.applyProfile(reg, allTools, pp.Profile)
 		}
 	}
 
@@ -255,12 +271,23 @@ func (pe *PolicyEngine) evaluate(
 		allowed = unionWithSpec(reg, allowed, allTools, agentToolPolicy.AlsoAllow)
 	}
 
+	// Deny always wins: re-apply the same deny specs as a final step so that
+	// AlsoAllow can never reintroduce a tool (or a group containing it) that
+	// was explicitly denied above. Without this, unionWithSpec adds tools back
+	// from allTools without re-checking the deny list.
+	if len(g.Deny) > 0 {
+		allowed = subtractSpec(reg, allowed, g.Deny)
+	}
+	if agentToolPolicy != nil && len(agentToolPolicy.Deny) > 0 {
+		allowed = subtractSpec(reg, allowed, agentToolPolicy.Deny)
+	}
+
 	return allowed
 }
 
 // applyProfile returns tools allowed by a named profile.
 // "full" or empty profile = all tools allowed.
-func (pe *PolicyEngine) applyProfile(allTools []string, profile string) []string {
+func (pe *PolicyEngine) applyProfile(reg *Registry, allTools []string, profile string) []string {
 	if profile == "" || profile == "full" {
 		return copySlice(allTools)
 	}
@@ -270,11 +297,6 @@ func (pe *PolicyEngine) applyProfile(allTools []string, profile string) []string
 		slog.Warn("unknown tool profile, using full", "profile", profile)
 		return copySlice(allTools)
 	}
-
-	// Get registry for group expansion
-	pe.mu.RLock()
-	reg := pe.registry
-	pe.mu.RUnlock()
 
 	return expandSpec(reg, allTools, spec)
 }
@@ -432,18 +454,38 @@ func unionWithSpec(reg *Registry, current []string, allTools []string, spec []st
 	return current
 }
 
+// WouldAllow checks whether a tool name would pass the full policy pipeline
+// (profile → allow → deny → alsoAllow) if it were present in the registry.
+// Used to filter per-user tools (e.g. per-user MCP tools) that intentionally
+// bypass registration in the shared registry to prevent credential leaks, but
+// still need to respect the agent's tool policy.
+//
+// reg is the concrete *Registry to use for group-expansion/deny-spec matching
+// (pass nil to fall back to a no-group-expansion match, e.g. from a caller that
+// only has a ToolExecutor). It works by running evaluate() with just [name] as
+// the available set. With a "full" profile and no allow restrictions, the name
+// survives. With a restrictive allow list that excludes MCP tools, it's
+// removed. With a deny containing group:mcp, MatchDenySpec removes it from the set.
+func (pe *PolicyEngine) WouldAllow(reg *Registry, name, providerName string, agentPolicy *config.ToolPolicySpec, groupAllow []string) bool {
+	allowed := pe.evaluate(reg, []string{name}, providerName, agentPolicy, groupAllow)
+	for _, a := range allowed {
+		if a == name {
+			return true
+		}
+	}
+	return false
+}
+
 // IsDenied checks if a tool name is explicitly denied by global or agent policy.
 // Used to prevent lazy-activated deferred tools from bypassing the deny list.
 // Checks under all candidate names: the raw name, the legacy alias (e.g. bash→exec),
-// and the registry alias when available.
-func (pe *PolicyEngine) IsDenied(name string, agentPolicy *config.ToolPolicySpec) bool {
+// and the registry alias when available. reg is the concrete *Registry to use for
+// group-expansion/deny-spec matching (nil is tolerated — falls back to a plain match).
+func (pe *PolicyEngine) IsDenied(reg *Registry, name string, agentPolicy *config.ToolPolicySpec) bool {
 	candidates := map[string]struct{}{name: {}}
 	// Keep legacy alias compatibility (e.g. bash -> exec).
 	candidates[resolveAlias(name)] = struct{}{}
 	// Include registry alias mapping when available.
-	pe.mu.RLock()
-	reg := pe.registry
-	pe.mu.RUnlock()
 	if reg != nil {
 		if canonical, ok := reg.Aliases()[name]; ok && canonical != "" {
 			candidates[canonical] = struct{}{}
@@ -485,7 +527,11 @@ func StripToolPrefix(tmpl, name string) string {
 	if strings.Contains(tmpl, placeholder) {
 		parts := strings.SplitN(tmpl, placeholder, 2)
 		prefix, suffix := parts[0], parts[1]
-		if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, suffix) {
+		// Require the name to be at least as long as prefix+suffix so an
+		// overlapping match (e.g. tmpl "pre_{tool_name}_suf", name "pre_suf")
+		// doesn't slice with a negative length and panic.
+		if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, suffix) &&
+			len(prefix)+len(suffix) <= len(name) {
 			result := name[len(prefix):]
 			if suffix != "" {
 				result = result[:len(result)-len(suffix)]

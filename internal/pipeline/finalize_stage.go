@@ -2,12 +2,16 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 
 	"github.com/google/uuid"
 	"github.com/nextlevelbuilder/goclaw/internal/hooks"
+	"github.com/nextlevelbuilder/goclaw/internal/i18n"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
@@ -42,9 +46,16 @@ func (s *FinalizeStage) Execute(ctx context.Context, state *RunState) error {
 	// Must run BEFORE session flush so the agent message is persisted even if suppressed.
 	isSilent := s.deps.IsSilentReply != nil && s.deps.IsSilentReply(state.Observe.FinalContent)
 
-	// 2b. Fallback for empty content (matching v2: channels need non-empty content to deliver).
-	if state.Observe.FinalContent == "" && !isSilent {
-		state.Observe.FinalContent = "..."
+	// 2b. Fallback for empty content (matching v2: channels need non-empty content
+	// to deliver). Media-only runs stay media-only — no text caption (matching v2
+	// hasDeliverableOutput). The placeholder is a meaningful localized message, not
+	// a bare "..." — ThinkStage already nudges the model for empty text responses,
+	// so this only fires when the model truly produced nothing.
+	hasDeliverableOutput := len(state.Tool.MediaResults) > 0 ||
+		len(state.Input.ForwardMedia) > 0 ||
+		state.Input.ContentSuffix != ""
+	if state.Observe.FinalContent == "" && !isSilent && !hasDeliverableOutput {
+		state.Observe.FinalContent = i18n.T(store.LocaleFromContext(ctx), i18n.MsgEmptyReplyFallback)
 	}
 
 	// 2c. Append content suffix (e.g. image markdown for WS) with dedup.
@@ -58,15 +69,13 @@ func (s *FinalizeStage) Execute(ctx context.Context, state *RunState) error {
 		state.Tool.MediaResults = append(state.Tool.MediaResults, MediaResult{Path: mf.Path, ContentType: ct})
 	}
 
-	// 3. Deduplicate + populate media sizes
-	s.processMedia(state)
-
-	// 3b. Persist assistant-generated images (Codex image_generation_call) to disk
-	// BEFORE building the assistant message so MediaRefs are included in the session store.
-	// Source is state.Observe.AssistantImages, which ObserveStage accumulates across
-	// every iteration — required because LastResponse holds only the final iteration's
-	// response (an image emitted mid-loop alongside a tool call would otherwise be lost).
-	var assistantImageRefs []providers.MediaRef
+	// 3. Persist assistant-generated images (Codex image_generation_call) to disk
+	// and fold them into MediaResults BEFORE deduplication, so a generated image
+	// and an explicitly attached copy of it collapse into one attachment.
+	// Source is state.Observe.AssistantImages, which ObserveStage accumulates
+	// across every iteration — required because LastResponse holds only the final
+	// iteration's response (an image emitted mid-loop alongside a tool call would
+	// otherwise be lost).
 	if s.deps.PersistAssistantImages != nil && len(state.Observe.AssistantImages) > 0 {
 		workspace := ""
 		if state.Workspace != nil {
@@ -77,11 +86,21 @@ func (s *FinalizeStage) Execute(ctx context.Context, state *RunState) error {
 		// the scratch message — we harvest MediaRefs from there.
 		scratch := &providers.Message{Images: state.Observe.AssistantImages}
 		s.deps.PersistAssistantImages(scratch, workspace)
-		assistantImageRefs = scratch.MediaRefs
+		for _, ref := range scratch.MediaRefs {
+			state.Tool.MediaResults = append(state.Tool.MediaResults, MediaResult{
+				Path:        ref.Path,
+				ContentType: ref.MimeType,
+				Prompt:      ref.Prompt,
+			})
+		}
 		state.Observe.AssistantImages = nil // prevent double-processing on retries
 	}
 
-	// 3c. Build final assistant message with MediaRefs for session persistence.
+	// 4. Populate sizes and drop duplicates across every producer.
+	s.processMedia(state)
+
+	// 5. Build the final assistant message from the deduplicated media set, so
+	// session history and outbound delivery carry exactly the same attachments.
 	assistantMsg := providers.Message{
 		Role:     "assistant",
 		Content:  state.Observe.FinalContent,
@@ -105,21 +124,24 @@ func (s *FinalizeStage) Execute(ctx context.Context, state *RunState) error {
 			Prompt:   mr.Prompt,
 		})
 	}
-	// Append persisted assistant image refs (Codex image_generation_call output).
-	assistantMsg.MediaRefs = append(assistantMsg.MediaRefs, assistantImageRefs...)
 	state.Messages.AppendPending(assistantMsg)
 
-	// 4. Flush remaining pending messages to session store
+	// 4. Flush remaining pending messages to session store.
+	// Capture the pre-flush history length so metadata msgCount reflects
+	// history + newly-persisted pending (matches upstream calibration).
+	historyCountBeforeFlush := len(state.Messages.History())
 	pending := state.Messages.FlushPending()
+	persistablePending := persistableMessages(pending)
 	if len(pending) > 0 && s.deps.FlushMessages != nil {
-		if err := s.deps.FlushMessages(ctx, state.Input.SessionKey, persistableMessages(pending)); err != nil {
+		if err := s.deps.FlushMessages(ctx, state.Input.SessionKey, persistablePending); err != nil {
 			slog.Warn("finalize flush failed", "err", err)
 		}
 	}
 
 	// 5. Update session metadata (token usage)
 	if s.deps.UpdateMetadata != nil {
-		if err := s.deps.UpdateMetadata(ctx, state.Input.SessionKey, state.Think.TotalUsage); err != nil {
+		msgCount := historyCountBeforeFlush + len(persistablePending)
+		if err := s.deps.UpdateMetadata(ctx, state.Input.SessionKey, state.Think.TotalUsage, state.Think.LastUsage, msgCount); err != nil {
 			slog.Warn("finalize metadata update failed", "err", err)
 		}
 	}
@@ -131,9 +153,15 @@ func (s *FinalizeStage) Execute(ctx context.Context, state *RunState) error {
 		}
 	}
 
-	// 7. Post-run summarization (async background)
+	// 7. Post-run summarization (async background).
+	// Pass the mid-loop pressure flag: when the guard had to compact mid-loop this
+	// run, maybeSummarize uses a lower, unit-aligned threshold so the compaction is
+	// PERSISTED to the session (TruncateHistory + IncrementCompaction) instead of
+	// being thrown away — which both breaks the per-turn re-compaction loop (Việc 2)
+	// and advances the cumulative compaction count so episodic can progress (Việc 1-B).
+	// Both mid-loop paths (prune_stage + compactForFinalRequestBudget) set this flag.
 	if s.deps.MaybeSummarize != nil {
-		s.deps.MaybeSummarize(ctx, state.Input.SessionKey)
+		s.deps.MaybeSummarize(ctx, state.Input.SessionKey, state.Prune.MidLoopCompacted)
 	}
 
 	// 8. Emit session.completed for consolidation pipeline (episodic → semantic → dreaming).
@@ -185,14 +213,43 @@ func (s *FinalizeStage) processMedia(state *RunState) {
 		}
 	}
 
-	// Deduplicate by path
-	seen := make(map[string]bool, len(media))
+	// Deduplicate. Path equality alone is not enough: an agent that generates an
+	// image and then attaches a copy of it under a different name produces two
+	// entries for one picture, and both were delivered — the user received the
+	// same image twice. Identical bytes collapse regardless of path.
+	seenPath := make(map[string]bool, len(media))
+	seenDigest := make(map[string]bool, len(media))
 	deduped := make([]MediaResult, 0, len(media))
 	for _, m := range media {
-		if !seen[m.Path] {
-			seen[m.Path] = true
-			deduped = append(deduped, m)
+		if m.Path != "" {
+			if seenPath[m.Path] {
+				continue
+			}
+			seenPath[m.Path] = true
+
+			// Remote or already-cleaned paths simply skip content comparison.
+			if digest, err := fileDigest(m.Path); err == nil {
+				if seenDigest[digest] {
+					continue
+				}
+				seenDigest[digest] = true
+			}
 		}
+		deduped = append(deduped, m)
 	}
 	state.Tool.MediaResults = deduped
+}
+
+// fileDigest returns the SHA-256 of a local file.
+func fileDigest(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }

@@ -71,6 +71,34 @@ export function useChannelDetail(instanceId: string | undefined) {
     [instanceId, http, invalidate],
   );
 
+  const refreshDiscordMetadata = useCallback(
+    async () => {
+      if (!instanceId) return;
+      try {
+        const result = await http.post<{
+          ok: boolean;
+          report?: {
+            errors?: string[];
+            failures?: Array<{ channel_id: string; reason: string }>;
+          };
+        }>(`/v1/channels/instances/${instanceId}/metadata/refresh`);
+        queryClient.invalidateQueries({ queryKey: queryKeys.channels.memoryExtractionGroups(instanceId), exact: true });
+        await invalidate();
+        if (!result?.ok) {
+          const detail = result.report?.errors?.[0]
+            ?? result.report?.failures?.[0]?.reason;
+          toast.error(i18next.t("channels:detail.discordMetadataRefreshFailed"), detail);
+          return;
+        }
+        toast.success(i18next.t("channels:detail.discordMetadataRefreshed"));
+      } catch (err) {
+        toast.error(i18next.t("channels:detail.discordMetadataRefreshFailed"), userFriendlyError(err));
+        throw err;
+      }
+    },
+    [http, instanceId, invalidate, queryClient],
+  );
+
   // Managers API (backend routes still use /writers paths)
   const listManagerGroups = useCallback(
     async (): Promise<GroupManagerGroupInfo[]> => {
@@ -216,6 +244,7 @@ export function useChannelDetail(instanceId: string | undefined) {
     setContextCredentials,
     deleteContextCredentials,
     listContacts,
+    refreshDiscordMetadata,
     refresh: invalidate,
   };
 }

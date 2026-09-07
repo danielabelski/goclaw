@@ -15,10 +15,20 @@ export interface CronSchedule {
   tz?: string;
 }
 
+export interface CronCommandSpec {
+  argv?: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+  input?: string;
+  timeoutSeconds?: number;
+  noOutputTimeoutSeconds?: number;
+  outputMaxBytes?: number;
+}
+
 export interface CronPayload {
   kind: string;
   message: string;
-  command?: string;
+  command?: CronCommandSpec;
 }
 
 export interface CronJobPatch {
@@ -27,6 +37,7 @@ export interface CronJobPatch {
   enabled?: boolean;
   schedule?: CronSchedule;
   message?: string;
+  command?: CronCommandSpec;
   deliver?: boolean;
   deliverChannel?: string;
   deliverTo?: string;
@@ -95,7 +106,8 @@ export function useCron() {
     async (params: {
       name: string;
       schedule: CronSchedule;
-      message: string;
+      message?: string;
+      command?: CronCommandSpec;
       agentId?: string;
       deliver?: boolean;
       channel?: string;

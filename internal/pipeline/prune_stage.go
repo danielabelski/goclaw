@@ -26,7 +26,7 @@ func NewPruneStage(deps *PipelineDeps, memFlush *MemoryFlushStage) *PruneStage {
 	return &PruneStage{deps: deps, memoryFlush: memFlush, result: Continue}
 }
 
-func (s *PruneStage) Name() string       { return "prune" }
+func (s *PruneStage) Name() string        { return "prune" }
 func (s *PruneStage) Result() StageResult { return s.result }
 
 // defaultCachePruneTTL is used when cfg.TTL is empty or invalid.
@@ -74,6 +74,17 @@ func (s *PruneStage) Execute(ctx context.Context, state *RunState) error {
 	tokensBefore := historyTokens
 
 	softThreshold := budget * 70 / 100
+	slog.Info("context.preflight_budget",
+		"session_key", state.Input.SessionKey,
+		"context_window", contextWindow,
+		"effective_context_window", state.Context.EffectiveContextWindow,
+		"history_tokens", historyTokens,
+		"overhead_tokens", state.Context.OverheadTokens,
+		"max_tokens", s.deps.Config.MaxTokens,
+		"reserve_tokens", s.deps.Config.ReserveTokens,
+		"budget", budget,
+		"soft_threshold", softThreshold,
+	)
 	if historyTokens <= softThreshold {
 		return nil // under budget, no action needed
 	}

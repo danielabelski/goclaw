@@ -47,9 +47,10 @@ func TestLoopCompact_Integration_DynamicMaxTokens_VietnameseFixture(t *testing.T
 	cap := &capturingProvider{response: "Tóm tắt cuộc trò chuyện: Đã thảo luận về nhiều chủ đề."}
 
 	loop := &Loop{
-		provider:     cap,
-		model:        "claude-3-5-sonnet",
-		tokenCounter: tokencount.NewFallbackCounter(),
+		provider:      cap,
+		model:         "claude-3-5-sonnet",
+		tokenCounter:  tokencount.NewFallbackCounter(),
+		contextWindow: 200_000,
 	}
 
 	// 600 messages × ~500 runes each ≈ 300k runes ÷ 3 ≈ 100k tokens total.
@@ -96,4 +97,106 @@ func TestLoopCompact_Integration_DynamicMaxTokens_VietnameseFixture(t *testing.T
 	estimatedIn := loop.estimateSummaryInputTokens(msgs[:splitIdx])
 	t.Logf("observed: msgs=%d splitIdx=%d estimatedIn=%d max_tokens=%d dynamicSummaryMax=%d",
 		len(msgs), splitIdx, estimatedIn, maxTokens, dynamicSummaryMax(estimatedIn))
+}
+
+func TestLoopCompact_ChunksEverySummaryRequestUnderAgentCap(t *testing.T) {
+	cap := &capturingProvider{response: "bounded summary"}
+	loop := &Loop{
+		provider:      cap,
+		model:         "claude-3-5-sonnet",
+		tokenCounter:  tokencount.NewFallbackCounter(),
+		contextWindow: 20_000,
+	}
+	msgs := buildVietnameseMsgs(20, 4_000)
+
+	result := loop.compactMessagesInPlace(context.Background(), msgs)
+	if result == nil {
+		t.Fatal("compactMessagesInPlace returned nil")
+	}
+	if len(cap.captured) < 3 {
+		t.Fatalf("provider calls = %d, want multiple chunks plus merge", len(cap.captured))
+	}
+	inputCap := loop.compactionInputCap()
+	for i, req := range cap.captured {
+		got := loop.tokenCounter.CountMessages(loop.model, req.Messages)
+		if got > inputCap {
+			t.Fatalf("request %d input = %d, exceeds cap %d", i, got, inputCap)
+		}
+	}
+}
+
+// TestLoopCompact_InputCapReservesFixedMaxTokens locks the agent-only budget:
+// compactionInputCap() reserves the CALLING agent's fixed effectiveMaxTokens()
+// from the window, bounded by the request share. The dynamic-output term
+// (dynamicSummaryMax) governs only the per-chunk output budget — it is NOT an
+// authority over the input cap, so it does not appear here.
+func TestLoopCompact_InputCapReservesFixedMaxTokens(t *testing.T) {
+	const (
+		window    = 20_000
+		maxTokens = 8_192
+	)
+	loop := &Loop{
+		provider:      &capturingProvider{},
+		model:         "claude-3-5-sonnet",
+		contextWindow: window,
+		maxTokens:     maxTokens,
+	}
+	inputCap := loop.compactionInputCap()
+
+	hardCap := window - maxTokens                                         // 11808
+	softTarget := int(float64(window)*defaultCompactionShare) - maxTokens // 8808
+	want := min(hardCap, softTarget)
+	if inputCap != want {
+		t.Fatalf("compactionInputCap() = %d, want %d (min(window-maxTokens, share*window-maxTokens))", inputCap, want)
+	}
+	// Invariant: input cap plus the fixed reserve never exceeds the window.
+	if inputCap+maxTokens > window {
+		t.Fatalf("inputCap %d + reserve %d exceeds window %d", inputCap, maxTokens, window)
+	}
+}
+
+func TestLoopCompact_RejectsMoreThanSixteenChunksBeforeProvider(t *testing.T) {
+	cap := &capturingProvider{response: "unused"}
+	loop := &Loop{
+		provider:      cap,
+		model:         "claude-3-5-sonnet",
+		tokenCounter:  tokencount.NewFallbackCounter(),
+		contextWindow: 200_000,
+	}
+	unit := strings.Repeat("bounded-word ", 1_500)
+	unitCap := loop.estimateCompactionRequestTokens(unit)
+	units := make([]string, maxCompactionChunks+1)
+	for i := range units {
+		units[i] = unit
+	}
+
+	if _, _, err := loop.summarizeCompactionUnits(context.Background(), units, unitCap, 1); err == nil {
+		t.Fatal("expected compaction chunk limit error")
+	}
+	if len(cap.captured) != 0 {
+		t.Fatalf("provider calls = %d, want 0 before chunk-limit rejection", len(cap.captured))
+	}
+}
+
+func TestBuildCompactionUnits_KeepsToolCycleTogether(t *testing.T) {
+	units := buildCompactionUnits([]providers.Message{
+		{Role: "assistant", Content: "calling tool", ToolCalls: []providers.ToolCall{{ID: "call-1", Name: "read_file", Arguments: map[string]any{"path": "a.go"}}}},
+		{Role: "tool", Content: "file body here", ToolCallID: "call-1"},
+		{Role: "user", Content: "continue"},
+	})
+	if len(units) != 2 {
+		t.Fatalf("units = %d, want 2 (tool cycle + following user)", len(units))
+	}
+	if !strings.Contains(units[0], "calling tool") || !strings.Contains(units[1], "continue") {
+		t.Fatalf("unexpected units: %#v", units)
+	}
+	// Regression: the tool RESULT payload and the tool CALL must survive into the
+	// compaction unit. Previously renderCompactionMessages dropped role=tool and
+	// assistant tool_calls, erasing technical data before summarization.
+	if !strings.Contains(units[0], "file body here") {
+		t.Fatalf("tool result dropped from compaction unit: %#v", units[0])
+	}
+	if !strings.Contains(units[0], "read_file") {
+		t.Fatalf("tool call dropped from compaction unit: %#v", units[0])
+	}
 }

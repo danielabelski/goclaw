@@ -56,16 +56,17 @@ Streaming fallback is conservative: backup models are tried only if the stream f
 
 ## Usage Cap Pricing Enforcement
 
-Standard edition can enforce AI budget caps before billable provider dispatch. API-key providers use OpenRouter `/models` pricing as the catalog source, with optional tenant/provider/model overrides in the dashboard.
+Standard edition can enforce AI budget caps before billable provider dispatch. API-key providers use OpenRouter `/models` pricing as the catalog source, with optional tenant/provider/model overrides in the dashboard. The gateway syncs the OpenRouter catalog automatically at startup and then once per day; the dashboard sync action remains available for manual refresh.
 
 Excluded provider classes:
-- `chatgpt_oauth`, `claude_cli`, and `bailian` are treated as subscription/non-API pricing in round one.
+- `chatgpt_oauth`, `claude_cli`, and `bailian` are skipped for budget-cap enforcement in round one.
+- Tracing observability can still map Bailian/DashScope Qwen model IDs to the OpenRouter catalog for market-price dashboard reporting.
 - local/no-key subprocess providers such as `acp` and `ollama` are skipped unless a future feature explicitly enables pricing for them.
 
 Runtime flow:
 1. Resolve the stored provider by name and skip non-billable provider classes.
 2. Load matching policies for tenant, agent, provider, provider type, and model.
-3. Resolve custom pricing override first, then OpenRouter catalog pricing when a matching policy has a cost ceiling. Native provider model IDs are mapped to OpenRouter prefixes for common providers such as OpenAI, Anthropic, and Gemini.
+3. Resolve custom pricing override first, then OpenRouter catalog pricing when a matching policy has a cost ceiling. Native provider model IDs are mapped to OpenRouter prefixes for common providers such as OpenAI, Anthropic, and Gemini. Tracing cost calculation uses the same override/catalog resolver, with legacy `telemetry.model_pricing` kept only as a fallback.
 4. Reserve estimated tokens and cost atomically before each dispatch attempt.
 5. Reconcile reserved counters after the provider returns usage or after a failed call.
 
@@ -95,6 +96,7 @@ Supported price units: input, output, cache read, cache write, reasoning, reques
 | Provider | API Base | Default Model | Notes |
 |----------|----------|---------------|-------|
 | openai | `https://api.openai.com/v1` | `gpt-4o` | |
+| atlascloud | `https://api.atlascloud.ai/v1` | `qwen/qwen3.5-flash` | Atlas Cloud OpenAI-compatible LLM endpoint |
 | api_route | `https://global.api-route.com/v1` | `gpt-5.4-mini` | API Route branded OpenAI-compatible endpoint |
 | openrouter | `https://openrouter.ai/api/v1` | `anthropic/claude-sonnet-4-5-20250929` | Model must contain `/` |
 | groq | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` | |
@@ -102,13 +104,13 @@ Supported price units: input, output, cache read, cache write, reasoning, reques
 | gemini | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-2.0-flash` | Skips empty content fields |
 | mistral | `https://api.mistral.ai/v1` | `mistral-large-latest` | |
 | xai | `https://api.x.ai/v1` | `grok-3-mini` | |
-| minimax | `https://api.minimax.io/v1` | `MiniMax-M2.5` | Uses custom chat path |
+| minimax | `https://api.minimax.io/v1` | `MiniMax-M3` | Uses OpenAI-compatible chat completions; MiniMax also exposes an Anthropic-compatible API, but GoClaw keeps the current OpenAI-compatible path |
 | cohere | `https://api.cohere.ai/compatibility/v1` | `command-a` | |
 | perplexity | `https://api.perplexity.ai` | `sonar-pro` | |
 | ollama | `http://localhost:11434/v1` | `llama3.3` | Local/configurable |
 | bailian | `https://coding-intl.dashscope.aliyuncs.com/v1` | `qwen3.5-plus` | Alibaba Coding API |
-| zai | `https://api.z.ai/api/paas/v4` | `glm-5` | |
-| zai-coding | `https://api.z.ai/api/coding/paas/v4` | `glm-5` | |
+| zai | `https://api.z.ai/api/paas/v4` | `glm-5.2` | 1M context, 128K max output |
+| zai-coding | `https://api.z.ai/api/coding/paas/v4` | `glm-5.2` | 1M context, 128K max output |
 | byteplus | `https://ark.ap-southeast.bytepluses.com/api/v3` | `seed-2-0-lite-260228` | Seed 2.0 models |
 | byteplus_coding | `https://ark.ap-southeast.bytepluses.com/api/coding/v3` | `seed-2-0-lite-260228` | Seed 2.0 Coding Plan |
 

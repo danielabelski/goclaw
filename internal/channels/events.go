@@ -98,10 +98,10 @@ func (m *Manager) HandleAgentEvent(eventType, runID string, payload any) {
 			currentStream := rc.stream
 			rc.stream = nil
 			rc.inToolPhase = true
-			rc.thinkingDone = false    // allow new thinking in next iteration
-			rc.thinkingBuffer = ""     // reset thinking buffer for new iteration
-			rc.hasThinking = false     // new iteration starts fresh
-			rc.tagParseSkipped = false // re-enable tag parsing for next iteration
+			rc.thinkingDone = false // allow new thinking in next iteration
+			rc.thinkingBuffer = ""  // reset thinking buffer for new iteration
+			rc.hasThinking = false  // new iteration starts fresh
+			rc.tagParsePending = "" // discard any incomplete tag from the previous iteration
 			rc.mu.Unlock()
 			if currentStream != nil {
 				if err := currentStream.Stop(ctx); err != nil {
@@ -135,19 +135,22 @@ func (m *Manager) HandleAgentEvent(eventType, runID string, payload any) {
 				// Fallback <think> tag parsing: for providers that embed thinking
 				// in the content stream (DeepSeek-via-OpenRouter, Qwen, some Ollama models).
 				// Only activates when no native ChatEventThinking was received.
-				if !rc.hasThinking && !rc.thinkingDone && !rc.tagParseSkipped {
-					candidate := rc.streamBuffer + content
+				if !rc.hasThinking && !rc.thinkingDone {
+					previousAnswer := rc.streamBuffer
+					candidate := rc.streamBuffer + rc.tagParsePending + content
 					split := SplitThinkTags(candidate)
-					if split.Thinking != "" {
+					if split.Found || split.Pending != "" {
 						// Found think tags — commit to buffer and route or suppress reasoning
 						// before any tagged content can leak into the answer lane.
 						displayReasoningInStream := rc.ReasoningDelivery.ShowInChannel && !rc.ReasoningDelivery.BubbleDelivery && sc.ReasoningStreamEnabled()
 						previousThinking := rc.thinkingBuffer
-						rc.streamBuffer = candidate
 						rc.thinkingBuffer = split.Thinking
 						thinkText := rc.thinkingBuffer
 						currentStream := rc.stream
-						if split.Partial {
+						if split.Partial || split.Pending != "" {
+							rc.streamBuffer = split.Answer
+							rc.tagParsePending = split.Pending
+							answerText := rc.streamBuffer
 							// Still inside <think> — wait for the close tag before streaming
 							// answer content. Native thinking uses hasThinking; tag parsing
 							// keeps it false until close so later chunks continue parsing.
@@ -158,9 +161,12 @@ func (m *Manager) HandleAgentEvent(eventType, runID string, payload any) {
 								}
 							} else if displayReasoningInStream && currentStream != nil {
 								currentStream.Update(ctx, formatReasoningPreview(thinkText))
+							} else if currentStream != nil {
+								currentStream.Update(ctx, answerText)
 							}
 							break
 						}
+						rc.tagParsePending = ""
 						// Tag closed — transition to answer, or strip reasoning entirely
 						// when Show Reasoning is off.
 						answerText := split.Answer
@@ -177,7 +183,7 @@ func (m *Manager) HandleAgentEvent(eventType, runID string, payload any) {
 							m.flushReasoningBubbles(runID)
 						}
 
-						if !displayReasoningInStream {
+						if previousAnswer != "" || !displayReasoningInStream {
 							if reasoningStream != nil && answerText != "" {
 								reasoningStream.Update(ctx, answerText)
 							}
@@ -209,9 +215,6 @@ func (m *Manager) HandleAgentEvent(eventType, runID string, payload any) {
 						}
 						break
 					}
-					// No think tags found — mark as skipped so we don't re-parse.
-					// Don't commit to streamBuffer here — the normal flow below appends content.
-					rc.tagParseSkipped = true
 				}
 
 				// Reasoning→answer transition: first chunk after native thinking events.
@@ -414,7 +417,18 @@ func (m *Manager) HandleAgentEvent(eventType, runID string, payload any) {
 		case protocol.AgentEventRunCompleted:
 			status = "done"
 		case protocol.AgentEventRunFailed:
-			status = "error"
+			// Issue 3: transient provider failures (rate limit, timeout, overload)
+			// already surface a friendly retry message via FormatAgentError — a
+			// terminal 💔 reaction would be misleading. Clear any interim reaction
+			// instead; permanent errors keep the 💔.
+			if isTransientFailureMessage(extractPayloadString(payload, "error")) {
+				if err := reactionCh.ClearReaction(ctx, rc.ChatID, rc.MessageID); err != nil {
+					slog.Debug("reaction clear failed", "channel", rc.ChannelName, "error", err)
+				}
+				status = ""
+			} else {
+				status = "error"
+			}
 		case protocol.AgentEventRunCancelled:
 			status = "done"
 		}
@@ -425,9 +439,26 @@ func (m *Manager) HandleAgentEvent(eventType, runID string, payload any) {
 		}
 	}
 
+	// Forward to ActivityIndicatorChannel — ephemeral "agent is working" indicator
+	// (e.g. Bitrix24 imbot InputAction.notify). Events set the status content; a
+	// conditional heartbeat ticker (started here) fills LLM-inference gaps. Best-effort:
+	// fireActivity never blocks and drops on error/rate-limit.
+	if actCh, ok := ch.(ActivityIndicatorChannel); ok {
+		switch eventType {
+		case protocol.AgentEventRunStarted:
+			m.fireActivity(rc, actCh, ActivityStatusThinking)
+			m.startActivityTicker(rc, actCh)
+		case protocol.AgentEventToolCall:
+			m.fireActivity(rc, actCh, resolveToolActivityStatus(extractPayloadString(payload, "name")))
+		case protocol.AgentEventToolResult:
+			m.fireActivity(rc, actCh, ActivityStatusAnalyzing)
+		}
+	}
+
 	// Clean up on terminal events
 	if eventType == protocol.AgentEventRunCompleted || eventType == protocol.AgentEventRunFailed || eventType == protocol.AgentEventRunCancelled {
 		m.cancelQuickAck(rc)
+		m.stopActivityTicker(rc)
 		rc.mu.Lock()
 		stopReasoningBubbleTimerLocked(rc)
 		rc.mu.Unlock()

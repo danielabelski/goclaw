@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -18,10 +19,11 @@ import (
 type PGAgentStore struct {
 	db          *sql.DB
 	embProvider store.EmbeddingProvider // optional: for agent frontmatter embeddings
+	embJobs     chan struct{}
 }
 
 func NewPGAgentStore(db *sql.DB) *PGAgentStore {
-	return &PGAgentStore{db: db}
+	return &PGAgentStore{db: db, embJobs: make(chan struct{}, 4)}
 }
 
 // SetEmbeddingProvider sets the embedding provider for agent frontmatter vectors.
@@ -44,46 +46,96 @@ func (s *PGAgentStore) generateAgentEmbedding(ctx context.Context, agentID uuid.
 		return
 	}
 	vecStr := vectorToString(embeddings[0])
-	if _, err := s.db.ExecContext(ctx, `UPDATE agents SET embedding = $1::vector WHERE id = $2`, vecStr, agentID); err != nil {
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE agents SET embedding = $1::vector
+		WHERE id = $2 AND deleted_at IS NULL AND status = 'active'
+		  AND COALESCE(display_name, '') = $3
+		  AND COALESCE(frontmatter, '') = $4`,
+		vecStr, agentID, displayName, frontmatter); err != nil {
 		slog.Warn("agent embedding update failed", "agent", agentID, "error", err)
+	}
+}
+
+// queueAgentEmbedding bounds background provider calls. Updates clear the old
+// vector before enqueueing, so overload leaves a retryable NULL instead of a
+// stale semantic index.
+func (s *PGAgentStore) queueAgentEmbedding(agentID uuid.UUID) {
+	if s.embProvider == nil {
+		return
+	}
+	select {
+	case s.embJobs <- struct{}{}:
+		go func() {
+			defer func() { <-s.embJobs }()
+			ctx, cancel := context.WithTimeout(store.WithCrossTenant(context.Background()), 75*time.Second)
+			defer cancel()
+			agent, err := s.GetByID(ctx, agentID)
+			if err != nil {
+				slog.Warn("agent embedding source load failed", "agent", agentID, "error", err)
+				return
+			}
+			s.generateAgentEmbedding(ctx, agent.ID, agent.DisplayName, agent.Frontmatter)
+		}()
+	default:
+		slog.Warn("agent embedding queue full; vector remains pending", "agent", agentID)
 	}
 }
 
 // BackfillAgentEmbeddings generates embeddings for all active agents that have frontmatter but no embedding.
 func (s *PGAgentStore) BackfillAgentEmbeddings(ctx context.Context) (int, error) {
 	if s.embProvider == nil {
-		return 0, nil
-	}
-	var pending []agentBackfillRow
-	if err := pkgSqlxDB.SelectContext(ctx, &pending,
-		`SELECT id, COALESCE(display_name, '') AS display_name, COALESCE(frontmatter, '') AS frontmatter
-		 FROM agents WHERE deleted_at IS NULL AND frontmatter IS NOT NULL AND frontmatter != '' AND embedding IS NULL`,
-	); err != nil {
-		return 0, err
-	}
-	if len(pending) == 0 {
-		return 0, nil
+		return 0, fmt.Errorf("no embedding provider configured")
 	}
 
-	slog.Info("backfilling agent embeddings", "count", len(pending))
-	updated := 0
-	for _, ag := range pending {
-		text := ag.DisplayName
-		if ag.Frontmatter != "" {
-			text += ": " + ag.Frontmatter
+	const batchSize = 50
+	total := 0
+	var backfillErrs []error
+	cursor := uuid.Nil
+	for {
+		var pending []agentBackfillRow
+		if err := pkgSqlxDB.SelectContext(ctx, &pending,
+			`SELECT id, COALESCE(display_name, '') AS display_name, COALESCE(frontmatter, '') AS frontmatter
+			 FROM agents
+			 WHERE deleted_at IS NULL AND status = 'active'
+			   AND frontmatter IS NOT NULL AND frontmatter != '' AND embedding IS NULL AND id > $1
+			 ORDER BY id ASC
+			 LIMIT $2`, cursor, batchSize,
+		); err != nil {
+			return total, fmt.Errorf("query agents without embeddings: %w", err)
 		}
-		embeddings, err := s.embProvider.Embed(ctx, []string{text})
-		if err != nil || len(embeddings) == 0 || len(embeddings[0]) == 0 {
-			continue
+		if len(pending) == 0 {
+			return total, errors.Join(backfillErrs...)
 		}
-		vecStr := vectorToString(embeddings[0])
-		if _, err := s.db.ExecContext(ctx, `UPDATE agents SET embedding = $1::vector WHERE id = $2`, vecStr, ag.ID); err != nil {
-			continue
+
+		items := make([]embeddingBackfillItem[agentBackfillRow], len(pending))
+		for i, agent := range pending {
+			items[i] = embeddingBackfillItem[agentBackfillRow]{
+				row:  agent,
+				id:   agent.ID,
+				text: agent.DisplayName + ": " + agent.Frontmatter,
+			}
 		}
-		updated++
+		updated, err := processEmbeddingBackfillBatch(ctx, s.embProvider, "agent", items,
+			func(ctx context.Context, agent agentBackfillRow, embedding []float32) (int64, error) {
+				result, err := s.db.ExecContext(ctx,
+					`UPDATE agents SET embedding = $1::vector
+				 WHERE id = $2 AND embedding IS NULL AND deleted_at IS NULL AND status = 'active'
+				   AND COALESCE(display_name, '') = $3 AND COALESCE(frontmatter, '') = $4`,
+					vectorToString(embedding), agent.ID, agent.DisplayName, agent.Frontmatter)
+				if err != nil {
+					return 0, err
+				}
+				return result.RowsAffected()
+			})
+		total += updated
+		if err != nil {
+			backfillErrs = append(backfillErrs, err)
+			if ctx.Err() != nil {
+				return total, errors.Join(backfillErrs...)
+			}
+		}
+		cursor = pending[len(pending)-1].ID
 	}
-	slog.Info("agent embeddings backfill complete", "updated", updated)
-	return updated, nil
 }
 
 // agentSelectCols is the column list for all agent SELECT queries.
@@ -97,6 +149,12 @@ const agentSelectCols = `id, agent_key, display_name, frontmatter, owner_id, pro
 		 model_fallback, shell_deny_groups, kg_dedup_config,
 		 agent_type, is_default, status, budget_monthly_cents, created_at, updated_at, tenant_id`
 
+// sqlExecer is satisfied by both *sql.DB and *sql.Tx, allowing helper
+// functions to be called within or outside a transaction.
+type sqlExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 func (s *PGAgentStore) Create(ctx context.Context, agent *store.AgentData) error {
 	if agent.ID == uuid.Nil {
 		agent.ID = store.GenNewID()
@@ -108,7 +166,14 @@ func (s *PGAgentStore) Create(ctx context.Context, agent *store.AgentData) error
 	if tenantID == uuid.Nil {
 		tenantID = store.MasterTenantID
 	}
-	_, err := s.db.ExecContext(ctx,
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	_, err = tx.ExecContext(ctx,
 		`INSERT INTO agents (id, agent_key, display_name, frontmatter, owner_id, provider, model,
 		 context_window, max_tool_iterations, workspace, restrict_to_workspace,
 		 tools_config, sandbox_config, subagents_config, memory_config,
@@ -131,18 +196,20 @@ func (s *PGAgentStore) Create(ctx context.Context, agent *store.AgentData) error
 		agent.AgentType, agent.IsDefault, agent.Status, agent.BudgetMonthlyCents, now, now, tenantID,
 	)
 	if err != nil {
-		return err
+		return fmt.Errorf("insert agent: %w", err)
 	}
 	if agent.BudgetMonthlyCents != nil {
-		if err := s.syncAgentBudgetUsageCap(ctx, tenantID, agent.ID, agent.BudgetMonthlyCents); err != nil {
-			_, _ = s.db.ExecContext(ctx, "DELETE FROM agents WHERE id = $1", agent.ID)
-			return err
+		if err := syncAgentBudgetUsageCap(ctx, tx, tenantID, agent.ID, agent.BudgetMonthlyCents); err != nil {
+			return fmt.Errorf("sync budget usage cap: %w", err)
 		}
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit agent create: %w", err)
+	}
 
-	// Generate embedding for new agent with frontmatter
-	if agent.Frontmatter != "" && s.embProvider != nil {
-		go s.generateAgentEmbedding(context.Background(), agent.ID, agent.DisplayName, agent.Frontmatter)
+	// Generate embedding for new agent with frontmatter (best-effort, outside tx).
+	if agent.Frontmatter != "" {
+		s.queueAgentEmbedding(agent.ID)
 	}
 	return nil
 }
@@ -256,6 +323,13 @@ func (s *PGAgentStore) Update(ctx context.Context, id uuid.UUID, updates map[str
 		}
 	}
 
+	_, frontmatterChanged := updates["frontmatter"]
+	_, displayNameChanged := updates["display_name"]
+	if frontmatterChanged || displayNameChanged {
+		// Never keep a vector built from stale routing metadata. A bounded async
+		// job or the next startup backfill will fill this NULL.
+		updates["embedding"] = nil
+	}
 	updates["updated_at"] = time.Now()
 	if store.IsCrossTenant(ctx) {
 		if err := execMapUpdateWhere(ctx, s.db, "agents", updates, "id = $IDX AND deleted_at IS NULL", id); err != nil {
@@ -271,20 +345,13 @@ func (s *PGAgentStore) Update(ctx context.Context, id uuid.UUID, updates map[str
 		}
 	}
 	if syncBudget {
-		if err := s.syncAgentBudgetUsageCap(ctx, budgetTenantID, id, budgetCents); err != nil {
+		if err := syncAgentBudgetUsageCap(ctx, s.db, budgetTenantID, id, budgetCents); err != nil {
 			return err
 		}
 	}
 
-	// Regenerate embedding when frontmatter changes
-	if _, hasFrontmatter := updates["frontmatter"]; hasFrontmatter && s.embProvider != nil {
-		bgCtx := store.WithTenantID(context.Background(), store.TenantIDFromContext(ctx))
-		go func() {
-			ag, agErr := s.GetByID(bgCtx, id)
-			if agErr == nil {
-				s.generateAgentEmbedding(bgCtx, id, ag.DisplayName, ag.Frontmatter)
-			}
-		}()
+	if frontmatterChanged || displayNameChanged {
+		s.queueAgentEmbedding(id)
 	}
 	return nil
 }
@@ -329,16 +396,19 @@ func budgetCentsFromUpdate(v any) (*int, error) {
 	return &cents, nil
 }
 
-func (s *PGAgentStore) syncAgentBudgetUsageCap(ctx context.Context, tenantID, agentID uuid.UUID, budgetCents *int) error {
+// syncAgentBudgetUsageCap upserts or deletes the agent's monthly budget cap
+// in usage_cap_policies. It accepts a sqlExecer so it can be called inside a
+// transaction (during Create) or directly against the pool (during Update).
+func syncAgentBudgetUsageCap(ctx context.Context, db sqlExecer, tenantID, agentID uuid.UUID, budgetCents *int) error {
 	if budgetCents == nil || *budgetCents <= 0 {
-		_, err := s.db.ExecContext(ctx,
+		_, err := db.ExecContext(ctx,
 			`DELETE FROM usage_cap_policies
 			 WHERE tenant_id=$1 AND agent_id=$2 AND source=$3`,
 			tenantID, agentID, store.UsageCapSourceAgentBudget)
 		return err
 	}
 	costMicros := int64(*budgetCents) * 10000
-	_, err := s.db.ExecContext(ctx, `
+	_, err := db.ExecContext(ctx, `
 INSERT INTO usage_cap_policies (
 	tenant_id, agent_id, window_key, max_cost_micros, enabled, priority, source
 ) VALUES ($1,$2,'month',$3,true,90,$4)
@@ -373,7 +443,37 @@ func isEmptyOrNullJSONUpdate(v any) bool {
 	}
 }
 
+func (s *PGAgentStore) aggregateAndDeleteAgentUsage(ctx context.Context, agentID uuid.UUID) error {
+	// Upsert this agent's usage_snapshots into NULL-agent aggregate rows, then delete the agent rows.
+	// This is necessary because the unique index uses COALESCE(agent_id, '00000000...') so ON DELETE SET NULL
+	// would cause a unique-constraint violation when multiple agent rows share the same bucket/provider/model/channel/tenant.
+	const upsertQuery = `
+		INSERT INTO usage_snapshots
+			(bucket_hour, agent_id, provider, model, channel, tenant_id, input_tokens, output_tokens, created_at)
+		SELECT bucket_hour, NULL, provider, model, channel, tenant_id,
+		       SUM(input_tokens), SUM(output_tokens), NOW()
+		FROM usage_snapshots
+		WHERE agent_id = $1
+		GROUP BY bucket_hour, provider, model, channel, tenant_id
+		ON CONFLICT (bucket_hour, COALESCE(agent_id, '00000000-0000-0000-0000-000000000000'::uuid),
+		             provider, model, channel, tenant_id)
+		DO UPDATE SET
+			input_tokens  = EXCLUDED.input_tokens  + usage_snapshots.input_tokens,
+			output_tokens = EXCLUDED.output_tokens + usage_snapshots.output_tokens
+	`
+	if _, err := s.db.ExecContext(ctx, upsertQuery, agentID); err != nil {
+		return fmt.Errorf("aggregate agent usage: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM usage_snapshots WHERE agent_id = $1", agentID); err != nil {
+		return fmt.Errorf("delete agent usage snapshots: %w", err)
+	}
+	return nil
+}
+
 func (s *PGAgentStore) Delete(ctx context.Context, id uuid.UUID) error {
+	if err := s.aggregateAndDeleteAgentUsage(ctx, id); err != nil {
+		return err
+	}
 	if store.IsCrossTenant(ctx) {
 		_, err := s.db.ExecContext(ctx, "DELETE FROM agents WHERE id = $1", id)
 		return err
@@ -397,7 +497,12 @@ func (s *PGAgentStore) List(ctx context.Context, ownerID string) ([]store.AgentD
 		argIdx++
 	}
 
-	if clause, targs, _, err := scopeClause(ctx, argIdx); err == nil && clause != "" {
+	clause, targs, _, err := scopeClause(ctx, argIdx)
+	if err != nil {
+		slog.Warn("agents.List: tenant context missing, returning empty (fail-closed)", "error", err)
+		return nil, nil
+	}
+	if clause != "" {
 		q += clause
 		args = append(args, targs...)
 		argIdx++

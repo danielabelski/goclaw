@@ -85,6 +85,8 @@ const (
 
 	MethodQuotaUsage = "quota.usage"
 
+	MethodLLMComplete = "llm.complete"
+
 	MethodSend = "send"
 )
 
@@ -161,6 +163,18 @@ const (
 // Team events
 const (
 	MethodTeamsEventsList = "teams.events.list"
+)
+
+// Tenants (multi-tenant management)
+const (
+	MethodTenantsList        = "tenants.list"
+	MethodTenantsGet         = "tenants.get"
+	MethodTenantsCreate      = "tenants.create"
+	MethodTenantsUpdate      = "tenants.update"
+	MethodTenantsUsersList   = "tenants.users.list"
+	MethodTenantsUsersAdd    = "tenants.users.add"
+	MethodTenantsUsersRemove = "tenants.users.remove"
+	MethodTenantsMine        = "tenants.mine"
 )
 
 // API key management

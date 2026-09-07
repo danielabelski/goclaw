@@ -5,6 +5,7 @@ export const HookEventEnum = z.enum([
   "user_prompt_submit",
   "pre_tool_use",
   "post_tool_use",
+  "post_model_response",
   "stop",
   "subagent_start",
   "subagent_stop",
@@ -37,6 +38,7 @@ export const hookFormSchema = z
     headers: z.string().optional(), // JSON string
     body_template: z.string().optional(),
     prompt_template: z.string().optional(),
+    provider: z.string().optional(),
     model: z.string().optional(),
     max_invocations_per_turn: z.number().int().min(1).max(20).optional(),
     // Script handler source (ES5.1 JavaScript). Cap mirrors backend 32 KiB
@@ -70,6 +72,20 @@ export const hookFormSchema = z
           code: z.ZodIssueCode.custom,
           path: ["prompt_template"],
           message: "validation.promptTemplateRequired",
+        });
+      }
+      if (!data.provider?.trim()) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["provider"],
+          message: "validation.promptProviderRequired",
+        });
+      }
+      if (!data.model?.trim()) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["model"],
+          message: "validation.promptModelRequired",
         });
       }
     }

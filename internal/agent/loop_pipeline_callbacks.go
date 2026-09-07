@@ -2,8 +2,12 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,7 +41,7 @@ func (l *Loop) pipelineCallbacks(req *RunRequest, bridgeRS *runState) pipelineCa
 		event.ChatID = req.ChatID
 		event.SessionKey = req.SessionKey
 		event.TenantID = l.tenantID
-		l.emit(event)
+		l.emit(redactDelegationAgentEvent(req, event))
 	}
 	return pipelineCallbackSet{
 		emitRun:            emitRun,
@@ -45,7 +49,7 @@ func (l *Loop) pipelineCallbacks(req *RunRequest, bridgeRS *runState) pipelineCa
 		loadSessionHistory: l.makeLoadSessionHistory(),
 		resolveWorkspace:   l.makeResolveWorkspace(req),
 		loadContextFiles:   l.makeLoadContextFiles(),
-		buildMessages:      l.makeBuildMessages(),
+		buildMessages:      l.makeBuildMessages(req),
 		enrichMedia:        l.makeEnrichMedia(req),
 		injectReminders:    l.makeInjectReminders(req),
 		buildFilteredTools: l.makeBuildFilteredTools(req),
@@ -90,9 +94,9 @@ type pipelineCallbackSet struct {
 	checkReadOnly      func(state *pipeline.RunState) (*providers.Message, bool)
 	sanitizeContent    func(string) string
 	flushMessages      func(ctx context.Context, sessionKey string, msgs []providers.Message) error
-	updateMetadata     func(ctx context.Context, sessionKey string, usage providers.Usage) error
+	updateMetadata     func(ctx context.Context, sessionKey string, usage, lastUsage providers.Usage, msgCount int) error
 	bootstrapCleanup   func(ctx context.Context, state *pipeline.RunState) error
-	maybeSummarize     func(ctx context.Context, sessionKey string)
+	maybeSummarize     func(ctx context.Context, sessionKey string, midLoopCompacted bool)
 }
 
 func (l *Loop) makeResolveWorkspace(req *RunRequest) func(ctx context.Context, input *pipeline.RunInput) (*workspace.WorkspaceContext, error) {
@@ -129,14 +133,20 @@ func (l *Loop) makeLoadContextFiles() func(ctx context.Context, userID string) (
 	}
 }
 
-func (l *Loop) makeBuildMessages() func(ctx context.Context, input *pipeline.RunInput, history []providers.Message, summary string) ([]providers.Message, error) {
+func (l *Loop) makeBuildMessages(req *RunRequest) func(ctx context.Context, input *pipeline.RunInput, history []providers.Message, summary string) ([]providers.Message, error) {
 	return func(ctx context.Context, input *pipeline.RunInput, history []providers.Message, summary string) ([]providers.Message, error) {
+		if prompt := buildTeamWorkDirectivePrompt(req.TeamWorkDirective); prompt != "" {
+			if input.ExtraSystemPrompt != "" {
+				input.ExtraSystemPrompt += "\n\n"
+			}
+			input.ExtraSystemPrompt += prompt
+		}
 		msgs, _ := l.buildMessages(ctx, history, summary,
 			input.Message, input.ExtraSystemPrompt,
 			input.SessionKey, input.Channel, input.ChannelType,
 			input.BitrixPortalDomain,
 			input.ChatTitle, input.ChatID, input.PeerKind, input.UserID, input.SenderName,
-			input.HistoryLimit, input.SkillFilter, input.LightContext)
+			input.HistoryLimit, input.SkillFilter, input.LightContext, input.TelegramManagerPermissions)
 		return msgs, nil
 	}
 }
@@ -179,13 +189,30 @@ func (l *Loop) makeEnrichMedia(req *RunRequest) func(ctx context.Context, state 
 		if len(msgs) == 0 {
 			return nil
 		}
-		enrichedCtx, enrichedMsgs, _ := l.enrichInputMedia(ctx, req, msgs)
+		enrichedCtx, enrichedMsgs, currentRefs := l.enrichInputMedia(ctx, req, msgs)
 		// Propagate enriched context (media images/docs/audio/video refs for tools).
 		state.Ctx = enrichedCtx
 		// Update history with enriched messages (media tags, inline images).
 		// Skip system message (index 0) — only history + user messages are enriched.
 		if len(enrichedMsgs) > 1 {
 			state.Messages.SetHistory(enrichedMsgs[1:])
+		}
+		// Preserve the enriched current input for the first session checkpoint.
+		// Inline image bytes stay request-local; durable history stores only the
+		// logical tags plus absolute MediaRefs used internally for exact lookup.
+		if len(currentRefs) > 0 {
+			for i := len(enrichedMsgs) - 1; i >= 0; i-- {
+				if enrichedMsgs[i].Role != "user" {
+					continue
+				}
+				req.enrichedInputMessage = providers.Message{
+					Role:      "user",
+					Content:   enrichedMsgs[i].Content,
+					MediaRefs: append([]providers.MediaRef(nil), currentRefs...),
+				}
+				req.hasEnrichedInputMessage = true
+				break
+			}
 		}
 		return nil
 	}
@@ -199,22 +226,45 @@ func (l *Loop) makeInjectReminders(req *RunRequest) func(ctx context.Context, in
 }
 
 func (l *Loop) makeBuildFilteredTools(req *RunRequest) func(state *pipeline.RunState) ([]providers.ToolDefinition, error) {
+	// Per-run cache: all filtering inputs (policy, disabled tools, bootstrap,
+	// channel, orchestration mode, user MCP tools) are fixed for the lifetime
+	// of a run. Only the final iteration differs (strips all tools). Cache the
+	// result after the first call and reuse for iterations 0..maxIter-1.
+	var (
+		cachedToolDefs []providers.ToolDefinition
+		cacheValid     bool
+	)
 	return func(state *pipeline.RunState) ([]providers.ToolDefinition, error) {
+		maxIter := l.maxIterations
+		if req.MaxIterations > 0 && req.MaxIterations < maxIter {
+			maxIter = req.MaxIterations
+		}
+
+		// Cache hit: reuse tool defs from first call for non-final iterations.
+		if cacheValid && state.Iteration != maxIter {
+			return cachedToolDefs, nil
+		}
+
 		// Load per-user MCP tools (Notion, etc.) into registry before filtering.
 		// Servers with require_user_credentials are deferred at startup and
 		// connected per-request here with the actual user's credentials.
 		//
-		// Use resolveActorUserID — the gateway consumer rewrites UserID in
-		// two scenarios (group chats AND DM with merged contact), both of
-		// which break per-user MCP credential lookup. ChannelType discriminates
-		// Bitrix24 (always prefer SenderID) from other channels (group-only
-		// rewrite recovery). See resolveActorUserID docstring for full rationale.
-		actorUserID := resolveActorUserID(
-			state.Input.UserID,
-			state.Input.SenderID,
-			state.Input.PeerKind,
-			state.Input.ChannelType,
-		)
+		// Prefer CredentialUserID from context — resolveCredentialUserID already
+		// resolved the merged tenant_user identity (e.g. Telegram group merged
+		// to a tenant_user via UI). Using the raw SenderID or group composite
+		// as the cache key would miss the credential row keyed by the merged
+		// tenant_user UUID. Fall back to resolveActorUserID for channels without
+		// merge resolution (backward compat). See resolveActorUserID docstring
+		// for the group-rewrite recovery rationale.
+		actorUserID := store.CredentialUserIDFromContext(state.Ctx)
+		if actorUserID == "" {
+			actorUserID = resolveActorUserID(
+				state.Input.UserID,
+				state.Input.SenderID,
+				state.Input.PeerKind,
+				state.Input.ChannelType,
+			)
+		}
 		userTools := l.getUserMCPTools(state.Ctx, actorUserID)
 		slog.Debug("mcp.user_tools_context",
 			"peer_kind", state.Input.PeerKind,
@@ -222,29 +272,9 @@ func (l *Loop) makeBuildFilteredTools(req *RunRequest) func(state *pipeline.RunS
 			"sender_id", state.Input.SenderID,
 			"actor_user_id", actorUserID,
 			"user_tools_count", len(userTools))
-		maxIter := l.maxIterations
-		if req.MaxIterations > 0 && req.MaxIterations < maxIter {
-			maxIter = req.MaxIterations
-		}
 		allMsgs := state.Messages.All()
 		toolDefs, _, returnedMsgs := l.buildFilteredTools(req, state.Context.HadBootstrap,
-			state.Iteration, maxIter, allMsgs)
-		if state.Iteration != maxIter && len(userTools) > 0 {
-			existing := make(map[string]struct{}, len(toolDefs)+len(userTools))
-			for _, td := range toolDefs {
-				if td.Function != nil {
-					existing[td.Function.Name] = struct{}{}
-				}
-			}
-			for _, t := range userTools {
-				name := t.Name()
-				if _, ok := existing[name]; ok {
-					continue
-				}
-				toolDefs = append(toolDefs, tools.ToProviderDef(t))
-				existing[name] = struct{}{}
-			}
-		}
+			state.Iteration, maxIter, allMsgs, userTools)
 		// buildFilteredTools returns the full messages slice; only messages appended
 		// beyond the original length are injections (e.g. final-iteration hint).
 		// Appending the entire slice would duplicate system+history into pending.
@@ -253,18 +283,36 @@ func (l *Loop) makeBuildFilteredTools(req *RunRequest) func(state *pipeline.RunS
 				state.Messages.AppendPending(msg)
 			}
 		}
-		mcpDefs := 0
-		for _, td := range toolDefs {
-			if strings.HasPrefix(strings.TrimSpace(td.Function.Name), "mcp_") {
-				mcpDefs++
-			}
+
+		// Cache store after first successful non-final call.
+		if !cacheValid && state.Iteration != maxIter {
+			cachedToolDefs = toolDefs
+			cacheValid = true
 		}
+
 		slog.Debug("mcp.filtered_tools",
 			"tool_defs_count", len(toolDefs),
-			"mcp_defs_count", mcpDefs,
+			"mcp_defs_count", countMCPToolDefs(toolDefs),
 			"iteration", state.Iteration)
 		return toolDefs, nil
 	}
+}
+
+// countMCPToolDefs counts MCP-bridged tool definitions (name prefix "mcp_").
+// It skips entries with a nil Function — e.g. the native image_generation
+// sentinel providers.ToolDefinition{Type: "image_generation"} — which would
+// otherwise nil-deref (the v3.14.0 panic on every message for codex agents).
+func countMCPToolDefs(toolDefs []providers.ToolDefinition) int {
+	n := 0
+	for _, td := range toolDefs {
+		if td.Function == nil {
+			continue
+		}
+		if strings.HasPrefix(strings.TrimSpace(td.Function.Name), "mcp_") {
+			n++
+		}
+	}
+	return n
 }
 
 // makeAuthorizeToolCall enforces a runtime fail-closed allowlist check before
@@ -294,7 +342,7 @@ func (l *Loop) makeAuthorizeToolCall() func(ctx context.Context, state *pipeline
 		if l.tools != nil && l.tools.TryActivateDeferred(name) {
 			// Re-check deny policy to prevent a lazy-activated tool from bypassing
 			// an explicit deny rule.
-			if l.toolPolicy != nil && l.toolPolicy.IsDenied(name, l.agentToolPolicy) {
+			if l.toolPolicy != nil && l.toolPolicy.IsDenied(tools.ResolveConcreteRegistry(l.tools), name, l.agentToolPolicy) {
 				return false, "tool not allowed by policy: " + name
 			}
 			allowed[name] = true
@@ -305,10 +353,38 @@ func (l *Loop) makeAuthorizeToolCall() func(ctx context.Context, state *pipeline
 	}
 }
 
+// allowedToolNamesSlice converts a policy-filtered allowed-tool set into a
+// sorted slice for deterministic downstream consumption (e.g. Claude CLI
+// --disallowedTools derivation).
+func allowedToolNamesSlice(allowed map[string]bool) []string {
+	names := make([]string, 0, len(allowed))
+	for name := range allowed {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
+}
+
 func (l *Loop) makeCallLLM(req *RunRequest, emitRun func(AgentEvent)) func(ctx context.Context, state *pipeline.RunState, chatReq providers.ChatRequest) (*providers.ChatResponse, error) {
 	return func(ctx context.Context, state *pipeline.RunState, chatReq providers.ChatRequest) (*providers.ChatResponse, error) {
 		provider := state.Provider
 		model := state.Model
+
+		// Issue 3: surface transient provider retries to the user ("Provider busy,
+		// retrying...") instead of a silent failure ending in a 💔 reaction. The
+		// providers' internal RetryDo / codex loops fire this hook before each retry
+		// attempt; the channel layer turns run.retrying into a placeholder update.
+		ctx = providers.WithRetryHook(ctx, func(attempt, maxAttempts int, _ error) {
+			emitRun(AgentEvent{
+				Type:    protocol.AgentEventRunRetrying,
+				AgentID: l.id,
+				RunID:   req.RunID,
+				Payload: map[string]string{
+					"attempt":     strconv.Itoa(attempt),
+					"maxAttempts": strconv.Itoa(maxAttempts),
+				},
+			})
+		})
 
 		// Enrich ChatRequest options to match v2 (providers need these for caching, routing, audit).
 		if chatReq.Options == nil {
@@ -323,8 +399,28 @@ func (l *Loop) makeCallLLM(req *RunRequest, emitRun func(AgentEvent)) func(ctx c
 		chatReq.Options[providers.OptPeerKind] = req.PeerKind
 		chatReq.Options[providers.OptLocalKey] = req.LocalKey
 		chatReq.Options[providers.OptWorkspace] = tools.ToolWorkspaceFromCtx(ctx)
-		if tid := store.TenantIDFromContext(ctx); tid != uuid.Nil {
-			chatReq.Options[providers.OptTenantID] = tid.String()
+		if delegationID := tools.DelegationIDFromCtx(ctx); delegationID != "" {
+			chatReq.Options[providers.OptDelegationID] = delegationID
+		}
+		if inputs := tools.DelegationArtifactInputsFromCtx(ctx); inputs != "" {
+			chatReq.Options[providers.OptDelegationInputs] = inputs
+		}
+		// Pass the policy-filtered allowed tool set so the Claude CLI provider
+		// can restrict its native built-in tools (Bash, Edit, Write, Read,
+		// WebFetch, WebSearch) to what the agent's tool policy actually allows.
+		// A nil state.Tool.AllowedTools means BuildFilteredTools didn't run
+		// (not wired) — do NOT set the option in that case, so the CLI
+		// provider's own fail-closed default (nil -> no tools allowed) applies
+		// rather than silently omitting the flag.
+		if state.Tool.AllowedTools != nil {
+			chatReq.Options[providers.OptAllowedToolNames] = allowedToolNamesSlice(state.Tool.AllowedTools)
+		}
+		tenantID := store.TenantIDFromContext(ctx)
+		if tenantID != uuid.Nil {
+			chatReq.Options[providers.OptTenantID] = tenantID.String()
+		}
+		if supportsPromptCacheParams(provider) {
+			setDefaultPromptCacheOptions(chatReq.Options, tenantID, l.agentUUID, provider.Name(), req.SessionKey)
 		}
 
 		// Reasoning decision: resolve effort level for thinking models (o3, DeepSeek-R1, Kimi).
@@ -351,6 +447,9 @@ func (l *Loop) makeCallLLM(req *RunRequest, emitRun func(AgentEvent)) func(ctx c
 			opts = append(opts, withProvider(provider.Name()))
 		}
 		spanID := l.emitLLMSpanStart(ctx, start, state.Iteration+1, chatReq.Messages, opts...)
+		if spanID != uuid.Nil {
+			state.CurrentLLMSpanID = &spanID
+		}
 		recordUsageCapAttempt := func(reservation *usagecaps.Reservation) {
 			if reservation != nil {
 				opts = append(opts, withUsageCapMetadata(reservation.TraceMetadata()))
@@ -463,9 +562,29 @@ func (l *Loop) makeCallLLM(req *RunRequest, emitRun func(AgentEvent)) func(ctx c
 			}(),
 			"tools_provided", len(chatReq.Tools))
 
+		if err == nil && teamWorkDirectiveNeedsRetry(req.TeamWorkDirective, state.Iteration, resp) {
+			retryReq := buildTeamWorkDirectiveRetryRequest(chatReq, req.TeamWorkDirective)
+			resp, err = callProvider("team-work-directive-retry", retryReq)
+			slog.Info("team_work_classify: directive retry response",
+				"has_error", err != nil,
+				"required_tool", req.TeamWorkDirective.normalizedRequiredTool(),
+				"tool_calls_count", func() int {
+					if resp == nil {
+						return -1
+					}
+					return len(resp.ToolCalls)
+				}())
+			if err == nil && teamWorkDirectiveNeedsRetry(req.TeamWorkDirective, state.Iteration, resp) {
+				resp = &providers.ChatResponse{
+					Content:      teamWorkDirectiveBlocker(req.TeamWorkDirective),
+					FinishReason: "stop",
+				}
+			}
+		}
+
 		// One guarded retry when MCP task tools are available but the model
 		// returns text-only instead of tool calls.
-		retryEligible := err == nil && resp != nil && len(resp.ToolCalls) == 0 && shouldRetryTaskMCP(chatReq)
+		retryEligible := req.TeamWorkDirective == nil && err == nil && resp != nil && len(resp.ToolCalls) == 0 && shouldRetryTaskMCP(chatReq)
 		slog.Info("debug.llm.retry_guard", "retry_eligible", retryEligible)
 		if retryEligible {
 			retryReq := chatReq
@@ -517,6 +636,17 @@ func (l *Loop) makeCallLLM(req *RunRequest, emitRun func(AgentEvent)) func(ctx c
 			}
 		}
 		l.emitLLMSpanEnd(ctx, spanID, start, resp, err, opts...)
+		if err == nil && resp != nil && resp.Usage != nil {
+			effModel, effProvider := l.resolveSpan(opts)
+			state.AppendCall(providers.CallUsage{
+				Type:     "llm_call",
+				Name:     fmt.Sprintf("%s/%s #%d", effProvider, effModel, state.Iteration+1),
+				Provider: effProvider,
+				Model:    effModel,
+				Usage:    *resp.Usage,
+				CostUSD:  l.calculateLLMCost(ctx, effProvider, effModel, resp.Usage),
+			})
+		}
 		return resp, err
 	}
 }
@@ -524,6 +654,9 @@ func (l *Loop) makeCallLLM(req *RunRequest, emitRun func(AgentEvent)) func(ctx c
 func shouldRetryTaskMCP(chatReq providers.ChatRequest) bool {
 	hasTaskMCPTool := false
 	for _, td := range chatReq.Tools {
+		if td.Function == nil {
+			continue
+		}
 		name := strings.TrimSpace(td.Function.Name)
 		if strings.HasPrefix(name, "mcp_bx24__") && (strings.Contains(name, "search") || strings.Contains(name, "execute")) {
 			hasTaskMCPTool = true
@@ -559,13 +692,6 @@ func (l *Loop) makeCompactMessages(req *RunRequest) func(ctx context.Context, ms
 		compacted := l.compactMessagesInPlace(ctx, msgs)
 		if compacted == nil {
 			return msgs, nil // compaction failed, return original
-		}
-		// The compacted slice replaces run history and is persisted verbatim —
-		// repair tool_use/tool_result pairing now so an orphaned role:"tool"
-		// message never reaches the provider (OpenAI rejects it with a 400).
-		compacted, repaired := sanitizeHistory(compacted)
-		if repaired > 0 {
-			slog.Warn("post_compaction_sanitize", "agent", l.id, "repaired", repaired)
 		}
 		// Stamp session metadata with the compaction timestamp so operators
 		// can diagnose compaction cadence without a dedicated column. Stored
@@ -620,24 +746,38 @@ func (l *Loop) makeFlushMessages(req *RunRequest) func(ctx context.Context, sess
 	return func(ctx context.Context, sessionKey string, msgs []providers.Message) error {
 		if !userMsgFlushed && !req.HideInput && req.Message != "" {
 			userMsgFlushed = true
-			l.sessions.AddMessage(ctx, sessionKey, providers.Message{
+			inputMessage := providers.Message{
 				Role:    "user",
 				Content: req.Message,
-			})
+			}
+			if req.hasEnrichedInputMessage {
+				inputMessage = req.enrichedInputMessage
+			}
+			l.sessions.AddMessage(ctx, sessionKey, redactDelegationMessage(req, inputMessage))
 		}
 		for _, msg := range msgs {
-			l.sessions.AddMessage(ctx, sessionKey, msg)
+			l.sessions.AddMessage(ctx, sessionKey, redactDelegationMessage(req, msg))
 		}
 		return nil
 	}
 }
 
-func (l *Loop) makeUpdateMetadata(req *RunRequest) func(ctx context.Context, sessionKey string, usage providers.Usage) error {
-	return func(ctx context.Context, sessionKey string, usage providers.Usage) error {
+func (l *Loop) makeUpdateMetadata(req *RunRequest) func(ctx context.Context, sessionKey string, usage, lastUsage providers.Usage, msgCount int) error {
+	return func(ctx context.Context, sessionKey string, usage, lastUsage providers.Usage, msgCount int) error {
 		l.sessions.UpdateMetadata(ctx, sessionKey, l.model, l.provider.Name(), req.Channel)
 		l.sessions.AccumulateTokens(ctx, sessionKey, int64(usage.PromptTokens), int64(usage.CompletionTokens))
 		// Persist session to DB (matching v2 finalizeRun behavior).
 		// FlushMessages already ran, so all pending messages are in the cache.
+		// Calibration uses the FINAL iteration's context size, NOT the
+		// run-cumulative total — the total sums every think→act→observe
+		// iteration and inflated the sessions "context used" display and
+		// compaction decisions by the iteration count.
+		// Current context = final prompt (incl. cached segments) + final output:
+		// the last reply joins history, so it occupies the next request's prompt.
+		// This matches msgCount, which already counts the flushed reply.
+		if lastCtx := lastUsage.ContextTokens(); lastCtx > 0 {
+			l.sessions.SetLastPromptTokens(ctx, sessionKey, lastCtx+lastUsage.CompletionTokens, msgCount)
+		}
 		l.sessions.Save(ctx, sessionKey)
 		return nil
 	}
@@ -668,13 +808,25 @@ func (l *Loop) makeBootstrapCleanup() func(ctx context.Context, state *pipeline.
 }
 
 func (l *Loop) reserveLLMUsage(ctx context.Context, req *RunRequest, state *pipeline.RunState, chatReq providers.ChatRequest, attempt string) (*usagecaps.Reservation, error) {
-	if l.usageCaps == nil || state.Provider == nil {
-		return nil, nil
+	providerName := ""
+	if state.Provider != nil {
+		providerName = state.Provider.Name()
 	}
-	return l.reserveLLMUsageFor(ctx, req, state.Iteration, chatReq, attempt, state.Provider.Name(), state.Model)
+	// reserveLLMUsageFor runs the mandatory hard-ceiling guard before any
+	// reservation or transport, so the non-fallback path is guarded here even
+	// when usage caps are disabled (Lite runtime).
+	return l.reserveLLMUsageFor(ctx, req, state.Iteration, chatReq, attempt, providerName, state.Model)
 }
 
 func (l *Loop) reserveLLMUsageFor(ctx context.Context, req *RunRequest, iteration int, chatReq providers.ChatRequest, attempt, providerName, model string) (*usagecaps.Reservation, error) {
+	// Mandatory final hard-ceiling guard for the concrete request that is about
+	// to be sent, after all directive/retry/reasoning mutations. This is the
+	// shared pre-transport chokepoint for BOTH the fallback candidate path and
+	// the non-fallback path (via reserveLLMUsage), and for every retry attempt.
+	// It runs regardless of usage-cap configuration so the ceiling holds on Lite.
+	if guardErr := l.guardCompleteModelRequest(chatReq, providerName, model, attempt); guardErr != nil {
+		return nil, guardErr
+	}
 	if l.usageCaps == nil {
 		return nil, nil
 	}
@@ -692,4 +844,35 @@ func (l *Loop) reserveLLMUsageFor(ctx context.Context, req *RunRequest, iteratio
 		Messages:        chatReq.Messages,
 		MaxOutputTokens: l.maxOutputTokensFromRequest(chatReq),
 	})
+}
+
+func supportsPromptCacheParams(provider providers.Provider) bool {
+	switch provider.(type) {
+	case *providers.CodexProvider, *providers.ChatGPTOAuthRouter:
+		return true
+	default:
+		return false
+	}
+}
+
+func setDefaultPromptCacheOptions(opts map[string]any, tenantID, agentID uuid.UUID, providerName, sessionKey string) {
+	if opts == nil {
+		return
+	}
+	if _, ok := opts[providers.OptPromptCacheKey]; !ok {
+		opts[providers.OptPromptCacheKey] = defaultPromptCacheKey(tenantID, agentID, providerName, sessionKey)
+	}
+	if _, ok := opts[providers.OptPromptCacheRetention]; !ok {
+		opts[providers.OptPromptCacheRetention] = "24h"
+	}
+}
+
+func defaultPromptCacheKey(tenantID, agentID uuid.UUID, providerName, sessionKey string) string {
+	h := sha256.Sum256([]byte(strings.Join([]string{
+		tenantID.String(),
+		agentID.String(),
+		providerName,
+		sessionKey,
+	}, "\x00")))
+	return "goclaw/" + hex.EncodeToString(h[:16])
 }

@@ -30,6 +30,7 @@ type fakeMCPStore struct {
 	mu sync.Mutex
 
 	serversByName map[string]*store.MCPServerData
+	serversByID   map[uuid.UUID]*store.MCPServerData
 	userCreds     map[string]store.MCPUserCredentials // key = serverID + ":" + userID
 
 	getUserCallCount int
@@ -39,6 +40,7 @@ type fakeMCPStore struct {
 func newFakeMCPStore() *fakeMCPStore {
 	return &fakeMCPStore{
 		serversByName: map[string]*store.MCPServerData{},
+		serversByID:   map[uuid.UUID]*store.MCPServerData{},
 		userCreds:     map[string]store.MCPUserCredentials{},
 	}
 }
@@ -81,8 +83,13 @@ func (f *fakeMCPStore) SetUserCredentials(_ context.Context, serverID uuid.UUID,
 func (f *fakeMCPStore) CreateServer(_ context.Context, _ *store.MCPServerData) error {
 	return nil
 }
-func (f *fakeMCPStore) GetServer(_ context.Context, _ uuid.UUID) (*store.MCPServerData, error) {
-	return nil, nil
+func (f *fakeMCPStore) GetServer(_ context.Context, id uuid.UUID) (*store.MCPServerData, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if s, ok := f.serversByID[id]; ok {
+		return s, nil
+	}
+	return nil, nil // partner's contract: nil + nil when absent
 }
 func (f *fakeMCPStore) ListServers(_ context.Context) ([]store.MCPServerData, error) { return nil, nil }
 func (f *fakeMCPStore) UpdateServer(_ context.Context, _ uuid.UUID, _ map[string]any) error {
@@ -119,6 +126,9 @@ func (f *fakeMCPStore) ReviewRequest(_ context.Context, _ uuid.UUID, _ bool, _, 
 	return nil
 }
 func (f *fakeMCPStore) DeleteUserCredentials(_ context.Context, _ uuid.UUID, _ string) error {
+	return nil
+}
+func (f *fakeMCPStore) CacheToolDescriptions(_ context.Context, _ uuid.UUID, _ map[string]store.CachedToolInfo) error {
 	return nil
 }
 
@@ -203,12 +213,18 @@ func TestProvisionIfMissing_OpenChannelBot_Skipped(t *testing.T) {
 	}
 	bc := ch.(*Channel)
 
-	err = bc.provisionIfMissing(context.Background(), "42", validAuth())
+	// IS_CONNECTOR=Y (external connector customer) → skipped: not a Bitrix user.
+	err = bc.provisionIfMissing(context.Background(), "42", true, validAuth(), "chat123")
 	if !errors.Is(err, ErrProvisionSkippedOpenChannel) {
-		t.Fatalf("err = %v; want ErrProvisionSkippedOpenChannel", err)
+		t.Fatalf("connector message: err = %v; want ErrProvisionSkippedOpenChannel", err)
 	}
 	if mcpStore.getUserCallCount != 0 {
-		t.Errorf("Open Channel bot must not hit MCP store; got %d GetUserCredentials calls", mcpStore.getUserCallCount)
+		t.Errorf("Open Channel connector message must not hit MCP store; got %d GetUserCredentials calls", mcpStore.getUserCallCount)
+	}
+
+	// IS_CONNECTOR=N (internal staff in an Open Channel) → must NOT connector-skip.
+	if err := bc.provisionIfMissing(context.Background(), "42", false, validAuth(), "chat123"); errors.Is(err, ErrProvisionSkippedOpenChannel) {
+		t.Fatalf("internal staff (IS_CONNECTOR=N) must not be connector-skipped; got %v", err)
 	}
 }
 
@@ -230,7 +246,7 @@ func TestProvisionIfMissing_Disabled(t *testing.T) {
 	}
 	bc := ch.(*Channel)
 
-	err = bc.provisionIfMissing(context.Background(), "42", validAuth())
+	err = bc.provisionIfMissing(context.Background(), "42", false, validAuth(), "chat123")
 	if !errors.Is(err, ErrProvisionDisabled) {
 		t.Fatalf("err = %v; want ErrProvisionDisabled", err)
 	}
@@ -264,7 +280,7 @@ func TestProvisionIfMissing_ExistingCreds_NoHTTP(t *testing.T) {
 		},
 	}
 
-	if err := bc.provisionIfMissing(context.Background(), "42", validAuth()); err != nil {
+	if err := bc.provisionIfMissing(context.Background(), "42", false, validAuth(), "chat123"); err != nil {
 		t.Fatalf("err = %v; want nil", err)
 	}
 	if httpCalls != 0 {
@@ -302,7 +318,7 @@ func TestProvisionIfMissing_NearExpiry_RefreshHTTP(t *testing.T) {
 		},
 	}
 
-	if err := bc.provisionIfMissing(context.Background(), "42", validAuth()); err != nil {
+	if err := bc.provisionIfMissing(context.Background(), "42", false, validAuth(), "chat123"); err != nil {
 		t.Fatalf("err = %v; want nil", err)
 	}
 	if httpCalls != 1 {
@@ -335,7 +351,7 @@ func TestProvisionIfMissing_LegacyNoExpiry_RefreshHTTP(t *testing.T) {
 		APIKey: "legacy-key",
 	}
 
-	if err := bc.provisionIfMissing(context.Background(), "42", validAuth()); err != nil {
+	if err := bc.provisionIfMissing(context.Background(), "42", false, validAuth(), "chat123"); err != nil {
 		t.Fatalf("err = %v; want nil", err)
 	}
 	if httpCalls != 1 {
@@ -369,7 +385,7 @@ func TestProvisionIfMissing_WarmExpiry_NoHTTP(t *testing.T) {
 		},
 	}
 
-	if err := bc.provisionIfMissing(context.Background(), "42", validAuth()); err != nil {
+	if err := bc.provisionIfMissing(context.Background(), "42", false, validAuth(), "chat123"); err != nil {
 		t.Fatalf("err = %v; want nil", err)
 	}
 	if httpCalls != 0 {
@@ -393,7 +409,7 @@ func TestProvisionIfMissing_MintAndPersist(t *testing.T) {
 	bc := newProvisionerTestChannel(t, mcpStore, srv.URL, "B")
 
 	before := time.Now()
-	err := bc.provisionIfMissing(context.Background(), "42", validAuth())
+	err := bc.provisionIfMissing(context.Background(), "42", false, validAuth(), "chat123")
 	if err != nil {
 		t.Fatalf("provisionIfMissing: %v", err)
 	}
@@ -451,7 +467,7 @@ func TestProvisionIfMissing_Debounce(t *testing.T) {
 	bc := newProvisionerTestChannel(t, mcpStore, srv.URL, "B")
 
 	// First attempt succeeds and marks the debounce.
-	if err := bc.provisionIfMissing(context.Background(), "42", validAuth()); err != nil {
+	if err := bc.provisionIfMissing(context.Background(), "42", false, validAuth(), "chat123"); err != nil {
 		t.Fatalf("first attempt: %v", err)
 	}
 	if httpCalls != 1 {
@@ -466,7 +482,7 @@ func TestProvisionIfMissing_Debounce(t *testing.T) {
 	delete(mcpStore.userCreds, credKey(bc.mcpServerID, "42"))
 	mcpStore.mu.Unlock()
 
-	err := bc.provisionIfMissing(context.Background(), "42", validAuth())
+	err := bc.provisionIfMissing(context.Background(), "42", false, validAuth(), "chat123")
 	if !errors.Is(err, ErrProvisionDebounced) {
 		t.Fatalf("second attempt: %v; want ErrProvisionDebounced", err)
 	}
@@ -489,7 +505,7 @@ func TestProvisionIfMissing_HTTPFailure_Surfaces(t *testing.T) {
 	mcpStore := newFakeMCPStore()
 	bc := newProvisionerTestChannel(t, mcpStore, srv.URL, "B")
 
-	err := bc.provisionIfMissing(context.Background(), "42", validAuth())
+	err := bc.provisionIfMissing(context.Background(), "42", false, validAuth(), "chat123")
 	if err == nil {
 		t.Fatal("401 from MCP must produce an error")
 	}
@@ -534,7 +550,7 @@ func TestProvisionIfMissing_MissingAuthBlock(t *testing.T) {
 			before := httpCalls
 			// Use a fresh userID per subcase so the debounce from a prior
 			// case doesn't mask a regression.
-			err := bc.provisionIfMissing(context.Background(), tc.name, tc.auth)
+			err := bc.provisionIfMissing(context.Background(), tc.name, false, tc.auth, "chat123")
 			if err == nil {
 				t.Fatalf("missing %s should fail", tc.name)
 			}
@@ -542,6 +558,136 @@ func TestProvisionIfMissing_MissingAuthBlock(t *testing.T) {
 				t.Errorf("incomplete auth must not hit HTTP; got +%d calls", httpCalls-before)
 			}
 		})
+	}
+}
+
+// attachTestPortal wires a real *Portal (OAuth calls routed to oauthSrv) onto
+// an already-built provisioner test channel, plus a derivable encKey — needed
+// for the ErrUserAuthRequired branch tests below, which call
+// Channel.BuildUserAuthorizeURL (requires portal.PublicURL() + a valid key).
+func attachTestPortal(t *testing.T, bc *Channel, oauthSrv *httptest.Server) {
+	t.Helper()
+	bc.encKey = testOAuthEncKey
+	portalFS := newFakeStore()
+	portal := newTestPortal(t, oauthSrv, portalFS, bc.TenantID(), "p",
+		store.BitrixPortalState{PublicURL: "https://goclaw.example.com"})
+	bc.startMu.Lock()
+	bc.portal = portal
+	bc.startMu.Unlock()
+}
+
+// TestProvisionIfMissing_NewUser_ReturnsAuthRequired covers the brand-new-user
+// branch (existing == nil, no auth in the event): must return
+// *ErrUserAuthRequired with a non-empty URL, WITHOUT calling the MCP server
+// or attempting a Bitrix token refresh (there's nothing to refresh).
+func TestProvisionIfMissing_NewUser_ReturnsAuthRequired(t *testing.T) {
+	mcpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("brand-new user with no auth in event must not hit MCP auto-onboard")
+	}))
+	defer mcpSrv.Close()
+	oauthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("brand-new user must not attempt a Bitrix token refresh either")
+	}))
+	defer oauthSrv.Close()
+
+	mcpStore := newFakeMCPStore()
+	bc := newProvisionerTestChannel(t, mcpStore, mcpSrv.URL, "B")
+	attachTestPortal(t, bc, oauthSrv)
+
+	err := bc.provisionIfMissing(context.Background(), "999", false, EventAuth{}, "chat123")
+	var authErr *ErrUserAuthRequired
+	if !errors.As(err, &authErr) {
+		t.Fatalf("err = %v, want *ErrUserAuthRequired", err)
+	}
+	if authErr.URL == "" {
+		t.Error("ErrUserAuthRequired.URL must not be empty")
+	}
+}
+
+// TestProvisionIfMissing_DeadRefreshToken_ReturnsAuthRequired_RowUntouched
+// covers the "existing user, refresh_token is dead" branch: Bitrix rejects
+// the refresh with invalid_grant → must escalate to *ErrUserAuthRequired
+// WITHOUT deleting the existing mcp_user_credentials row (design.md §12 —
+// SetUserCredentials upserts in place once the user re-authorizes; deleting
+// first would be unnecessary churn).
+func TestProvisionIfMissing_DeadRefreshToken_ReturnsAuthRequired_RowUntouched(t *testing.T) {
+	mcpSrv := httptest.NewServer(mcpAutoOnboardHandler())
+	defer mcpSrv.Close()
+	oauthSrv := httptest.NewServer(oauthTokenHandler(0, true)) // invalid_grant
+	defer oauthSrv.Close()
+
+	mcpStore := newFakeMCPStore()
+	bc := newProvisionerTestChannel(t, mcpStore, mcpSrv.URL, "B")
+	attachTestPortal(t, bc, oauthSrv)
+
+	staleCreds := store.MCPUserCredentials{
+		APIKey: "old-key",
+		Env: map[string]string{
+			"BITRIX_DOMAIN":        "portal.bitrix24.com",
+			"BITRIX_ACCESS_TOKEN":  "old-access",
+			"BITRIX_REFRESH_TOKEN": "dead-refresh",
+			"BITRIX_EXPIRES_AT":    time.Now().Add(-time.Hour).UTC().Format(time.RFC3339),
+		},
+	}
+	mcpStore.mu.Lock()
+	mcpStore.userCreds[credKey(bc.mcpServerID, "1058")] = staleCreds
+	mcpStore.mu.Unlock()
+
+	err := bc.provisionIfMissing(context.Background(), "1058", false, EventAuth{}, "chat123")
+	var authErr *ErrUserAuthRequired
+	if !errors.As(err, &authErr) {
+		t.Fatalf("err = %v, want *ErrUserAuthRequired", err)
+	}
+
+	mcpStore.mu.Lock()
+	got, ok := mcpStore.userCreds[credKey(bc.mcpServerID, "1058")]
+	mcpStore.mu.Unlock()
+	if !ok {
+		t.Fatal("existing row must NOT be deleted on dead-token classification")
+	}
+	if got.APIKey != "old-key" {
+		t.Errorf("row was modified; APIKey = %q, want unchanged %q", got.APIKey, "old-key")
+	}
+}
+
+// TestProvisionIfMissing_TransientRefreshError_NotAuthRequired ensures a
+// non-classified refresh failure (network/5xx — here a bare 500 with no
+// Bitrix `error` field, so APIError.Code == "") does NOT escalate to
+// *ErrUserAuthRequired — it must fall through to the existing generic error
+// path (handle.go's notifyUserOfMCPIssueOnce), since a retry might just work
+// without bothering the user for re-authorization.
+func TestProvisionIfMissing_TransientRefreshError_NotAuthRequired(t *testing.T) {
+	mcpSrv := httptest.NewServer(mcpAutoOnboardHandler())
+	defer mcpSrv.Close()
+	oauthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer oauthSrv.Close()
+
+	mcpStore := newFakeMCPStore()
+	bc := newProvisionerTestChannel(t, mcpStore, mcpSrv.URL, "B")
+	attachTestPortal(t, bc, oauthSrv)
+
+	staleCreds := store.MCPUserCredentials{
+		Env: map[string]string{
+			"BITRIX_DOMAIN":        "portal.bitrix24.com",
+			"BITRIX_ACCESS_TOKEN":  "old-access",
+			"BITRIX_REFRESH_TOKEN": "still-alive-refresh",
+			"BITRIX_EXPIRES_AT":    time.Now().Add(-time.Hour).UTC().Format(time.RFC3339),
+		},
+	}
+	mcpStore.mu.Lock()
+	mcpStore.userCreds[credKey(bc.mcpServerID, "42")] = staleCreds
+	mcpStore.mu.Unlock()
+
+	err := bc.provisionIfMissing(context.Background(), "42", false, EventAuth{}, "chat123")
+	var authErr *ErrUserAuthRequired
+	if errors.As(err, &authErr) {
+		t.Fatalf("transient 5xx must NOT escalate to ErrUserAuthRequired, got %v", err)
+	}
+	if err == nil {
+		t.Fatal("expected a transient error, got nil")
 	}
 }
 
@@ -558,7 +704,7 @@ func TestProvisionIfMissing_MissingAuthBlock(t *testing.T) {
 // Each case should leave mcpClient nil + mcpServerID zero, so
 // provisionIfMissing returns ErrProvisionDisabled.
 //
-// Path B auth note: there is no longer an admin-token branch to test —
+// Auto-onboard auth note: there is no longer an admin-token branch to test —
 // the MCP server authenticates each /api/auto-onboard call via the
 // caller-supplied Bitrix access_token, not a shared bearer.
 func TestInitMCPProvisioner_DisabledModes(t *testing.T) {
@@ -598,6 +744,141 @@ func TestInitMCPProvisioner_DisabledModes(t *testing.T) {
 			t.Errorf("missing server row should leave provisioner off")
 		}
 	})
+
+	// mcp_server_id path (v3.15+ dashboard wiring): the UUID string must
+	// parse and resolve to a live mcp_servers row. Broken UUID or missing
+	// row silently disables provisioning — no fallback to legacy name.
+	t.Run("mcp_server_id_invalid_uuid", func(t *testing.T) {
+		fs := newFakeStore()
+		resetWebhookRouterForTest()
+		defer resetWebhookRouterForTest()
+
+		mcpStore := newFakeMCPStore()
+
+		fn := FactoryWithPortalStoreAndMCP(fs, mcpStore, "")
+		ch, _ := fn("b1", nil, json.RawMessage(`{"portal":"p","bot_code":"c","bot_name":"n","mcp_server_id":"not-a-uuid"}`),
+			bus.New(), nil)
+		bc := ch.(*Channel)
+		if err := bc.initMCPProvisioner(context.Background()); err != nil {
+			t.Fatalf("init: %v", err)
+		}
+		if bc.mcpClient != nil || bc.mcpServerID != uuid.Nil {
+			t.Errorf("invalid mcp_server_id UUID should leave provisioner off")
+		}
+	})
+
+	t.Run("mcp_server_id_row_not_found", func(t *testing.T) {
+		fs := newFakeStore()
+		resetWebhookRouterForTest()
+		defer resetWebhookRouterForTest()
+
+		mcpStore := newFakeMCPStore()
+		// Intentionally do NOT seed serversByID — GetServer returns nil.
+
+		fn := FactoryWithPortalStoreAndMCP(fs, mcpStore, "")
+		ch, _ := fn("b1", nil, json.RawMessage(`{"portal":"p","bot_code":"c","bot_name":"n","mcp_server_id":"00000000-0000-0000-0000-000000000042"}`),
+			bus.New(), nil)
+		bc := ch.(*Channel)
+		if err := bc.initMCPProvisioner(context.Background()); err != nil {
+			t.Fatalf("init: %v", err)
+		}
+		if bc.mcpClient != nil || bc.mcpServerID != uuid.Nil {
+			t.Errorf("missing mcp_servers row for mcp_server_id should leave provisioner off")
+		}
+	})
+}
+
+// TestDeriveAutoOnboardBaseURL guards the fix for the Phase 2 regression
+// where mcp_servers.url (JSON-RPC endpoint under /mcp) was passed verbatim
+// to mcp_client.newMCPClient — which appends "/api/auto-onboard" to it,
+// producing "…/mcp/api/auto-onboard" (404). The origin extraction is the
+// contract the Bitrix24 auto-onboard client expects.
+func TestDeriveAutoOnboardBaseURL(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"jsonrpc subpath", "https://mcp.example.com/mcp", "https://mcp.example.com"},
+		{"jsonrpc trailing slash", "https://mcp.example.com/mcp/", "https://mcp.example.com"},
+		{"origin trailing slash", "https://mcp.example.com/", "https://mcp.example.com"},
+		{"origin only", "https://mcp.example.com", "https://mcp.example.com"},
+		{"deep path with query", "http://localhost:8080/some/path?x=1#frag", "http://localhost:8080"},
+		{"prod b24 syn mcp", "https://b24-mcp-dev.synity.so/mcp", "https://b24-mcp-dev.synity.so"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := deriveAutoOnboardBaseURL(tc.in)
+			if err != nil {
+				t.Fatalf("deriveAutoOnboardBaseURL(%q) unexpected error: %v", tc.in, err)
+			}
+			if got != tc.want {
+				t.Errorf("deriveAutoOnboardBaseURL(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+
+	errCases := []struct {
+		name string
+		in   string
+	}{
+		{"empty", ""},
+		{"whitespace only", "   \t"},
+		{"no scheme", "mcp.example.com/mcp"},
+		{"no host", "https:///path"},
+	}
+	for _, tc := range errCases {
+		t.Run("err_"+tc.name, func(t *testing.T) {
+			if _, err := deriveAutoOnboardBaseURL(tc.in); err == nil {
+				t.Errorf("deriveAutoOnboardBaseURL(%q) expected error, got nil", tc.in)
+			}
+		})
+	}
+}
+
+// TestInitMCPProvisioner_MCPServerID exercises the v3.15+ id-based wiring:
+// mcp_server_id resolves to a live mcp_servers row whose URL becomes the
+// base URL for /api/auto-onboard. Legacy MCPServerName + MCPBaseURL are
+// ignored on this path (single source of truth).
+func TestInitMCPProvisioner_MCPServerID(t *testing.T) {
+	fs := newFakeStore()
+	resetWebhookRouterForTest()
+	defer resetWebhookRouterForTest()
+
+	mcpStore := newFakeMCPStore()
+	serverID := uuid.MustParse("019df803-ec13-76c3-b1f5-60b0e80d3eec")
+	// URL carries a /mcp subpath because that's how partner MCP servers
+	// really configure the JSON-RPC endpoint. initMCPProvisioner must
+	// strip it before handing the value to mcp_client (which appends
+	// /api/auto-onboard). Regression guard for the Phase 2 fix.
+	mcpStore.serversByID[serverID] = &store.MCPServerData{
+		BaseModel: store.BaseModel{ID: serverID},
+		Name:      "b24-syn-mcp",
+		URL:       "https://b24-mcp.example.test/mcp",
+		Enabled:   true,
+		// Field promoted from settings JSONB in Phase 89 — the provisioner
+		// reads it to log accurately and downstream provisionIfMissing
+		// respects it via manager-level checks.
+		RequireUserCredentials: true,
+	}
+
+	fn := FactoryWithPortalStoreAndMCP(fs, mcpStore, "")
+	cfg := `{"portal":"p","bot_code":"c","bot_name":"n","mcp_server_id":"019df803-ec13-76c3-b1f5-60b0e80d3eec"}`
+	ch, err := fn("b1", nil, json.RawMessage(cfg), bus.New(), nil)
+	if err != nil {
+		t.Fatalf("factory: %v", err)
+	}
+	bc := ch.(*Channel)
+	if err := bc.initMCPProvisioner(context.Background()); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	if bc.mcpClient == nil {
+		t.Fatalf("mcp_server_id path should wire mcpClient — got nil")
+	}
+	if bc.mcpServerID != serverID {
+		t.Errorf("mcpServerID = %s, want %s", bc.mcpServerID, serverID)
+	}
 }
 
 // newBareChannelForNotifyTest builds a Channel that's wired enough for

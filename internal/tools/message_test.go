@@ -56,9 +56,9 @@ func TestResolveMediaPath(t *testing.T) {
 			want   string
 			wantOK bool
 		}{
-			// /tmp/ always allowed
-			{"valid temp file", "MEDIA:" + filepath.Join(tmpDir, "test.png"), filepath.Join(tmpDir, "test.png"), true},
-			{"valid nested temp", "MEDIA:" + filepath.Join(tmpDir, "sub", "file.txt"), filepath.Join(tmpDir, "sub", "file.txt"), true},
+			// Unscoped temp files are not tenant/run-owned.
+			{"unscoped temp file", "MEDIA:" + filepath.Join(tmpDir, "test.png"), "", false},
+			{"unscoped nested temp", "MEDIA:" + filepath.Join(tmpDir, "sub", "file.txt"), "", false},
 
 			// Workspace files allowed
 			{"workspace absolute", "MEDIA:" + testFileCanonical, testFileCanonical, true},
@@ -104,8 +104,8 @@ func TestResolveMediaPath(t *testing.T) {
 			{"absolute outside workspace", "MEDIA:" + outsidePath(workspaceCanonical, "etc/hostname"), false},
 			// Workspace-relative → allowed
 			{"workspace relative", "MEDIA:docs/report.pdf", true},
-			// /tmp/ → allowed (temp dir exception in restricted mode)
-			{"temp file", "MEDIA:" + filepath.Join(tmpDir, "test.png"), true},
+			// /tmp/ is not an implicit cross-tenant read root.
+			{"temp file", "MEDIA:" + filepath.Join(tmpDir, "test.png"), false},
 		}
 
 		for _, tt := range tests {
@@ -131,6 +131,29 @@ func TestResolveMediaPath(t *testing.T) {
 			t.Errorf("got %q, want %q", got, testFileCanonical)
 		}
 	})
+
+}
+
+func TestMessageMediaRejectsNonRegularFiles(t *testing.T) {
+	workspace := t.TempDir()
+	tool := NewMessageTool(workspace, true)
+	tool.SetMessageBus(bus.New())
+
+	if result := tool.sendMedia(context.Background(), "telegram", "chat-1", workspace); !result.IsError {
+		t.Fatal("sendMedia allowed a directory")
+	}
+
+	original := filepath.Join(workspace, "original.png")
+	if err := os.WriteFile(original, []byte("image"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hardlink := filepath.Join(workspace, "hardlink.png")
+	if err := os.Link(original, hardlink); err != nil {
+		t.Skipf("hardlinks not supported: %v", err)
+	}
+	if result := tool.sendMedia(context.Background(), "telegram", "chat-1", hardlink); !result.IsError {
+		t.Fatal("sendMedia allowed a hardlinked file")
+	}
 }
 
 func TestIsInTempDir(t *testing.T) {
@@ -157,8 +180,6 @@ func TestIsInTempDir(t *testing.T) {
 }
 
 func TestExtractEmbeddedMedia(t *testing.T) {
-	tmpDir := os.TempDir()
-
 	workspace := t.TempDir()
 	workspaceCanonical, _ := filepath.EvalSymlinks(workspace)
 
@@ -215,7 +236,10 @@ func TestExtractEmbeddedMedia(t *testing.T) {
 	})
 
 	t.Run("multiple MEDIA: on same line", func(t *testing.T) {
-		img := filepath.Join(tmpDir, "photo.png")
+		img := filepath.Join(workspaceCanonical, "photo.png")
+		if err := os.WriteFile(img, []byte("image"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 		msg := "MEDIA:" + reportCanonical + " MEDIA:" + img
 		cleaned, media := tool.extractEmbeddedMedia(ctx, msg)
 
@@ -224,6 +248,17 @@ func TestExtractEmbeddedMedia(t *testing.T) {
 		}
 		if len(media) != 2 {
 			t.Fatalf("expected 2 media from same line, got %d", len(media))
+		}
+	})
+
+	t.Run("non-regular MEDIA path is stripped without attachment", func(t *testing.T) {
+		msg := "Directory:\nMEDIA:" + docsDir + "\nDone"
+		cleaned, media := tool.extractEmbeddedMedia(ctx, msg)
+		if cleaned != "Directory:\nDone" {
+			t.Fatalf("unexpected cleaned text: %q", cleaned)
+		}
+		if len(media) != 0 {
+			t.Fatalf("non-regular path produced attachments: %+v", media)
 		}
 	})
 
@@ -252,7 +287,11 @@ func TestExtractEmbeddedMedia(t *testing.T) {
 	})
 
 	t.Run("audio_as_voice tag stripped", func(t *testing.T) {
-		msg := "[[audio_as_voice]]\nMEDIA:" + filepath.Join(tmpDir, "voice.ogg") + "\nExtra text"
+		voice := filepath.Join(workspaceCanonical, "voice.ogg")
+		if err := os.WriteFile(voice, []byte("audio"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		msg := "[[audio_as_voice]]\nMEDIA:" + voice + "\nExtra text"
 		cleaned, media := tool.extractEmbeddedMedia(ctx, msg)
 
 		if cleaned != "Extra text" {
@@ -264,7 +303,10 @@ func TestExtractEmbeddedMedia(t *testing.T) {
 	})
 
 	t.Run("multiple MEDIA: paths", func(t *testing.T) {
-		img := filepath.Join(tmpDir, "photo.png")
+		img := filepath.Join(workspaceCanonical, "photo-2.png")
+		if err := os.WriteFile(img, []byte("image"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 		msg := "Files:\nMEDIA:" + reportCanonical + "\nMEDIA:" + img + "\nEnjoy!"
 		cleaned, media := tool.extractEmbeddedMedia(ctx, msg)
 
@@ -317,8 +359,8 @@ func TestValidateChannelTenant(t *testing.T) {
 
 	// Wire a mock checker.
 	channels := map[string]uuid.UUID{
-		"telegram":       tenantA,
-		"tenant-b-tg":   tenantB,
+		"telegram":    tenantA,
+		"tenant-b-tg": tenantB,
 	}
 	tool.SetChannelTenantChecker(func(name string) (uuid.UUID, bool) {
 		tid, ok := channels[name]
@@ -840,6 +882,49 @@ func TestMessageToolCrossTargetGuard_NoNoticeOnSendFailure(t *testing.T) {
 	}
 }
 
+// A cross-target group forward must tag the outbound message with the origin
+// channel/chat (in addition to group_id) so dispatchOutbound can notify the
+// origin chat if the downstream send actually fails — otherwise a bad target
+// (e.g. a display name instead of a real chat ID) fails silently.
+func TestMessageToolForward_TagsOriginMetadataOnGroupSend(t *testing.T) {
+	tool := NewMessageTool(t.TempDir(), false)
+	mb := bus.New()
+	tool.SetMessageBus(mb)
+
+	ctx := context.Background()
+	ctx = WithToolSessionKey(ctx, "agent:a:zalo:group:747300108647389888")
+	ctx = WithToolChannel(ctx, "bunny-zalo-personal")
+	ctx = WithToolChatID(ctx, "747300108647389888")
+	ctx = WithToolPeerKind(ctx, "group")
+
+	res := tool.Execute(ctx, map[string]any{
+		"action": "send", "channel": "bunny-zalo-personal", "target": "Ban Điều Hành",
+		"forward": true, "forward_reason": "forward to Ban Điều Hành",
+		"message": "Anh Tài ơi, xem giúp comment khách hàng nhé.",
+	})
+	if res != nil && res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+
+	got := drainBusNow(mb)
+	if len(got) == 0 {
+		t.Fatal("expected at least one outbound message")
+	}
+	forwardMsg := got[0]
+	if forwardMsg.ChatID != "Ban Điều Hành" {
+		t.Fatalf("forward target = %q, want %q", forwardMsg.ChatID, "Ban Điều Hành")
+	}
+	if forwardMsg.Metadata[bus.MetaForwardOriginChannel] != "bunny-zalo-personal" {
+		t.Errorf("MetaForwardOriginChannel = %q, want %q", forwardMsg.Metadata[bus.MetaForwardOriginChannel], "bunny-zalo-personal")
+	}
+	if forwardMsg.Metadata[bus.MetaForwardOriginChatID] != "747300108647389888" {
+		t.Errorf("MetaForwardOriginChatID = %q, want %q", forwardMsg.Metadata[bus.MetaForwardOriginChatID], "747300108647389888")
+	}
+	if forwardMsg.Metadata["group_id"] != "Ban Điều Hành" {
+		t.Errorf("group_id metadata = %q, want %q (must survive alongside forward tracking)", forwardMsg.Metadata["group_id"], "Ban Điều Hành")
+	}
+}
+
 func TestMessageTargetEnforced(t *testing.T) {
 	cases := []struct {
 		key  string
@@ -860,5 +945,145 @@ func TestMessageTargetEnforced(t *testing.T) {
 		if got := MessageTargetEnforced(tc.key); got != tc.want {
 			t.Errorf("MessageTargetEnforced(%q) = %v, want %v", tc.key, got, tc.want)
 		}
+	}
+}
+
+func TestMessageToolEditAction(t *testing.T) {
+	var gotChannel, gotChat, gotContent string
+	var gotMsgID int
+	tool := NewMessageTool("", true)
+	tool.SetChannelEditor(func(_ context.Context, ch, chatID string, messageID int, content string) error {
+		gotChannel, gotChat, gotMsgID, gotContent = ch, chatID, messageID, content
+		return nil
+	})
+	r := tool.Execute(context.Background(), map[string]any{
+		"action":     "edit",
+		"channel":    "telegram",
+		"target":     float64(-1003995384344),
+		"message_id": float64(42),
+		"message":    "Status\nItem: ✅\nAlice: ✅",
+	})
+	if r.IsError {
+		t.Fatalf("unexpected error: %s", r.ForLLM)
+	}
+	if gotChannel != "telegram" || gotChat != "-1003995384344" || gotMsgID != 42 {
+		t.Errorf("editor got channel=%q chat=%q msgID=%d, want telegram/-1003995384344/42", gotChannel, gotChat, gotMsgID)
+	}
+	if gotContent == "" || !strings.Contains(gotContent, "Alice: ✅") {
+		t.Errorf("editor content = %q, want new status text", gotContent)
+	}
+}
+
+func TestMessageToolEditRequiresMessageID(t *testing.T) {
+	tool := NewMessageTool("", true)
+	tool.SetChannelEditor(func(_ context.Context, _, _ string, _ int, _ string) error { return nil })
+	r := tool.Execute(context.Background(), map[string]any{
+		"action":  "edit",
+		"channel": "telegram",
+		"target":  "123",
+		"message": "x",
+	})
+	if !r.IsError {
+		t.Error("edit without message_id must error")
+	}
+}
+
+func TestMessageToolEditPrefersContextChannel(t *testing.T) {
+	var gotChannel, gotChat string
+	tool := NewMessageTool("", true)
+	tool.SetChannelEditor(func(_ context.Context, ch, chatID string, _ int, _ string) error {
+		gotChannel, gotChat = ch, chatID
+		return nil
+	})
+	// Context has the real channel instance + chat; LLM wrongly passes platform name + null target.
+	ctx := WithToolChatID(WithToolChannel(context.Background(), "mychan"), "-1003995384344")
+	r := tool.Execute(ctx, map[string]any{
+		"action":     "edit",
+		"channel":    "telegram", // wrong — must be ignored in favor of ctx
+		"target":     nil,
+		"message_id": float64(42),
+		"message":    "Status\nAlice: ✅\nItem: ✅",
+	})
+	if r.IsError {
+		t.Fatalf("unexpected error: %s", r.ForLLM)
+	}
+	if gotChannel != "mychan" || gotChat != "-1003995384344" {
+		t.Errorf("editor got channel=%q chat=%q, want mychan/-1003995384344 (context wins)", gotChannel, gotChat)
+	}
+}
+
+func TestMessageToolTopicSend(t *testing.T) {
+	var gotChannel, gotChat, gotTopic string
+	tool := NewMessageTool("", true)
+	tool.SetTopicResolver(func(_ context.Context, ch, chatID, name string) (string, bool) {
+		gotChannel, gotChat, gotTopic = ch, chatID, name
+		if name == "Announcements" {
+			return "77", true
+		}
+		return "", false
+	})
+	mb := bus.New()
+	tool.SetMessageBus(mb)
+
+	ctx := WithToolChatID(WithToolChannel(context.Background(), "mychan"), "-100500")
+	r := tool.Execute(ctx, map[string]any{
+		"action":  "send",
+		"topic":   "Announcements",
+		"message": "invoice marked paid, but Alice has not transferred yet",
+	})
+	if r.IsError {
+		t.Fatalf("unexpected error: %s", r.ForLLM)
+	}
+	if gotChannel != "mychan" || gotChat != "-100500" || gotTopic != "Announcements" {
+		t.Errorf("resolver got %q/%q/%q, want mychan/-100500/Announcements", gotChannel, gotChat, gotTopic)
+	}
+	out, ok := mb.SubscribeOutbound(ctx)
+	if !ok {
+		t.Fatal("expected an outbound message")
+	}
+	if out.Metadata["message_thread_id"] != "77" {
+		t.Errorf("outbound thread id = %q, want 77", out.Metadata["message_thread_id"])
+	}
+}
+
+func TestMessageToolTopicNotFound(t *testing.T) {
+	tool := NewMessageTool("", true)
+	tool.SetTopicResolver(func(_ context.Context, _, _, _ string) (string, bool) { return "", false })
+	tool.SetMessageBus(bus.New())
+	ctx := WithToolChatID(WithToolChannel(context.Background(), "mychan"), "-100500")
+	r := tool.Execute(ctx, map[string]any{"action": "send", "topic": "Nonexistent", "message": "x"})
+	if !r.IsError {
+		t.Error("unknown topic must return an error")
+	}
+}
+
+func TestMessageToolTopicSendReturnsMessageID(t *testing.T) {
+	var gotThread int
+	tool := NewMessageTool("", true)
+	tool.SetTopicResolver(func(_ context.Context, _, _, name string) (string, bool) {
+		if name == "Announcements" {
+			return "77", true
+		}
+		return "", false
+	})
+	// Synchronous poster returns the sent message id.
+	tool.SetTopicPoster(func(_ context.Context, ch, chatID string, threadID int, content string) (int, error) {
+		gotThread = threadID
+		return 4242, nil
+	})
+	ctx := WithToolChatID(WithToolChannel(context.Background(), "mychan"), "-100500")
+	r := tool.Execute(ctx, map[string]any{
+		"action":  "send",
+		"topic":   "Announcements",
+		"message": "Terminator 2 — not watched",
+	})
+	if r.IsError {
+		t.Fatalf("unexpected error: %s", r.ForLLM)
+	}
+	if gotThread != 77 {
+		t.Errorf("poster got thread %d, want 77", gotThread)
+	}
+	if !strings.Contains(r.ForLLM, `"message_id":4242`) {
+		t.Errorf("result must include the sent message_id, got: %s", r.ForLLM)
 	}
 }

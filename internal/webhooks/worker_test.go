@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/nextlevelbuilder/goclaw/internal/crypto"
+	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/security"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
@@ -28,6 +30,8 @@ type stubCallStore struct {
 	claimErr    error          // if non-nil, returned by ClaimNext
 	reclaimN    int64          // count returned by ReclaimStale
 	casLeaseErr error          // if non-nil, returned by UpdateStatusCAS
+	hbCount     int32          // số lần Heartbeat được gọi (atomic)
+	hbErr       error          // nếu non-nil, Heartbeat trả về lỗi này
 }
 
 func newStubCallStore(initial *store.WebhookCallData) *stubCallStore {
@@ -94,11 +98,18 @@ func (s *stubCallStore) ClaimNext(_ context.Context, _ uuid.UUID, _ time.Time) (
 func (s *stubCallStore) List(_ context.Context, _ store.WebhookCallListFilter) ([]store.WebhookCallData, error) {
 	return nil, nil
 }
+func (s *stubCallStore) Count(_ context.Context, _ store.WebhookCallListFilter) (int, error) {
+	return 0, nil
+}
 func (s *stubCallStore) DeleteOlderThan(_ context.Context, _ uuid.UUID, _ time.Time) (int64, error) {
 	return 0, nil
 }
 func (s *stubCallStore) ReclaimStale(_ context.Context, _ time.Time) (int64, error) {
 	return s.reclaimN, nil
+}
+func (s *stubCallStore) Heartbeat(_ context.Context, _ uuid.UUID, _ string, _ time.Time) error {
+	atomic.AddInt32(&s.hbCount, 1)
+	return s.hbErr
 }
 
 // stubWebhookStore returns a fixed webhook on GetByID.
@@ -118,6 +129,9 @@ func (s *stubWebhookStore) GetByHash(_ context.Context, _ string) (*store.Webhoo
 }
 func (s *stubWebhookStore) List(_ context.Context, _ store.WebhookListFilter) ([]store.WebhookData, error) {
 	return nil, nil
+}
+func (s *stubWebhookStore) Count(_ context.Context, _ store.WebhookListFilter) (int, error) {
+	return 0, nil
 }
 func (s *stubWebhookStore) Update(_ context.Context, _ uuid.UUID, _ map[string]any) error { return nil }
 func (s *stubWebhookStore) RotateSecret(_ context.Context, _ uuid.UUID, _, _, _ string) error {
@@ -167,6 +181,33 @@ func newTestCall(callbackURL string, agentID *uuid.UUID) *store.WebhookCallData 
 	b, _ := json.Marshal(payload)
 	call.RequestPayload = b
 	return call
+}
+
+func TestNewCallbackUsageMapsCacheTokens(t *testing.T) {
+	if got := newCallbackUsage(nil); got != nil {
+		t.Fatalf("nil usage must map to nil, got %+v", got)
+	}
+	u := &providers.Usage{
+		PromptTokens:                      10,
+		CompletionTokens:                  5,
+		TotalTokens:                       15,
+		CacheReadTokens:                   8,
+		CacheCreationTokens:               2,
+		PromptTokensIncludeCachedSegments: true,
+	}
+	got := newCallbackUsage(u)
+	if got == nil {
+		t.Fatal("expected non-nil callbackUsage")
+	}
+	if got.PromptTokens != 10 || got.CompletionTokens != 5 || got.TotalTokens != 15 {
+		t.Errorf("base tokens wrong: %+v", got)
+	}
+	if got.CacheReadTokens != 8 || got.CacheCreationTokens != 2 {
+		t.Errorf("cache tokens not mapped: read=%d create=%d", got.CacheReadTokens, got.CacheCreationTokens)
+	}
+	if !got.PromptTokensIncludeCachedSegments {
+		t.Error("include-cached flag not mapped")
+	}
 }
 
 func TestDecodeAsyncPayload_UnwrapsAuditEnvelope(t *testing.T) {
@@ -284,6 +325,78 @@ func TestHMACHeaderPresent(t *testing.T) {
 	expected := Sign(rawSecret, ts, gotBody)
 	if gotSig != expected {
 		t.Errorf("HMAC mismatch\ngot:  %s\nwant: %s", gotSig, expected)
+	}
+}
+
+// TestExecuteReDeliveryCarriesCallsBreakdown verifies that when a call already has
+// a stored callbackPayload (call.Response set, simulating a re-delivery/retry), the
+// re-sent HTTP callback body carries forward the per-call breakdown (`calls`) and
+// `total_cost_usd` fields from the previously-stored payload.
+func TestExecuteReDeliveryCarriesCallsBreakdown(t *testing.T) {
+	security.SetAllowLoopbackForTest(true)
+	defer security.SetAllowLoopbackForTest(false)
+
+	var gotBody []byte
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	agentID := uuid.New()
+	call := newTestCall(srv.URL, &agentID)
+	// Pre-populate response so agent invocation is skipped and the re-delivery
+	// path (execute's "else if len(call.Response) > 0" branch) is exercised.
+	prevResp, _ := json.Marshal(callbackPayload{
+		Output: "prior output",
+		Status: "done",
+		Calls: []providers.CallUsage{
+			{
+				Type:     "tool_call",
+				Name:     "read_image",
+				Provider: "9router",
+				Model:    "cx/gpt-5.5",
+				Usage:    providers.Usage{PromptTokens: 100, TotalTokens: 100},
+				CostUSD:  0.02,
+			},
+		},
+		TotalCostUSD: 0.02,
+	})
+	call.Response = prevResp
+
+	wh, _ := newTestWebhook(call.WebhookID, testEncKey)
+	callStore := newStubCallStore(call)
+	whStore := &stubWebhookStore{wh: wh}
+
+	w := newTestWorker(callStore, whStore)
+	w.execute(context.Background(), call, call.TenantID, "test-lease")
+
+	if len(gotBody) == 0 {
+		t.Fatal("no callback body captured — request never reached server")
+	}
+
+	var payload callbackPayload
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("unmarshal captured body: %v\nbody: %s", err, gotBody)
+	}
+
+	if len(payload.Calls) != 1 {
+		t.Fatalf("payload.Calls length: got %d, want 1 (body: %s)", len(payload.Calls), gotBody)
+	}
+	if payload.Calls[0].Name != "read_image" {
+		t.Errorf("payload.Calls[0].Name: got %q, want %q", payload.Calls[0].Name, "read_image")
+	}
+	if payload.TotalCostUSD < 0.0199 || payload.TotalCostUSD > 0.0201 {
+		t.Errorf("payload.TotalCostUSD: got %f, want ~0.02", payload.TotalCostUSD)
+	}
+
+	// Belt-and-suspenders: also confirm the raw JSON carries the expected keys.
+	bodyStr := string(gotBody)
+	for _, want := range []string{`"calls"`, `"read_image"`, `"total_cost_usd"`} {
+		if !strings.Contains(bodyStr, want) {
+			t.Errorf("callback body missing %s: %s", want, bodyStr)
+		}
 	}
 }
 
@@ -693,6 +806,70 @@ func TestSign(t *testing.T) {
 	}
 	if len(v1) != 64 {
 		t.Errorf("v1 hex length: got %d, want 64", len(v1))
+	}
+}
+
+// TestHeartbeatLoopRenews verifies the loop calls Heartbeat repeatedly and does NOT
+// cancel the run while the lease stays valid.
+func TestHeartbeatLoopRenews(t *testing.T) {
+	callStore := newStubCallStore(nil)
+	w := newTestWorker(callStore, &stubWebhookStore{})
+
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+	stop := make(chan struct{})
+
+	go w.heartbeatLoop(context.Background(), uuid.New(), "lease-1", 5*time.Millisecond, stop, cancelRun)
+
+	time.Sleep(40 * time.Millisecond)
+	close(stop)
+	time.Sleep(10 * time.Millisecond)
+
+	if atomic.LoadInt32(&callStore.hbCount) < 3 {
+		t.Errorf("expected ≥3 heartbeats, got %d", atomic.LoadInt32(&callStore.hbCount))
+	}
+	if runCtx.Err() != nil {
+		t.Errorf("runCtx must NOT be cancelled while lease valid; err=%v", runCtx.Err())
+	}
+}
+
+func TestBuildCallbackBreakdown(t *testing.T) {
+	calls := []providers.CallUsage{
+		{Type: "llm_call", Provider: "p", Model: "m", Usage: providers.Usage{PromptTokens: 10, TotalTokens: 10}, CostUSD: 0.01},
+		{Type: "tool_call", Name: "read_image", Provider: "9router", Model: "cx/gpt-5.5",
+			Usage: providers.Usage{PromptTokens: 100, TotalTokens: 100}, CostUSD: 0.02},
+	}
+	usage, cost := callbackBreakdown(calls)
+	if usage == nil || usage.PromptTokens != 110 {
+		t.Errorf("usage sum wrong: %+v", usage)
+	}
+	if cost < 0.0299 || cost > 0.0301 {
+		t.Errorf("cost = %f, want ~0.03", cost)
+	}
+	if usage2, _ := callbackBreakdown(nil); usage2 != nil {
+		t.Error("nil calls → nil usage")
+	}
+}
+
+// TestHeartbeatLoopCancelsOnLeaseLost verifies that when Heartbeat returns ErrLeaseExpired,
+// the loop cancels runCtx and returns.
+func TestHeartbeatLoopCancelsOnLeaseLost(t *testing.T) {
+	callStore := newStubCallStore(nil)
+	callStore.hbErr = store.ErrLeaseExpired // mất lease ngay tick đầu
+	w := newTestWorker(callStore, &stubWebhookStore{})
+
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+	stop := make(chan struct{})
+	defer close(stop)
+
+	go w.heartbeatLoop(context.Background(), uuid.New(), "lease-1", 5*time.Millisecond, stop, cancelRun)
+
+	select {
+	case <-runCtx.Done():
+		// đúng — run bị hủy do mất lease
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("runCtx not cancelled after lease lost within 200ms")
 	}
 }
 

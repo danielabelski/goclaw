@@ -123,3 +123,75 @@ func TestBuildStreamJSONInput_NoText(t *testing.T) {
 		t.Errorf("content blocks = %d, want 1 (image only)", len(msg.Message.Content))
 	}
 }
+
+// TestDisallowedCLITools_NoStaleToolNames guards against deny rules that name
+// tools the current Claude CLI no longer registers. A stale name makes the CLI
+// print `Permission deny rule "<name>" matches no known tool` on every
+// invocation (including background episodic summarization), which buries real
+// errors. TodoRead/NotebookRead were removed from the CLI in 2.x; their
+// write-side counterparts must stay blocked.
+func TestDisallowedCLITools_NoStaleToolNames(t *testing.T) {
+	blocked := disallowedCLITools(nil) // nil = fail closed: everything blocked
+
+	got := make(map[string]bool, len(blocked))
+	for _, name := range blocked {
+		got[name] = true
+	}
+
+	for _, stale := range []string{"TodoRead", "NotebookRead"} {
+		if got[stale] {
+			t.Errorf("disallowedCLITools includes %q, which current Claude CLI no longer registers (causes 'matches no known tool' warnings)", stale)
+		}
+	}
+	for _, required := range []string{"TodoWrite", "NotebookEdit", "Glob", "Grep"} {
+		if !got[required] {
+			t.Errorf("disallowedCLITools missing %q — native tool without GoClaw equivalent must stay blocked", required)
+		}
+	}
+}
+
+func TestClaudeCLIRemembersUnknownDisallowedToolRules(t *testing.T) {
+	p := NewClaudeCLIProvider("claude")
+
+	if _, retry := p.noteInvalidDisallowedTool(`Permission deny rule "NotebookRead" matches no known tool — check for typos.`); !retry {
+		t.Fatalf("first unknown tool observation should request retry")
+	}
+	if _, retry := p.noteInvalidDisallowedTool(`Permission deny rule "NotebookRead" matches no known tool — check for typos.`); retry {
+		t.Fatalf("repeated unknown tool observation should not request another retry")
+	}
+
+	filtered := p.filterInvalidDisallowedTools([]string{"Bash", "NotebookRead", "TodoWrite"})
+	want := []string{"Bash", "TodoWrite"}
+	if len(filtered) != len(want) {
+		t.Fatalf("filtered tools = %v, want %v", filtered, want)
+	}
+	for i := range want {
+		if filtered[i] != want[i] {
+			t.Fatalf("filtered tools = %v, want %v", filtered, want)
+		}
+	}
+}
+
+func TestClaudeCLIDisallowedToolsExcludeRemovedReadOnlyTools(t *testing.T) {
+	blocked := disallowedCLITools(nil)
+	for _, removed := range []string{"NotebookRead", "TodoRead"} {
+		for _, got := range blocked {
+			if got == removed {
+				t.Fatalf("disallowedCLITools included removed Claude CLI tool %q in %v", removed, blocked)
+			}
+		}
+	}
+
+	for _, want := range []string{"NotebookEdit", "TodoWrite"} {
+		found := false
+		for _, got := range blocked {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("disallowedCLITools missing still-supported tool %q in %v", want, blocked)
+		}
+	}
+}

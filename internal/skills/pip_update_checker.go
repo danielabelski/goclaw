@@ -111,7 +111,11 @@ func (c *PipUpdateChecker) runOutdated(ctx context.Context, includePre bool) ([]
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	args := []string{"list", "--outdated", "--format", "json", "--break-system-packages"}
+	// `list` is a read-only query — PEP 668 (externally-managed environments)
+	// only constrains commands that write into site-packages, and pip rejects
+	// --break-system-packages on `list` on every version (verified on pip 24).
+	// Passing it here makes the outdated check fail unconditionally.
+	args := []string{"list", "--outdated", "--format", "json"}
 	if includePre {
 		args = append(args, "--pre")
 	}

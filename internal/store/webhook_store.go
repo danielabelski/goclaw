@@ -70,14 +70,16 @@ type WebhookCallData struct {
 	CompletedAt    *time.Time `json:"completed_at,omitempty" db:"completed_at"`
 }
 
-// WebhookListFilter controls filtering for WebhookStore.List.
+// WebhookListFilter controls filtering for WebhookStore.List / Count.
 type WebhookListFilter struct {
-	AgentID *uuid.UUID // filter by bound agent (nil = all)
-	Limit   int        // 0 = default (50)
-	Offset  int
+	AgentID        *uuid.UUID // filter by bound agent (nil = all)
+	IncludeRevoked bool       // false (default) excludes revoked = true
+	Query          string     // case-insensitive match on name OR prefix-match on secret_prefix ("" = no filter)
+	Limit          int        // 0 = default (50)
+	Offset         int
 }
 
-// WebhookCallListFilter controls filtering for WebhookCallStore.List.
+// WebhookCallListFilter controls filtering for WebhookCallStore.List / Count.
 type WebhookCallListFilter struct {
 	WebhookID *uuid.UUID // filter by parent webhook (nil = all in tenant)
 	Status    string     // "" = all statuses
@@ -112,6 +114,9 @@ type WebhookStore interface {
 
 	// List returns webhooks for the context tenant, with optional agent filter.
 	List(ctx context.Context, f WebhookListFilter) ([]WebhookData, error)
+
+	// Count returns the total number of webhooks matching the filter (ignores Limit/Offset).
+	Count(ctx context.Context, f WebhookListFilter) (int, error)
 
 	// Update applies a partial update via column→value map.
 	// Caller validates keys; store validates against allowlist.
@@ -158,16 +163,24 @@ type WebhookCallStore interface {
 	// Returns sql.ErrNoRows if the queue is empty.
 	ClaimNext(ctx context.Context, tenantID uuid.UUID, now time.Time) (*WebhookCallData, error)
 
+	// Heartbeat renews the lease for a running call (CAS on lease_token).
+	// Sets last_heartbeat_at = now WHERE id=callID AND lease_token=lease AND status='running'.
+	// Returns store.ErrLeaseExpired if 0 rows match (lease was reclaimed) — the caller MUST stop the current run.
+	Heartbeat(ctx context.Context, callID uuid.UUID, lease string, now time.Time) error
+
 	// List returns calls for the context tenant with optional filters.
 	List(ctx context.Context, f WebhookCallListFilter) ([]WebhookCallData, error)
+
+	// Count returns the total number of calls matching the filter (ignores Limit/Offset).
+	Count(ctx context.Context, f WebhookCallListFilter) (int, error)
 
 	// DeleteOlderThan deletes terminal calls (done/failed/dead) older than ts.
 	// If tenantID is uuid.Nil, deletes across all tenants (retention worker).
 	DeleteOlderThan(ctx context.Context, tenantID uuid.UUID, ts time.Time) (int64, error)
 
-	// ReclaimStale resets rows stuck in status='running' with started_at older than
-	// staleThreshold back to status='queued'. Called on worker startup and periodically
-	// (every 60s) to recover from crashes between ClaimNext and UpdateStatus.
-	// Returns the number of rows reclaimed.
+	// ReclaimStale resets rows stuck in status='running' whose last_heartbeat_at is older
+	// than staleThreshold (or NULL — never-heartbeated/legacy rows) back to status='queued'.
+	// Called on worker startup and periodically (every 60s) to recover from a worker that
+	// crashed or hung and stopped renewing its lease. Returns the number of rows reclaimed.
 	ReclaimStale(ctx context.Context, staleThreshold time.Time) (int64, error)
 }

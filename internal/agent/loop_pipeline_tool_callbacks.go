@@ -13,8 +13,25 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
+	"github.com/nextlevelbuilder/goclaw/internal/tracing"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
+
+// recordToolCallUsage appends a tool's internal LLM call to the run breakdown.
+// No-op unless the tool actually made an LLM call (result.Usage != nil).
+func (l *Loop) recordToolCallUsage(ctx context.Context, state *pipeline.RunState, toolName string, result *tools.Result) {
+	if result == nil || result.Usage == nil {
+		return
+	}
+	state.AppendCall(providers.CallUsage{
+		Type:     "tool_call",
+		Name:     toolName,
+		Provider: result.Provider,
+		Model:    result.Model,
+		Usage:    *result.Usage,
+		CostUSD:  l.calculateLLMCost(ctx, result.Provider, result.Model, result.Usage),
+	})
+}
 
 // makeExecuteToolCall wraps tool execution: name resolution, execute, process result.
 // Uses bridgeRS to share loop detection state between the pipeline and agent's processToolResult.
@@ -33,9 +50,17 @@ func (l *Loop) makeExecuteToolCall(req *RunRequest, bridgeRS *runState) func(ctx
 			Payload: map[string]any{"name": tc.Name, "id": tc.ID, "arguments": tc.Arguments},
 		})
 
-		// Emit tool span start for tracing.
+		// Emit tool span start for tracing. Parent the tool span to the current
+		// LLM-call span so the trace tree nests tool calls under the model turn.
 		toolStart := time.Now().UTC()
-		toolSpanID := l.emitToolSpanStart(ctx, toolStart, registryName, tc.ID, string(argsJSON))
+		toolCtx := ctx
+		if state.CurrentLLMSpanID != nil {
+			toolCtx = tracing.WithParentSpanID(ctx, *state.CurrentLLMSpanID)
+		}
+		toolSpanID := l.emitToolSpanStart(toolCtx, toolStart, registryName, tc.ID, string(argsJSON))
+		if toolSpanID != uuid.Nil {
+			state.CurrentToolSpanID = &toolSpanID
+		}
 
 		// Inject agent audio snapshot so TTS tool (and any future audio consumers)
 		// can read agent-level voice/model config without an extra DB lookup.
@@ -50,12 +75,18 @@ func (l *Loop) makeExecuteToolCall(req *RunRequest, bridgeRS *runState) func(ctx
 		// C2 fix: route through executeToolForActor so per-user MCP tools
 		// resolve to the calling user's BridgeTool (not the first user's
 		// BridgeTool leaked via shared registry).
-		actorUserID := resolveActorUserID(req.UserID, req.SenderID, req.PeerKind, req.ChannelType)
+		// Prefer CredentialUserID (merged tenant_user identity) over raw
+		// resolveActorUserID so the cache key matches what getUserMCPTools used.
+		actorUserID := store.CredentialUserIDFromContext(ctx)
+		if actorUserID == "" {
+			actorUserID = resolveActorUserID(req.UserID, req.SenderID, req.PeerKind, req.ChannelType)
+		}
 		result := l.executeToolForActor(ctx, registryName, tc.Arguments,
 			req.Channel, req.ChatID, req.PeerKind, req.SessionKey, actorUserID)
 		toolDuration := time.Since(toolStart)
 
 		l.emitToolSpanEnd(ctx, toolSpanID, toolStart, result)
+		l.recordToolCallUsage(ctx, state, registryName, result)
 		l.recordToolUsageEvent(ctx, req, registryName, tc.Name, tc.ID, tc.Arguments, toolStart, result, toolSpanID)
 
 		// v3 evolution metrics: record tool execution non-blocking (best-effort).
@@ -120,7 +151,12 @@ func (l *Loop) makeExecuteToolRaw(req *RunRequest) func(ctx context.Context, tc 
 
 		// C2 fix (parallel path): route through executeToolForActor for per-user
 		// MCP tool isolation. Same rationale as makeExecuteToolCall above.
-		actorUserID := resolveActorUserID(req.UserID, req.SenderID, req.PeerKind, req.ChannelType)
+		// Prefer CredentialUserID (merged tenant_user identity) over raw
+		// resolveActorUserID so the cache key matches what getUserMCPTools used.
+		actorUserID := store.CredentialUserIDFromContext(ctx)
+		if actorUserID == "" {
+			actorUserID = resolveActorUserID(req.UserID, req.SenderID, req.PeerKind, req.ChannelType)
+		}
 		result := l.executeToolForActor(ctx, registryName, tc.Arguments,
 			req.Channel, req.ChatID, req.PeerKind, req.SessionKey, actorUserID)
 		dur := time.Since(start)
@@ -132,6 +168,7 @@ func (l *Loop) makeExecuteToolRaw(req *RunRequest) func(ctx context.Context, tc 
 			Role:       "tool",
 			Content:    result.ForLLM,
 			ToolCallID: tc.ID,
+			ToolName:   tc.Name,
 			IsError:    result.IsError,
 		}
 		return msg, &toolRawResult{result: result, duration: dur, start: start, spanID: spanID, toolName: registryName, rawName: tc.Name}, nil
@@ -181,6 +218,7 @@ func (l *Loop) makeProcessToolResult(req *RunRequest, bridgeRS *runState) func(c
 		if result == nil {
 			return []providers.Message{rawMsg}
 		}
+		l.recordToolCallUsage(ctx, state, registryName, result)
 		if rawName == "" {
 			rawName = tc.Name
 		}
@@ -347,6 +385,6 @@ func makeToolEmitRun(l *Loop, req *RunRequest) func(AgentEvent) {
 		event.Channel = req.Channel
 		event.ChatID = req.ChatID
 		event.TenantID = l.tenantID
-		l.emit(event)
+		l.emit(redactDelegationAgentEvent(req, event))
 	}
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/systemmessages"
 )
 
 // PolicyResult is returned by BaseChannel policy checks.
@@ -198,6 +199,19 @@ type ReactionChannel interface {
 	ClearReaction(ctx context.Context, chatID string, messageID string) error
 }
 
+// ActivityIndicatorChannel is optionally implemented by channels that can show an
+// ephemeral "agent is working" indicator (e.g. Bitrix24 imbot InputAction.notify)
+// while the agent thinks or runs tools — without persisting a chat message.
+//
+// statusCode is a platform-native activity code (see activity_indicator.go); an empty
+// string means "keep the current / default working indicator". Implementations MUST be
+// best-effort and non-blocking on the caller's side: the indicator is cosmetic, so a
+// failed or rate-limited call must be dropped silently and never affect the real reply.
+type ActivityIndicatorChannel interface {
+	Channel
+	OnActivityEvent(ctx context.Context, chatID string, statusCode string) error
+}
+
 // BaseChannel provides shared functionality for all channel implementations.
 // Channel implementations should embed this struct.
 type BaseChannel struct {
@@ -214,6 +228,7 @@ type BaseChannel struct {
 
 	// Shared policy + pairing fields (set via setters after construction).
 	pairingService  store.PairingStore
+	systemMessages  *systemmessages.Resolver
 	groupHistory    *PendingHistory
 	historyLimit    int
 	approvedGroups  sync.Map // chatID → true (in-memory cache for paired group approval)
@@ -243,7 +258,12 @@ func (c *BaseChannel) Type() string {
 }
 
 // SetName overrides the channel name (used by InstanceLoader for DB instances).
-func (c *BaseChannel) SetName(name string) { c.name = name }
+func (c *BaseChannel) SetName(name string) {
+	c.name = name
+	if c.groupHistory != nil {
+		c.groupHistory.SetChannelName(name)
+	}
+}
 
 // SetType sets the platform type (used by InstanceLoader for DB instances).
 func (c *BaseChannel) SetType(t string) { c.channelType = t }
@@ -272,8 +292,24 @@ func (c *BaseChannel) SetPairingService(ps store.PairingStore) { c.pairingServic
 // PairingService returns the configured pairing store (may be nil).
 func (c *BaseChannel) PairingService() store.PairingStore { return c.pairingService }
 
+// SetSystemMessages sets the resolver used for operator/system messages.
+func (c *BaseChannel) SetSystemMessages(r *systemmessages.Resolver) { c.systemMessages = r }
+
+// SystemMessage renders a configurable operator/system message.
+func (c *BaseChannel) SystemMessage(locale, key string, vars systemmessages.Vars) string {
+	if c.systemMessages != nil {
+		return c.systemMessages.Render(locale, key, vars)
+	}
+	return systemmessages.Render(locale, key, vars)
+}
+
 // SetGroupHistory sets the pending group history tracker.
-func (c *BaseChannel) SetGroupHistory(gh *PendingHistory) { c.groupHistory = gh }
+func (c *BaseChannel) SetGroupHistory(gh *PendingHistory) {
+	c.groupHistory = gh
+	if c.groupHistory != nil {
+		c.groupHistory.SetChannelName(c.name)
+	}
+}
 
 // GroupHistory returns the pending group history tracker (may be nil).
 func (c *BaseChannel) GroupHistory() *PendingHistory { return c.groupHistory }
@@ -619,12 +655,51 @@ func (c *BaseChannel) ValidatePolicy(dmPolicy, groupPolicy string) {
 // This is the standard way for channels to forward received messages.
 // peerKind should be "direct" or "group" (see sessions.PeerDirect, sessions.PeerGroup).
 func (c *BaseChannel) HandleMessage(senderID, chatID, content string, media []string, metadata map[string]string, peerKind string) {
+	c.handleMessage(senderID, chatID, content, media, metadata, peerKind, false)
+}
+
+// HandleAuthorizedMessage publishes a message after the caller has already
+// enforced the channel policy. It preserves the default direct-message safety
+// net for adapters that do not have an explicit policy gate.
+func (c *BaseChannel) HandleAuthorizedMessage(senderID, chatID, content string, media []string, metadata map[string]string, peerKind string) {
+	c.handleMessage(senderID, chatID, content, media, metadata, peerKind, true)
+}
+
+func (c *BaseChannel) handleMessage(senderID, chatID, content string, media []string, metadata map[string]string, peerKind string, policyChecked bool) {
+	// Convert string paths to MediaFile (legacy path-only callers).
+	// Use filepath.Base(p) as filename so persistMedia's sanitizer gets a
+	// meaningful stem instead of falling back to UUID. MimeType is left empty —
+	// persistMedia infers it from the file extension for these callers.
+	var mediaFiles []bus.MediaFile
+	for _, p := range media {
+		mediaFiles = append(mediaFiles, bus.MediaFile{Path: p, Filename: filepath.Base(p)})
+	}
+	c.handleMessageMedia(senderID, chatID, content, mediaFiles, metadata, peerKind, policyChecked)
+}
+
+// HandleMessageMedia is the richer sibling of HandleMessage: it accepts
+// pre-built bus.MediaFile values so a channel can preserve the original MIME
+// type and filename. This matters because the agent pipeline routes media by
+// MIME (image vs document vs audio vs video) — the path-only HandleMessage
+// loses that information. Channels that already know the content type at
+// download time (e.g. Bitrix24 file events) should call this directly.
+func (c *BaseChannel) HandleMessageMedia(senderID, chatID, content string, media []bus.MediaFile, metadata map[string]string, peerKind string) {
+	c.handleMessageMedia(senderID, chatID, content, media, metadata, peerKind, false)
+}
+
+// HandleAuthorizedMessageMedia is the media-preserving variant for callers
+// that have already enforced the channel policy.
+func (c *BaseChannel) HandleAuthorizedMessageMedia(senderID, chatID, content string, media []bus.MediaFile, metadata map[string]string, peerKind string) {
+	c.handleMessageMedia(senderID, chatID, content, media, metadata, peerKind, true)
+}
+
+func (c *BaseChannel) handleMessageMedia(senderID, chatID, content string, media []bus.MediaFile, metadata map[string]string, peerKind string, policyChecked bool) {
 	// For DMs, enforce the allowlist as a safety net.
 	// For group messages, skip this check — group access is already enforced
 	// by the channel-specific group policy (checkGroupPolicy / CheckPolicy).
 	// Re-checking the sender here would incorrectly block users who are not
 	// individually listed but are in an allowed (or open-policy) group.
-	if peerKind != "group" && !c.IsAllowed(senderID) {
+	if peerKind != "group" && !policyChecked && !c.IsAllowed(senderID) {
 		return
 	}
 
@@ -635,20 +710,12 @@ func (c *BaseChannel) HandleMessage(senderID, chatID, content string, media []st
 		userID = senderID[:idx]
 	}
 
-	// Convert string paths to MediaFile (legacy path-only callers).
-	// Use filepath.Base(p) as filename so persistMedia's sanitizer gets a
-	// meaningful stem instead of falling back to UUID.
-	var mediaFiles []bus.MediaFile
-	for _, p := range media {
-		mediaFiles = append(mediaFiles, bus.MediaFile{Path: p, Filename: filepath.Base(p)})
-	}
-
 	msg := bus.InboundMessage{
 		Channel:  c.name,
 		SenderID: senderID,
 		ChatID:   chatID,
 		Content:  content,
-		Media:    mediaFiles,
+		Media:    media,
 		PeerKind: peerKind,
 		UserID:   userID,
 		Metadata: metadata,
@@ -668,6 +735,98 @@ type GroupMember struct {
 // GroupMemberProvider is optionally implemented by channels that can list group members.
 type GroupMemberProvider interface {
 	ListGroupMembers(ctx context.Context, chatID string) ([]GroupMember, error)
+}
+
+// GroupInfo represents a group/channel chat the account belongs to.
+type GroupInfo struct {
+	GroupID     string `json:"group_id"`
+	Name        string `json:"name"`
+	TotalMember int    `json:"total_member,omitempty"`
+}
+
+// GroupListProvider is optionally implemented by channels that can list the
+// groups/chats the connected account belongs to — lets the agent resolve a
+// group's display name to its real chat ID instead of guessing.
+type GroupListProvider interface {
+	ListGroups(ctx context.Context) ([]GroupInfo, error)
+}
+
+// GroupTitleProvider is optionally implemented by channels that can resolve
+// a platform group/channel ID to a human-readable title.
+type GroupTitleProvider interface {
+	ResolveGroupTitle(ctx context.Context, chatID string) (string, error)
+}
+
+// MetadataRefreshFailure records one group whose presentation metadata could
+// not be refreshed.
+type MetadataRefreshFailure struct {
+	ChannelID string `json:"channel_id"`
+	Source    string `json:"source"`
+	Reason    string `json:"reason"`
+}
+
+// MetadataRefreshReport describes a manual channel metadata refresh. It keeps
+// stable IDs intact while making refresh coverage and failures observable.
+type MetadataRefreshReport struct {
+	OK                    bool                     `json:"ok"`
+	GroupsRefreshed       int                      `json:"groups_refreshed"`
+	UsersRefreshed        int                      `json:"users_refreshed"`
+	ContactTargets        int                      `json:"contact_targets"`
+	PendingMessageTargets int                      `json:"pending_message_targets"`
+	LiveTargets           int                      `json:"live_targets"`
+	DirectLookupAttempts  int                      `json:"direct_lookup_attempts"`
+	DirectLookupResolved  int                      `json:"direct_lookup_resolved"`
+	Errors                []string                 `json:"errors,omitempty"`
+	Failures              []MetadataRefreshFailure `json:"failures,omitempty"`
+}
+
+// GroupTitlesProvider is optionally implemented by channels that can resolve
+// multiple platform group/channel IDs in one best-effort operation.
+type GroupTitlesProvider interface {
+	ResolveGroupTitles(ctx context.Context, chatIDs []string) (map[string]string, error)
+}
+
+// GroupDisplayTitleProvider optionally resolves a presentation title for a
+// group/channel ID. Unlike GroupTitleProvider, the result may include a
+// platform hierarchy (for example, a Discord thread and its parent channel).
+// Routing and persistence must continue to use the stable chat ID.
+type GroupDisplayTitleProvider interface {
+	ResolveGroupDisplayTitle(ctx context.Context, chatID string) (string, error)
+}
+
+// TelegramManagerRequest describes a whitelisted Telegram Bot API management
+// action requested by the agent-facing telegram_manager tool.
+type TelegramManagerRequest struct {
+	Action              string         `json:"action"`
+	ChatID              string         `json:"chat_id,omitempty"`
+	MessageThreadID     int            `json:"message_thread_id,omitempty"`
+	MessageID           int            `json:"message_id,omitempty"`
+	UserID              int64          `json:"user_id,omitempty"`
+	Name                string         `json:"name,omitempty"`
+	Text                string         `json:"text,omitempty"`
+	InviteLink          string         `json:"invite_link,omitempty"`
+	IconColor           int            `json:"icon_color,omitempty"`
+	IconCustomEmojiID   string         `json:"icon_custom_emoji_id,omitempty"`
+	ExpireDate          int64          `json:"expire_date,omitempty"`
+	MemberLimit         int            `json:"member_limit,omitempty"`
+	DisableNotification bool           `json:"disable_notification,omitempty"`
+	CreatesJoinRequest  bool           `json:"creates_join_request,omitempty"`
+	OnlyIfBanned        bool           `json:"only_if_banned,omitempty"`
+	RevokeMessages      bool           `json:"revoke_messages,omitempty"`
+	Params              map[string]any `json:"params,omitempty"`
+}
+
+// TelegramManagerResult is a normalized response returned by Telegram-capable
+// channels after executing a whitelisted management action.
+type TelegramManagerResult struct {
+	Action string         `json:"action"`
+	Result map[string]any `json:"result,omitempty"`
+}
+
+// TelegramManagerProvider is optionally implemented by channels that expose
+// Telegram Bot API management actions through the channel manager.
+type TelegramManagerProvider interface {
+	ManageTelegram(ctx context.Context, req TelegramManagerRequest) (TelegramManagerResult, error)
 }
 
 // PendingCompactable is optionally implemented by channels that have a PendingHistory

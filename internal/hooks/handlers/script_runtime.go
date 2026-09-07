@@ -48,6 +48,24 @@ func bindEvent(rt *goja.Runtime, ev hooks.Event) error {
 		"depth":     ev.Depth,
 		"eventId":   ev.EventID,
 	}
+
+	// PostModelResponse-specific fields
+	if ev.HookEvent == hooks.EventPostModelResponse {
+		viewable["modelResponse"] = ev.ModelResponse
+		viewable["thinking"] = ev.Thinking
+		toolCalls := make([]map[string]any, len(ev.ToolCalls))
+		for i, tc := range ev.ToolCalls {
+			toolCalls[i] = map[string]any{
+				"id":         tc.ID,
+				"name":       tc.Name,
+				"arguments":  tc.Arguments,
+				"metadata":   tc.Metadata,
+				"parseError": tc.ParseError,
+			}
+		}
+		viewable["toolCalls"] = toolCalls
+	}
+
 	b, err := json.Marshal(viewable)
 	if err != nil {
 		return fmt.Errorf("bindEvent marshal: %w", err)
@@ -116,36 +134,43 @@ func captureStdout(rt *goja.Runtime, buf *strings.Builder) {
 	_ = rt.Set("console", console)
 }
 
-// parseReturn enforces the `{decision, reason?, updatedInput?}` contract.
+// parseReturn enforces the
+// `{decision, reason?, additionalContext?, updatedInput?}` contract.
 // Any deviation (non-object, missing field, unknown decision string) maps to
 // DecisionError with a descriptive error.
-func parseReturn(rt *goja.Runtime, v goja.Value) (hooks.Decision, string, map[string]any, error) {
+func parseReturn(rt *goja.Runtime, v goja.Value) (hooks.Decision, string, string, map[string]any, error) {
 	if v == nil || goja.IsUndefined(v) || goja.IsNull(v) {
-		return hooks.DecisionError, "", nil, errors.New("script return: must be object with decision")
+		return hooks.DecisionError, "", "", nil, errors.New("script return: must be object with decision")
 	}
 	obj := v.ToObject(rt)
 	if obj == nil {
-		return hooks.DecisionError, "", nil, errors.New("script return: must be object")
+		return hooks.DecisionError, "", "", nil, errors.New("script return: must be object")
 	}
 	decRaw := obj.Get("decision")
 	if decRaw == nil || goja.IsUndefined(decRaw) {
-		return hooks.DecisionError, "", nil, errors.New("script return: missing decision field")
+		return hooks.DecisionError, "", "", nil, errors.New("script return: missing decision field")
 	}
 	decStr, ok := decRaw.Export().(string)
 	if !ok {
-		return hooks.DecisionError, "", nil, errors.New("script return: decision must be string")
+		return hooks.DecisionError, "", "", nil, errors.New("script return: decision must be string")
 	}
 	dec := hooks.Decision(decStr)
 	switch dec {
 	case hooks.DecisionAllow, hooks.DecisionBlock, hooks.DecisionAsk, hooks.DecisionDefer:
 		// ok
 	default:
-		return hooks.DecisionError, "", nil, fmt.Errorf("script return: invalid decision %q", decStr)
+		return hooks.DecisionError, "", "", nil, fmt.Errorf("script return: invalid decision %q", decStr)
 	}
 	var reason string
 	if r := obj.Get("reason"); r != nil && !goja.IsUndefined(r) {
 		if s, ok := r.Export().(string); ok {
 			reason = s
+		}
+	}
+	var additionalContext string
+	if a := obj.Get("additionalContext"); a != nil && !goja.IsUndefined(a) {
+		if s, ok := a.Export().(string); ok {
+			additionalContext = s
 		}
 	}
 	var updated map[string]any
@@ -154,5 +179,5 @@ func parseReturn(rt *goja.Runtime, v goja.Value) (hooks.Decision, string, map[st
 			updated = m
 		}
 	}
-	return dec, reason, updated, nil
+	return dec, reason, additionalContext, updated, nil
 }

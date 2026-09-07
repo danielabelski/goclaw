@@ -36,9 +36,8 @@ func (e *PipUpdateExecutor) Update(ctx context.Context, name, toVersion string, 
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
-	args := []string{
-		"install", "--upgrade",
-		"--no-cache-dir", "--break-system-packages",
+	args := []string{"install", "--upgrade",
+		"--no-cache-dir", pipBreakSystemPackagesFlag,
 		"--upgrade-strategy", "only-if-needed",
 	}
 
@@ -57,18 +56,17 @@ func (e *PipUpdateExecutor) Update(ctx context.Context, name, toVersion string, 
 	}
 	args = append(args, name)
 
-	cmd := exec.CommandContext(cctx, pipBinary, args...)
-	cmd.WaitDelay = 2 * time.Second
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
 	start := time.Now()
-	runErr := cmd.Run()
+	stderr, runErr := runPipUpdateCommand(cctx, args)
+	// If pip rejects the PEP 668 flag (pip < 23.0, issue #956), retry once
+	// without it so updates keep working on legacy environments.
+	if runErr != nil && pipRejectsBSPFlag([]byte(stderr)) {
+		stderr, runErr = runPipUpdateCommand(cctx, dropPipBSPFlag(args))
+	}
 	durationMs := time.Since(start).Milliseconds()
 
 	if runErr != nil {
-		sentinel, reason := ClassifyPipStderr(stderr.String())
+		sentinel, reason := ClassifyPipStderr(stderr)
 		if sentinel == nil {
 			sentinel = fmt.Errorf("pip install failed: %w", runErr)
 		}
@@ -90,4 +88,17 @@ func (e *PipUpdateExecutor) Update(ctx context.Context, name, toVersion string, 
 		"status", "success",
 		"duration_ms", durationMs)
 	return nil
+}
+
+// runPipUpdateCommand runs `pip3 <args...>` and returns stderr only (it feeds
+// ClassifyPipStderr); stdout is captured and discarded. Command-level
+// WaitDelay mirrors the previous inline exec.
+func runPipUpdateCommand(ctx context.Context, args []string) (stderr string, runErr error) {
+	cmd := exec.CommandContext(ctx, pipBinary, args...)
+	cmd.WaitDelay = 2 * time.Second
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	runErr = cmd.Run()
+	return errBuf.String(), runErr
 }

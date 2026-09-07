@@ -25,6 +25,7 @@ type episodicWorker struct {
 	eventBus      eventbus.DomainEventBus
 	alertDeps     bgalert.AlertDeps
 	usageCaps     *usagecaps.Service
+	agents        store.AgentCRUDStore // resolves per-agent request budget for the preflight guard
 }
 
 // resolveProvider delegates to shared background provider resolution.
@@ -56,6 +57,10 @@ func (w *episodicWorker) Handle(ctx context.Context, event eventbus.DomainEvent)
 		return fmt.Errorf("episodic: invalid agent_id %q: %w", event.AgentID, err)
 	}
 	ctx = store.WithAgentID(ctx, agentUUID)
+	// Wire the calling agent's request budget so nested LLM summarization calls
+	// pass the agent-only preflight guard instead of failing closed with an
+	// AgentBudgetWiringError (purpose=episodic-summary).
+	ctx = withAgentRequestBudget(ctx, w.agents, agentUUID, "episodic-summary")
 
 	// Build source_id for idempotency
 	sourceID := fmt.Sprintf("%s:%d", payload.SessionKey, payload.CompactionCount)
@@ -122,6 +127,7 @@ func (w *episodicWorker) Handle(ctx context.Context, event eventbus.DomainEvent)
 			EpisodicID:  ep.ID.String(),
 			SessionKey:  payload.SessionKey,
 			Summary:     summary,
+			KeyTopics:   entities,
 			KeyEntities: entities,
 		},
 	})

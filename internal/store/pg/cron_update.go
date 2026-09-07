@@ -89,10 +89,22 @@ func (s *PGCronStore) UpdateJob(ctx context.Context, jobID string, patch store.C
 	if patch.WakeHeartbeat != nil {
 		updates["wake_heartbeat"] = *patch.WakeHeartbeat
 	}
+	if patch.ProviderID != nil {
+		updates["provider_id"] = *patch.ProviderID
+	}
+	if patch.Model != nil {
+		updates["model"] = *patch.Model
+	}
 
-	if patch.Message != "" {
+	if patch.Message != "" || patch.Command != nil {
 		payload := current.Payload
-		payload.Message = patch.Message
+		if patch.Message != "" {
+			payload.Message = patch.Message
+		}
+		if patch.Command != nil {
+			payload.Kind = store.CronPayloadKindCommand
+			payload.Command = patch.Command
+		}
 		mergedPayload, err := json.Marshal(payload)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal payload for job %s: %w", jobID, err)
@@ -181,7 +193,6 @@ func (s *PGCronStore) lockCronJobForMutation(ctx context.Context, tx *sql.Tx, id
 	return &state, nil
 }
 
-
 func execCronJobUpdateTx(ctx context.Context, tx *sql.Tx, id uuid.UUID, updates map[string]any) error {
 	if len(updates) == 0 {
 		return nil
@@ -219,4 +230,3 @@ func execCronJobUpdateTx(ctx context.Context, tx *sql.Tx, id uuid.UUID, updates 
 	}
 	return nil
 }
-

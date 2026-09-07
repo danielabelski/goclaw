@@ -23,6 +23,18 @@ var sensitiveKeys = []string{
 	"credential", "authorization", "cookie",
 }
 
+var safeTokenTelemetryKeys = map[string]bool{
+	"total_tokens":             true,
+	"prompt_tokens":            true,
+	"completion_tokens":        true,
+	"input_tokens":             true,
+	"output_tokens":            true,
+	"thinking_tokens":          true,
+	"last_prompt_tokens":       true,
+	"last_usage_prompt_tokens": true,
+	"total_prompt_tokens":      true,
+}
+
 // LogTee is a slog.Handler that forwards log records to subscribed WS clients
 // while delegating to an underlying handler for normal output.
 type LogTee struct {
@@ -347,6 +359,9 @@ func logLevelValue(v any) slog.Level {
 
 func isSensitiveKey(key string) bool {
 	lower := strings.ToLower(key)
+	if safeTokenTelemetryKeys[lower] {
+		return false
+	}
 	for _, s := range sensitiveKeys {
 		if strings.Contains(lower, s) {
 			return true

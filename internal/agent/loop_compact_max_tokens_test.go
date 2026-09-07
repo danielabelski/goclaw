@@ -31,8 +31,9 @@ func TestCompactMessagesInPlace_MaxTokensDynamic(t *testing.T) {
 	cap := &capturingProvider{response: "Summary of conversation."}
 
 	loop := &Loop{
-		provider: cap,
-		model:    "claude-3-5-sonnet",
+		provider:      cap,
+		model:         "claude-3-5-sonnet",
+		contextWindow: 200_000,
 		// tokenCounter nil → estimateSummaryInputTokens uses rune/3 fallback
 	}
 

@@ -110,6 +110,14 @@
     "behaviorDesc": "Response behavior configuration",
     "accessControl": "Access Control",
     "accessControlDesc": "User access restrictions",
+    "telegramManagement": "Telegram Management",
+    "telegramManagementDesc": "Enable the hidden tool and choose Telegram actions for agents using this channel",
+    "discordMetadata": "Discord Metadata",
+    "discordMetadataDesc": "Refresh cached Discord channel, category, thread, and known user names from the running bot.",
+    "refreshDiscordMetadata": "Refresh Discord Metadata",
+    "refreshingDiscordMetadata": "Refreshing...",
+    "discordMetadataRefreshed": "Discord metadata refreshed",
+    "discordMetadataRefreshFailed": "Failed to refresh Discord metadata",
     "reviewDiagnostics": "Review the latest diagnosis in this channel before changing settings.",
     "whatHappened": "What happened",
     "recommendedAction": "Recommended action",
@@ -202,6 +210,7 @@
       "title": "Passive memory extraction",
       "description": "Extract long-lived facts from passive group traffic into reviewable memory.",
       "pendingCount": "{{count}} pending",
+      "unprocessedCount": "{{count}} unprocessed messages",
       "enable": "Enable passive extraction",
       "reviewMode": "Require review before writing",
       "interval": "Interval (minutes)",
@@ -211,13 +220,29 @@
       "types": "Memory types",
       "excludeUsers": "Excluded users",
       "excludePatterns": "Excluded patterns",
-      "runNow": "Run now",
+      "channelCustomPrompt": "Channel extraction instructions",
+      "excludeGroups": "Excluded Discord channels",
+      "excludeGroupsPlaceholder": "Select a channel to exclude",
+      "manualExcludePlaceholder": "Paste Discord channel ID",
+      "useDiscordChannelId": "Use Discord channel ID:",
+      "addExcludedGroup": "Add",
+      "noExcludeGroups": "No Discord channel history found yet.",
+      "noExcludedGroups": "No channels excluded.",
+      "removeExcludedGroup": "Remove {{group}} from excluded channels",
+      "runNow": "Run latest group",
+      "processAll": "Run all groups",
       "save": "Save",
       "saving": "Saving...",
       "saved": "Memory settings saved",
       "saveFailed": "Failed to save memory settings",
       "runQueued": "Memory extraction started",
+      "runAllDone": "Processed {{messages}} messages across {{runs}} groups",
       "runFailed": "Memory extraction failed",
+      "runAllProgress": "Run all groups progress",
+      "runAllProgressStats": "{{runs}} done, {{skipped}} skipped, {{errors}} failed, {{messages}} messages",
+      "groupCompleted": "Completed group {{historyKey}}",
+      "groupSkipped": "Skipped group {{historyKey}} below the minimum message count ({{messageCount}} messages)",
+      "groupFailed": "Group {{historyKey}} failed: {{error}}",
       "itemUpdated": "Memory item updated",
       "itemFailed": "Memory item action failed",
       "reviewQueue": "Review queue",
@@ -229,6 +254,10 @@
       "approve": "Approve",
       "reject": "Reject",
       "delete": "Delete",
+      "debugBadge": {
+        "topic": "Topic",
+        "entity": "Entity"
+      },
       "type": {
         "people": "People",
         "projects": "Projects",
@@ -236,7 +265,10 @@
         "todos": "Todos",
         "preferences": "Preferences",
         "events": "Events"
-      }
+      },
+      "groupCustomPrompt": "Group extraction instructions",
+      "groupCustomPromptPlaceholder": "Select a group to tune",
+      "noPromptGroups": "No Discord channel history found yet."
     },
     "timeline": {
       "title": "Timeline",
@@ -286,8 +318,13 @@
     }
   },
   "fieldConfig": {
-    "token": { "label": "Bot Token", "help": "From @BotFather" },
-    "bot_token": { "label": "Bot Token" },
+    "token": {
+      "label": "Bot Token",
+      "help": "From @BotFather"
+    },
+    "bot_token": {
+      "label": "Bot Token"
+    },
     "app_token": {
       "label": "App-Level Token",
       "help": "App-Level Token with connections:write scope (required for Socket Mode)"
@@ -296,14 +333,23 @@
       "label": "User Token (Optional)",
       "help": "Optional: User OAuth Token for custom bot identity. Leave empty to use default bot identity."
     },
-    "app_id": { "label": "App ID" },
-    "app_secret": { "label": "App Secret" },
-    "encrypt_key": { "label": "Encrypt Key", "help": "For webhook mode" },
+    "app_id": {
+      "label": "App ID"
+    },
+    "app_secret": {
+      "label": "App Secret"
+    },
+    "encrypt_key": {
+      "label": "Encrypt Key",
+      "help": "For webhook mode"
+    },
     "verification_token": {
       "label": "Verification Token",
       "help": "For webhook mode"
     },
-    "webhook_secret": { "label": "Webhook Secret" },
+    "webhook_secret": {
+      "label": "Webhook Secret"
+    },
     "api_server": {
       "label": "API Server URL",
       "help": "Custom Telegram Bot API server for large file uploads (up to 2GB). Leave empty for default."
@@ -312,8 +358,12 @@
       "label": "HTTP Proxy",
       "help": "Route bot traffic through an HTTP proxy"
     },
-    "dm_policy": { "label": "DM Policy" },
-    "group_policy": { "label": "Group Policy" },
+    "dm_policy": {
+      "label": "DM Policy"
+    },
+    "group_policy": {
+      "label": "Group Policy"
+    },
     "require_mention": {
       "label": "Require @mention in groups",
       "disabledHint": "Multi-bot mode always listens to all messages"
@@ -342,11 +392,35 @@
       "label": "Show Reasoning",
       "help": "Choose how model reasoning is shown in channel messages."
     },
-    "reaction_level": { "label": "Reaction Level" },
-    "media_max_mb": { "label": "Max Media Size (MB)" },
-    "link_preview": { "label": "Link Preview" },
-    "allow_from": { "label": "Allowed Users" },
-    "domain": { "label": "Domain" },
+    "reaction_level": {
+      "label": "Reaction Level"
+    },
+    "activity_indicator": {
+      "label": "Activity Indicator",
+      "help": "Show a native \"agent is working\" indicator (thinking/searching/generating…) while the agent processes. Ephemeral, not a chat message."
+    },
+    "media_max_mb": {
+      "label": "Max Media Size (MB)"
+    },
+    "link_preview": {
+      "label": "Link Preview"
+    },
+    "allow_from": {
+      "label": "Allowed Users"
+    },
+    "telegram_manager": {
+      "enabled": {
+        "label": "Enable Telegram management tool",
+        "help": "Only applies to agents running through this Telegram channel. This is a hidden tool and does not appear in shared tool profiles."
+      },
+      "allowed_actions": {
+        "label": "Telegram management permissions",
+        "help": "Choose which Telegram actions the agent may use. If no permission is selected, the tool is not granted to the agent."
+      }
+    },
+    "domain": {
+      "label": "Domain"
+    },
     "connection_mode": {
       "label": "Connection Mode",
       "help": "WebSocket needs no public IP — outbound connection only"
@@ -359,12 +433,16 @@
       "label": "Webhook Path",
       "help": "Path on main server for Lark events"
     },
-    "webhook_url": { "label": "Webhook URL" },
+    "webhook_url": {
+      "label": "Webhook URL"
+    },
     "topic_session_mode": {
       "label": "Topic Session Mode",
       "help": "Use thread root_id for session isolation"
     },
-    "render_mode": { "label": "Render Mode" },
+    "render_mode": {
+      "label": "Render Mode"
+    },
     "text_chunk_limit": {
       "label": "Text Chunk Limit",
       "help": "Max characters per message"
@@ -393,7 +471,9 @@
       "label": "Tool Allowlist",
       "help": "Restrict which tools the agent can use in this group"
     },
-    "system_prompt": { "label": "System Prompt" },
+    "system_prompt": {
+      "label": "System Prompt"
+    },
     "chat_behavior": {
       "enabled": {
         "label": "Human-like Delivery",
@@ -466,8 +546,14 @@
         }
       }
     },
-    "platform": { "label": "Platform", "help": "Select the platform this Pancake page serves." },
-    "tiktok_type": { "label": "TikTok Type", "help": "Select the TikTok account type for this page" },
+    "platform": {
+      "label": "Platform",
+      "help": "Select the platform this Pancake page serves."
+    },
+    "tiktok_type": {
+      "label": "TikTok Type",
+      "help": "Select the TikTok account type for this page"
+    },
     "features.private_reply": {
       "label": "Private Reply (Comment → DM)",
       "help": "Send a one-time DM to commenters after the public reply. Facebook/Instagram only. Meta allows DM within 7 days of the comment."
@@ -503,6 +589,16 @@
       "streaming_only": "Streaming only",
       "always_bubbles": "Always as bubbles",
       "off": "Off"
+    },
+    "telegram_manager": {
+      "allowed_actions": {
+        "topic": "Manage topics",
+        "message": "Manage messages",
+        "member": "Manage members",
+        "invite": "Manage invite links",
+        "chat": "Chat info/settings",
+        "join_request": "Approve join requests"
+      }
     },
     "chat_behavior": {
       "enabled": {
@@ -562,17 +658,17 @@
       "card": "Card"
     },
     "platform": {
-      "facebook":    "Facebook",
-      "instagram":   "Instagram",
-      "threads":     "Threads (Beta)",
-      "tiktok":      "TikTok",
-      "youtube":     "YouTube (Beta)",
-      "shopee":      "Shopee",
-      "line":        "Line",
-      "google":      "Google",
+      "facebook": "Facebook",
+      "instagram": "Instagram",
+      "threads": "Threads (Beta)",
+      "tiktok": "TikTok",
+      "youtube": "YouTube (Beta)",
+      "shopee": "Shopee",
+      "line": "Line",
+      "google": "Google",
       "chat_plugin": "Chat Plugin",
-      "lazada":      "Lazada",
-      "tokopedia":   "Tokopedia"
+      "lazada": "Lazada",
+      "tokopedia": "Tokopedia"
     }
   },
   "groupOverrides": {
@@ -703,7 +799,15 @@
       "createFirst": "Connect your first Bitrix24 portal",
       "createNew": "Create new portal",
       "pendingBadge": "Pending install — click to resume",
-      "loadError": "Failed to load portals. Refresh to retry."
+      "loadError": "Failed to load portals. Refresh to retry.",
+      "deleteAria": "Delete portal {{name}}",
+      "deleteConfirm": {
+        "title": "Delete pending portal",
+        "description": "Delete pending portal \"{{name}}\"? It hasn't finished install and isn't used by any channel. This cannot be undone.",
+        "confirmLabel": "Delete",
+        "success": "Portal \"{{name}}\" deleted",
+        "error": "Failed to delete portal"
+      }
     },
     "errors": {
       "portalRequired": "Please select a portal.",

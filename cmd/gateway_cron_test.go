@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 
 	"github.com/nextlevelbuilder/goclaw/internal/agent"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/scheduler"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
@@ -41,6 +43,9 @@ func TestCronJobHandlerInjectsPayloadCredentialUserID(t *testing.T) {
 		nil,
 		nil,
 		nil,
+		nil,
+		nil,
+		nil,
 	)
 
 	result, err := handler(&store.CronJob{
@@ -65,6 +70,53 @@ func TestCronJobHandlerInjectsPayloadCredentialUserID(t *testing.T) {
 	if gotCredentialUserID != wantCredentialUserID {
 		t.Fatalf("credential user ID in scheduled context = %q, want %q", gotCredentialUserID, wantCredentialUserID)
 	}
+}
+
+func TestCronJobHandlerResolvesGroupDisplayTitle(t *testing.T) {
+	var got agent.RunRequest
+	sched := scheduler.NewScheduler(
+		scheduler.DefaultLanes(),
+		scheduler.QueueConfig{Mode: scheduler.QueueModeQueue, Cap: 1, MaxConcurrent: 1},
+		func(_ context.Context, req agent.RunRequest) (*agent.RunResult, error) {
+			got = req
+			return &agent.RunResult{Content: "ok"}, nil
+		},
+	)
+	defer sched.Stop()
+	msgBus := bus.New()
+	defer msgBus.Close()
+	manager := channels.NewManager(nil)
+	manager.RegisterChannel("discord-main", cronDisplayTitleChannel{consumerTestChannel: consumerTestChannel{name: "discord-main", channelType: channels.TypeDiscord}, title: "launch-thread / product-planning"})
+
+	handler := makeCronJobHandler(sched, msgBus, &config.Config{}, manager, nil, nil, nil, nil, nil)
+	if _, err := handler(&store.CronJob{
+		ID:             uuid.NewString(),
+		TenantID:       uuid.New(),
+		Name:           "thread-report",
+		AgentID:        "reporter",
+		UserID:         "guild:guild-1:user:user-1",
+		Deliver:        true,
+		DeliverChannel: "discord-main",
+		DeliverTo:      "thread-1",
+		Payload:        store.CronPayload{Kind: "agent_turn", Message: "report"},
+	}); err != nil {
+		t.Fatalf("cron handler: %v", err)
+	}
+	if got.ChatID != "thread-1" {
+		t.Fatalf("chat ID = %q, want stable thread ID", got.ChatID)
+	}
+	if got.ChatTitle != "launch-thread / product-planning" {
+		t.Fatalf("chat title = %q, want qualified title", got.ChatTitle)
+	}
+}
+
+type cronDisplayTitleChannel struct {
+	consumerTestChannel
+	title string
+}
+
+func (c cronDisplayTitleChannel) ResolveGroupDisplayTitle(context.Context, string) (string, error) {
+	return c.title, nil
 }
 
 func TestCronOutputContainsNoReplySentinel(t *testing.T) {
@@ -137,6 +189,9 @@ func TestCronJobHandlerSuppressesNoReplyDelivery(t *testing.T) {
 				nil,
 				nil,
 				nil,
+				nil,
+				nil,
+				nil,
 			)
 
 			result, err := handler(&store.CronJob{
@@ -177,5 +232,141 @@ func TestCronJobHandlerSuppressesNoReplyDelivery(t *testing.T) {
 				t.Fatalf("outbound message = %#v, want channel telegram chat chat-1 content %q", got, tt.content)
 			}
 		})
+	}
+}
+
+// fakeCronSessionStore records Reset calls. The embedded nil SessionStore
+// satisfies the interface; the cron handler only calls Reset/Save.
+type fakeCronSessionStore struct {
+	store.SessionStore
+	resetCount int
+}
+
+func (f *fakeCronSessionStore) Reset(context.Context, string)      { f.resetCount++ }
+func (f *fakeCronSessionStore) Save(context.Context, string) error { return nil }
+
+// A stateless cron run must start fresh by clearing BOTH the goclaw session
+// store and the Claude CLI on-disk session; a stateful run must keep both.
+func TestCronJobHandler_StatelessResetsSession(t *testing.T) {
+	cases := []struct {
+		name      string
+		stateless bool
+		wantReset bool
+	}{
+		{name: "stateless resets both layers", stateless: true, wantReset: true},
+		{name: "stateful keeps session", stateless: false, wantReset: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var cliResetKeys []string
+			orig := cronCLISessionReset
+			cronCLISessionReset = func(_, key string) { cliResetKeys = append(cliResetKeys, key) }
+			defer func() { cronCLISessionReset = orig }()
+
+			fakeStore := &fakeCronSessionStore{}
+
+			sched := scheduler.NewScheduler(
+				scheduler.DefaultLanes(),
+				scheduler.QueueConfig{
+					Mode:          scheduler.QueueModeQueue,
+					Cap:           1,
+					Drop:          scheduler.DropOld,
+					DebounceMs:    0,
+					MaxConcurrent: 1,
+				},
+				func(context.Context, agent.RunRequest) (*agent.RunResult, error) {
+					return &agent.RunResult{Content: "ok"}, nil
+				},
+			)
+			defer sched.Stop()
+
+			handler := makeCronJobHandler(sched, nil, &config.Config{}, nil, fakeStore, nil, nil, nil, nil)
+
+			if _, err := handler(&store.CronJob{
+				ID:        uuid.NewString(),
+				TenantID:  uuid.New(),
+				Name:      "j",
+				AgentID:   "reporter",
+				UserID:    "user-1",
+				Stateless: tc.stateless,
+				Payload:   store.CronPayload{Kind: "agent_turn", Message: "m"},
+			}); err != nil {
+				t.Fatalf("cron handler error: %v", err)
+			}
+
+			if gotStore := fakeStore.resetCount > 0; gotStore != tc.wantReset {
+				t.Errorf("session store reset called=%v, want %v", gotStore, tc.wantReset)
+			}
+			if gotCLI := len(cliResetKeys) > 0; gotCLI != tc.wantReset {
+				t.Errorf("CLI session reset called=%v, want %v", gotCLI, tc.wantReset)
+			}
+		})
+	}
+}
+
+// fakeTenantStore implements only GetTenant; embedding the interface satisfies
+// the rest (calling any other method would nil-panic, which none of these tests do).
+type fakeTenantStore struct {
+	store.TenantStore
+	byID map[uuid.UUID]*store.TenantData
+	err  error
+}
+
+func (f *fakeTenantStore) GetTenant(_ context.Context, id uuid.UUID) (*store.TenantData, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.byID[id], nil
+}
+
+func TestCronTenantContext_InjectsSlugForNonMasterTenant(t *testing.T) {
+	tid := uuid.Must(uuid.NewV7())
+	ts := &fakeTenantStore{byID: map[uuid.UUID]*store.TenantData{
+		tid: {ID: tid, Slug: "family-pilot"},
+	}}
+
+	ctx := cronTenantContext(context.Background(), ts, tid)
+
+	if got := store.TenantIDFromContext(ctx); got != tid {
+		t.Errorf("tenant id = %v, want %v", got, tid)
+	}
+	// The slug is what tenant-scoped skills-store/workspace paths key off; without
+	// it a cron agent turn sees none of its tenant's managed skills.
+	if got := store.TenantSlugFromContext(ctx); got != "family-pilot" {
+		t.Errorf("tenant slug = %q, want %q (skills-store would resolve to the wrong dir)", got, "family-pilot")
+	}
+}
+
+func TestCronTenantContext_MasterTenantNeedsNoSlug(t *testing.T) {
+	// Master tenant paths resolve to the base dir regardless of slug; the store
+	// must not even be consulted.
+	ts := &fakeTenantStore{err: fmt.Errorf("GetTenant must not be called for master")}
+	ctx := cronTenantContext(context.Background(), ts, store.MasterTenantID)
+	if got := store.TenantIDFromContext(ctx); got != store.MasterTenantID {
+		t.Errorf("tenant id = %v, want master", got)
+	}
+}
+
+func TestCronTenantContext_NilStore_TenantIDOnly(t *testing.T) {
+	tid := uuid.Must(uuid.NewV7())
+	ctx := cronTenantContext(context.Background(), nil, tid)
+	if got := store.TenantIDFromContext(ctx); got != tid {
+		t.Errorf("tenant id = %v, want %v", got, tid)
+	}
+	if got := store.TenantSlugFromContext(ctx); got != "" {
+		t.Errorf("slug = %q, want empty when store is nil", got)
+	}
+}
+
+func TestCronTenantContext_LookupError_FallsBackToIDOnly(t *testing.T) {
+	tid := uuid.Must(uuid.NewV7())
+	ts := &fakeTenantStore{err: fmt.Errorf("db down")}
+	ctx := cronTenantContext(context.Background(), ts, tid)
+	if got := store.TenantSlugFromContext(ctx); got != "" {
+		t.Errorf("slug = %q, want empty on lookup error", got)
+	}
+	if got := store.TenantIDFromContext(ctx); got != tid {
+		t.Errorf("tenant id = %v, want %v (must still scope by id)", got, tid)
 	}
 }

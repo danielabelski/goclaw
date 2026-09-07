@@ -20,11 +20,6 @@ const mcpOptionalParamInstruction = "**Optional parameters:** Only include param
 	"WRONG: {\"url\": \"https://example.com\", \"debug\": true, \"timeout\": 10000, \"format\": \"bullet\"}\n" +
 	"RIGHT: {\"url\": \"https://example.com\"}"
 
-// mcpToolDescMaxLen is the max character length for MCP tool descriptions
-// in the system prompt inline section. ~200 chars ≈ ~50 tokens, balancing
-// discoverability with prompt budget.
-const mcpToolDescMaxLen = 200
-
 // buildCRMFreshnessSection emits a Bitrix24-specific data-freshness reminder.
 // LLMs tend to recall CRM record fields from earlier conversation turns;
 // when admin changes the user's CRM permission mid-session, the LLM may
@@ -139,32 +134,21 @@ func buildMCPToolsSearchSection() []string {
 	}
 }
 
-// buildMCPToolsInlineSection generates the MCP tools section for inline mode.
-// Lists each MCP tool with its real description (truncated to mcpToolDescMaxLen).
+// buildMCPToolsInlineSection generates the MCP tools behavioral note for inline mode.
+// Per-tool name+description enumeration was removed — the `tools:` API parameter
+// now carries the real, complete MCP tool schemas (name, description, JSON schema),
+// so repeating name+description in prose was pure duplication. Only the behavioral
+// instructions that aren't expressible in a JSON schema (prefer-MCP-over-core,
+// optional-parameter guidance) are kept here.
 func buildMCPToolsInlineSection(descs map[string]string) []string {
-	lines := []string{
+	return []string{
 		"## MCP Tools (prefer over core tools)",
 		"",
-		"External tool integrations (MCP servers). **When an MCP tool overlaps with a core tool, always prefer the MCP tool.**",
+		"External tool integrations (MCP servers) are available — see their schemas in the tools list. **When an MCP tool overlaps with a core tool, always prefer the MCP tool.**",
 		"",
 		mcpOptionalParamInstruction,
 		"",
 	}
-	// Sort MCP tool names for deterministic ordering — critical for prompt caching.
-	sortedNames := make([]string, 0, len(descs))
-	for name := range descs {
-		sortedNames = append(sortedNames, name)
-	}
-	slices.Sort(sortedNames)
-	for _, name := range sortedNames {
-		desc := descs[name]
-		if len(desc) > mcpToolDescMaxLen {
-			desc = desc[:mcpToolDescMaxLen] + "…"
-		}
-		lines = append(lines, fmt.Sprintf("- %s: %s", name, desc))
-	}
-	lines = append(lines, "")
-	return lines
 }
 
 // buildSafetySlimSection generates a 2-line safety section for task mode.
@@ -181,7 +165,7 @@ func buildSafetySlimSection() []string {
 
 // buildMemoryRecallSlimSection generates a concise memory instruction for task mode.
 func buildMemoryRecallSlimSection(hasMemoryExpand bool) []string {
-	line := "Before answering about prior work/decisions: call memory_search."
+	line := "Before answering about prior work/decisions: call memory_search. For today/yesterday/last 24h style questions, use query:\"*\" with createdAfter/createdBefore or timeRange; do not put date words into query."
 	if hasMemoryExpand {
 		line += " Use memory_expand(id) for full session details from episodic results."
 	}
@@ -192,7 +176,7 @@ func buildMemoryRecallSlimSection(hasMemoryExpand bool) []string {
 // buildMemoryRecallMinimalSection generates a 1-line memory instruction for minimal mode.
 func buildMemoryRecallMinimalSection() []string {
 	return []string{
-		"If you need context from past sessions: call memory_search.",
+		"If you need context from past sessions: call memory_search; for recency/date questions use query:\"*\" with time filters.",
 		"",
 	}
 }
@@ -268,14 +252,13 @@ func buildSkillsHybridSection(pinnedSummary string, hasSearch, hasManage bool) [
 			"Pinned skills (always available — scan these first):",
 			pinnedSummary,
 			"",
+			"Pinned skills shown as `<skill_instructions name=\"...\">` already contain their full SKILL.md content inline — use it directly, no `use_skill`/`read_file` round trip needed. "+
+				"Pinned skills shown as `<skill>` (pointer only, too large to inline) still need `use_skill` then `read_file` with the exact `<location>`.",
+			"",
 		)
 	}
 	if hasSearch {
-		lines = append(lines,
-			"For other skills, run `skill_search` with **English keywords** describing the domain.",
-			"If a match is found, read its SKILL.md at the returned location, then follow it.",
-			"",
-		)
+		lines = append(lines, skillLoadingProtocolLines()...)
 	}
 	if hasManage {
 		lines = append(lines, "### Skill Creation", "",
@@ -284,6 +267,24 @@ func buildSkillsHybridSection(pinnedSummary string, hasSearch, hasManage bool) [
 			"")
 	}
 	return lines
+}
+
+// skillLoadingProtocolLines is the shared, mechanical protocol for activating
+// and loading skills. Centralized so every skills section (hybrid, inline,
+// search) gives the model identical path-safe steps: read the EXACT location
+// verbatim, never guess a SKILL.md path.
+func skillLoadingProtocolLines() []string {
+	return []string{
+		"Skill loading protocol — follow exactly:",
+		"1. Check the `<available_skills>` list in this prompt.",
+		"2. If a clearly matching skill is listed there: call `use_skill(\"<name>\")`; then, if `use_skill` did not return the skill's full instructions, call `read_file` with the EXACT `<location>` from `<available_skills>` (copy it verbatim, including the leading `/`); then follow the SKILL.md.",
+		"3. If no clear match is listed: call `skill_search` with **English keywords**, pick the most specific result, call `use_skill(\"<name>\")`, then `read_file` the EXACT `location` returned by `skill_search`; then follow the SKILL.md.",
+		"4. Never guess, construct, or modify SKILL.md paths — only use a `location` value copied verbatim.",
+		"5. If `read_file` fails, do not invent another path: call `skill_search` again by skill name and read the `location` it returns.",
+		"6. `use_skill` only activates/traces the skill; it does not load the instructions unless it returns the full content.",
+		"7. Read at most one skill up front; if none apply, proceed normally.",
+		"",
+	}
 }
 
 // buildSandboxSection creates the "## Sandbox" section matching TS system-prompt.ts lines 476-519.
@@ -352,6 +353,10 @@ func buildMemoryRecallSection(hasMemoryGet, hasMemoryExpand, hasKG bool) []strin
 				"call memory_search with a relevant query and answer from the matching results. "+
 				"If no relevant results found, say so naturally without mentioning tool names.")
 	}
+	lines = append(lines,
+		"For recency/date questions (today, yesterday, last 24h, this week, \"hom nay\", \"hom qua\", \"24h gan nhat\"), "+
+			"compute the time window and call memory_search with query:\"*\" plus createdAfter/createdBefore or timeRange. "+
+			"Do not put date words or guessed topics into query. First retrieve the broad time window, then run a second semantic search only if the user asks for a narrower topic.")
 
 	if hasMemoryExpand {
 		lines = append(lines,
@@ -766,6 +771,8 @@ func buildOrchestrationSection(data OrchestrationSectionData) []string {
 	lines = append(lines,
 		"",
 		"Use `delegate` with the agent_key of the target agent. Do NOT invent agent keys.",
+		"Return generated files or media artifacts to the caller through the delegate result.",
+		"Do not ask the delegatee to send directly to your current chat; delegated runs use an internal `delegate` channel and the caller handles final delivery.",
 		"",
 	)
 	return lines
@@ -793,37 +800,6 @@ func buildTeamWorkspaceSection(teamWsPath string) []string {
 		"[Auto-status] messages are informational — relay naturally. Do NOT create, retry, or reassign tasks from them.",
 		"",
 	}
-}
-
-// buildTeamMembersSection lists team members so the agent knows who to assign tasks to.
-// teamGuidance is injected from TeamActionPolicy.MemberGuidance() — varies by edition.
-func buildTeamMembersSection(members []store.TeamMemberData, teamGuidance string) []string {
-	lines := []string{
-		"## Team Members",
-		"",
-		"Your team (use agent_key as assignee in team_tasks):",
-	}
-	for _, m := range members {
-		entry := fmt.Sprintf("- %s (%s) [%s]", m.AgentKey, m.DisplayName, m.Role)
-		if m.Frontmatter != "" {
-			fm := m.Frontmatter
-			if len([]rune(fm)) > 80 {
-				fm = string([]rune(fm)[:80]) + "…"
-			}
-			entry += " — " + fm
-		}
-		lines = append(lines, entry)
-	}
-	lines = append(lines,
-		"",
-		"When creating tasks with team_tasks, set assignee to the agent_key of the best-suited member.",
-		"Do NOT invent agent keys — only use the keys listed above.",
-	)
-	if teamGuidance != "" {
-		lines = append(lines, teamGuidance)
-	}
-	lines = append(lines, "")
-	return lines
 }
 
 // buildVoiceResponseSection generates guidance for triggering auto TTS in "tagged" mode.

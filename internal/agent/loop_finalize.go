@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +14,6 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/i18n"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
-	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
 
 // isUserFilePopulated checks if USER.md has been filled with actual user data
@@ -47,7 +47,7 @@ func (l *Loop) finalizeRun(
 	// BEFORE sanitize strips them. Covers cases where a tool returned its
 	// artifact via the ForLLM MEDIA: prefix but the agent relayed it as plain
 	// text (e.g. PDF from exec/weasyprint, TTS mp3 paths the LLM quotes back).
-	if extracted := extractMediaFromContent(rs.finalContent, tools.ToolWorkspaceFromCtx(ctx)); len(extracted) > 0 {
+	if extracted := extractMediaFromContent(rs.finalContent, l.mediaEgressRoots(ctx)); len(extracted) > 0 {
 		rs.mediaResults = append(rs.mediaResults, extracted...)
 	}
 
@@ -66,13 +66,14 @@ func (l *Loop) finalizeRun(
 		rs.finalContent += "\n\n---\n_" + i18n.T(locale, i18n.MsgSkillNudgePostscript) + "_"
 	}
 
-	// 7. Fallback for empty content
-	if rs.finalContent == "" {
-		if len(rs.asyncToolCalls) > 0 {
-			rs.finalContent = "..."
-		} else {
-			rs.finalContent = "..."
-		}
+	// 7. Fallback only when there is no other deliverable output. Media-only
+	// runs must remain media-only instead of gaining a visible caption. Use a
+	// meaningful localized message instead of the old meaningless "...".
+	hasDeliverableOutput := len(rs.mediaResults) > 0 ||
+		len(req.ForwardMedia) > 0 ||
+		req.ContentSuffix != ""
+	if rs.finalContent == "" && !hasDeliverableOutput {
+		rs.finalContent = i18n.T(store.LocaleFromContext(ctx), i18n.MsgEmptyReplyFallback)
 	}
 
 	// Append content suffix (e.g. image markdown for WS) before saving to session.
@@ -186,10 +187,9 @@ func (l *Loop) finalizeRun(
 	l.sessions.UpdateMetadata(ctx, req.SessionKey, l.model, l.provider.Name(), req.Channel)
 	l.sessions.AccumulateTokens(ctx, req.SessionKey, int64(rs.totalUsage.PromptTokens), int64(rs.totalUsage.CompletionTokens))
 
-	// Calibrate token estimation: store actual prompt tokens + message count.
-	if rs.totalUsage.PromptTokens > 0 {
-		msgCount := len(history) + rs.checkpointFlushedMsgs + len(rs.pendingMsgs)
-		l.sessions.SetLastPromptTokens(ctx, req.SessionKey, rs.totalUsage.PromptTokens, msgCount)
+	// Calibrate token estimation using the last LLM request, not the total run.
+	if rs.lastUsage.PromptTokens > 0 && rs.lastUsageMsgCount > 0 {
+		l.sessions.SetLastPromptTokens(ctx, req.SessionKey, rs.lastUsage.PromptTokens, rs.lastUsageMsgCount)
 	}
 
 	l.sessions.Save(ctx, req.SessionKey)
@@ -200,26 +200,40 @@ func (l *Loop) finalizeRun(
 		slog.Info("agent loop: NO_REPLY detected, suppressing delivery",
 			"agent", l.id, "session", req.SessionKey)
 		rs.finalContent = ""
+		if req.ContentSuffix != "" {
+			rs.finalContent = deduplicateMediaSuffix("", req.ContentSuffix)
+		}
 	}
 
 	// 9. Maybe summarize
-	l.maybeSummarize(ctx, req.SessionKey)
+	// Legacy v2 path has no mid-loop pressure signal (that lives in v3 RunState.Prune),
+	// so pass false — this preserves the original baseline-threshold behavior here.
+	l.maybeSummarize(ctx, req.SessionKey, false)
 
 	// V3: emit session.completed for consolidation pipeline (episodic → semantic → dreaming)
 	if l.domainBus != nil {
+		// Bug C parity: include count in SourceID so the eventbus dedup key advances
+		// per compaction cycle (matches the v3 adapter emit path). This path is
+		// currently disabled (FinalizeStage owns finalization) but kept in sync.
+		finalizeCount := l.sessions.GetCompactionCount(ctx, req.SessionKey)
 		l.domainBus.Publish(eventbus.DomainEvent{
 			Type:     eventbus.EventSessionCompleted,
 			TenantID: l.tenantID.String(),
 			AgentID:  l.agentUUID.String(),
 			UserID:   req.UserID,
-			SourceID: req.SessionKey,
+			SourceID: fmt.Sprintf("%s:%d", req.SessionKey, finalizeCount),
 			Payload: &eventbus.SessionCompletedPayload{
 				SessionKey:      req.SessionKey,
 				MessageCount:    len(history) + len(rs.pendingMsgs),
 				TokensUsed:      rs.totalUsage.PromptTokens + rs.totalUsage.CompletionTokens,
-				CompactionCount: l.sessions.GetCompactionCount(ctx, req.SessionKey),
+				CompactionCount: finalizeCount,
 			},
 		})
+	}
+
+	var lastUsage *providers.Usage
+	if rs.lastUsage.PromptTokens > 0 || rs.lastUsage.CompletionTokens > 0 || rs.lastUsage.TotalTokens > 0 {
+		lastUsage = &rs.lastUsage
 	}
 
 	return &RunResult{
@@ -228,6 +242,7 @@ func (l *Loop) finalizeRun(
 		RunID:          req.RunID,
 		Iterations:     rs.iteration,
 		Usage:          &rs.totalUsage,
+		LastUsage:      lastUsage,
 		Media:          rs.mediaResults,
 		Deliverables:   rs.deliverables,
 		BlockReplies:   rs.blockReplies,

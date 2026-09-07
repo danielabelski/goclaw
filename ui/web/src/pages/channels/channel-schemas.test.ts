@@ -53,6 +53,35 @@ describe("telegram configSchema", () => {
       expect(field.help?.trim(), `${field.key} should have tooltip help`).toBeTruthy();
     }
   });
+
+  it("exposes Telegram manager permissions as fixed multi-select actions", () => {
+    const enabled = telegramConfig.find((field) => field.key === "telegram_manager.enabled");
+    const allowedActions = telegramConfig.find((field) => field.key === "telegram_manager.allowed_actions");
+
+    expect(enabled).toBeDefined();
+    expect(enabled!.type).toBe("boolean");
+    expect(allowedActions).toBeDefined();
+    expect(allowedActions!.type).toBe("multi-select");
+    expect(allowedActions!.options!.map((option) => option.value)).toEqual([
+      "topic",
+      "message",
+      "member",
+      "invite",
+      "chat",
+      "join_request",
+    ]);
+  });
+});
+
+describe("discord configSchema", () => {
+  const discordConfig = configSchema["discord"]!;
+
+  it("matches the backend pending group history default", () => {
+    const historyLimit = discordConfig.find((field) => field.key === "history_limit");
+    expect(historyLimit).toBeDefined();
+    expect(historyLimit!.defaultValue).toBe(200);
+    expect(historyLimit!.help).toMatch(/0 = disabled/i);
+  });
 });
 
 describe("pancake configSchema", () => {

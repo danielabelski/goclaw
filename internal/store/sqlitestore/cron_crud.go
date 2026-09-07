@@ -83,7 +83,17 @@ func (s *SQLiteCronStore) AddJob(ctx context.Context, name string, schedule stor
 	}
 
 	s.InvalidateCache()
-	job, _ := s.GetJob(ctx, id.String())
+
+	// Read back with a tenant-consistent context. The INSERT above uses
+	// tenantIDForInsert(ctx), which falls back to MasterTenantID when the
+	// caller has no tenant in context. scanJob rejects a nil-tenant context
+	// with "tenant_id required", so reading back under the same tenant the row
+	// was inserted with keeps insert and readback symmetric (matches pg store).
+	readCtx := store.WithTenantID(ctx, tenantIDForInsert(ctx))
+	job, ok := s.GetJob(readCtx, id.String())
+	if !ok || job == nil {
+		return nil, fmt.Errorf("cron job %s created but readback failed", id)
+	}
 	return job, nil
 }
 
@@ -103,7 +113,7 @@ func (s *SQLiteCronStore) ListJobs(ctx context.Context, includeDisabled bool, ag
 	q := `SELECT id, tenant_id, agent_id, user_id, name, enabled, schedule_kind, cron_expression, run_at, timezone,
 		 interval_ms, payload, delete_after_run, stateless, deliver, deliver_channel, deliver_to, wake_heartbeat,
 		 next_run_at, last_run_at, last_status, last_error,
-		 created_at, updated_at FROM cron_jobs WHERE 1=1`
+		 created_at, updated_at, provider_id, model FROM cron_jobs WHERE 1=1`
 
 	var args []any
 
@@ -303,10 +313,22 @@ func (s *SQLiteCronStore) UpdateJob(ctx context.Context, jobID string, patch sto
 	if patch.WakeHeartbeat != nil {
 		updates["wake_heartbeat"] = *patch.WakeHeartbeat
 	}
+	if patch.ProviderID != nil {
+		updates["provider_id"] = *patch.ProviderID
+	}
+	if patch.Model != nil {
+		updates["model"] = *patch.Model
+	}
 
-	if patch.Message != "" {
+	if patch.Message != "" || patch.Command != nil {
 		payload := current.Payload
-		payload.Message = patch.Message
+		if patch.Message != "" {
+			payload.Message = patch.Message
+		}
+		if patch.Command != nil {
+			payload.Kind = store.CronPayloadKindCommand
+			payload.Command = patch.Command
+		}
 		mergedPayload, err := json.Marshal(payload)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal payload for job %s: %w", jobID, err)

@@ -152,6 +152,16 @@ type Message struct {
 	ToolCallID string         `json:"tool_call_id,omitempty"` // for role="tool" responses
 	IsError    bool           `json:"is_error,omitempty"`     // for role="tool" responses
 
+	// ToolName is the originating tool's name for role="tool" messages.
+	// Google Gemini drops tool_call_id entirely and pairs functionCall↔functionResponse
+	// by function name, so its OpenAI-compat shim requires a non-empty
+	// FunctionResponse.name. Carrying the name on the message itself keeps it
+	// recoverable after pruning, truncation or tool_call collapse — all of which
+	// can remove the assistant tool_call that a reverse id→name lookup depends on.
+	// Must match the assistant ToolCall.Name that was sent on the wire (raw name,
+	// not the resolved registry name). Empty on history persisted before this field.
+	ToolName string `json:"tool_name,omitempty"`
+
 	// Phase is a Codex-specific field (gpt-5.3-codex) indicating message purpose.
 	// Values: "commentary" (intermediate), "final_answer" (closeout), or "" (unset).
 	// Must be persisted and passed back in subsequent requests for Codex performance.

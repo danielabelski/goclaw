@@ -41,6 +41,7 @@ import enImportExport from "./locales/en/import-export.json";
 import enV3Capabilities from "./locales/en/v3-capabilities.json";
 import enBackup from "./locales/en/backup.json";
 import enHooks from "./locales/en/hooks.json";
+import enWebhooks from "./locales/en/webhooks.json";
 import enWorkstations from "./locales/en/workstations.json";
 
 // --- VI namespaces ---
@@ -83,7 +84,48 @@ import viImportExport from "./locales/vi/import-export.json";
 import viV3Capabilities from "./locales/vi/v3-capabilities.json";
 import viBackup from "./locales/vi/backup.json";
 import viHooks from "./locales/vi/hooks.json";
+import viWebhooks from "./locales/vi/webhooks.json";
 import viWorkstations from "./locales/vi/workstations.json";
+
+// --- KO namespaces ---
+import koCommon from "./locales/ko/common.json";
+import koSidebar from "./locales/ko/sidebar.json";
+import koTopbar from "./locales/ko/topbar.json";
+import koLogin from "./locales/ko/login.json";
+import koOverview from "./locales/ko/overview.json";
+import koChat from "./locales/ko/chat.json";
+import koAgents from "./locales/ko/agents.json";
+import koTeams from "./locales/ko/teams.json";
+import koSessions from "./locales/ko/sessions.json";
+import koSkills from "./locales/ko/skills.json";
+import koCron from "./locales/ko/cron.json";
+import koConfig from "./locales/ko/config.json";
+import koChannels from "./locales/ko/channels.json";
+import koProviders from "./locales/ko/providers.json";
+import koTraces from "./locales/ko/traces.json";
+import koEvents from "./locales/ko/events.json";
+import koUsage from "./locales/ko/usage.json";
+import koApprovals from "./locales/ko/approvals.json";
+import koNodes from "./locales/ko/nodes.json";
+import koLogs from "./locales/ko/logs.json";
+import koTools from "./locales/ko/tools.json";
+import koMcp from "./locales/ko/mcp.json";
+import koTts from "./locales/ko/tts.json";
+import koSetup from "./locales/ko/setup.json";
+import koMemory from "./locales/ko/memory.json";
+import koVault from "./locales/ko/vault.json";
+import koStorage from "./locales/ko/storage.json";
+import koPendingMessages from "./locales/ko/pending-messages.json";
+import koContacts from "./locales/ko/contacts.json";
+import koActivity from "./locales/ko/activity.json";
+import koApiKeys from "./locales/ko/api-keys.json";
+import koCliCredentials from "./locales/ko/cli-credentials.json";
+import koPackages from "./locales/ko/packages.json";
+import koTenants from "./locales/ko/tenants.json";
+import koSystemSettings from "./locales/ko/system-settings.json";
+import koImportExport from "./locales/ko/import-export.json";
+import koV3Capabilities from "./locales/ko/v3-capabilities.json";
+import koBackup from "./locales/ko/backup.json";
 
 // --- ZH namespaces ---
 import zhCommon from "./locales/zh/common.json";
@@ -125,16 +167,62 @@ import zhImportExport from "./locales/zh/import-export.json";
 import zhV3Capabilities from "./locales/zh/v3-capabilities.json";
 import zhBackup from "./locales/zh/backup.json";
 import zhHooks from "./locales/zh/hooks.json";
+import zhWebhooks from "./locales/zh/webhooks.json";
 import zhWorkstations from "./locales/zh/workstations.json";
+
+// --- RU namespaces ---
+import ruCommon from "./locales/ru/common.json";
+import ruSidebar from "./locales/ru/sidebar.json";
+import ruTopbar from "./locales/ru/topbar.json";
+import ruLogin from "./locales/ru/login.json";
+import ruOverview from "./locales/ru/overview.json";
+import ruChat from "./locales/ru/chat.json";
+import ruAgents from "./locales/ru/agents.json";
+import ruTeams from "./locales/ru/teams.json";
+import ruSessions from "./locales/ru/sessions.json";
+import ruSkills from "./locales/ru/skills.json";
+import ruCron from "./locales/ru/cron.json";
+import ruConfig from "./locales/ru/config.json";
+import ruChannels from "./locales/ru/channels.json";
+import ruProviders from "./locales/ru/providers.json";
+import ruTraces from "./locales/ru/traces.json";
+import ruEvents from "./locales/ru/events.json";
+import ruUsage from "./locales/ru/usage.json";
+import ruApprovals from "./locales/ru/approvals.json";
+import ruNodes from "./locales/ru/nodes.json";
+import ruLogs from "./locales/ru/logs.json";
+import ruTools from "./locales/ru/tools.json";
+import ruMcp from "./locales/ru/mcp.json";
+import ruTts from "./locales/ru/tts.json";
+import ruSetup from "./locales/ru/setup.json";
+import ruMemory from "./locales/ru/memory.json";
+import ruVault from "./locales/ru/vault.json";
+import ruStorage from "./locales/ru/storage.json";
+import ruPendingMessages from "./locales/ru/pending-messages.json";
+import ruContacts from "./locales/ru/contacts.json";
+import ruActivity from "./locales/ru/activity.json";
+import ruApiKeys from "./locales/ru/api-keys.json";
+import ruCliCredentials from "./locales/ru/cli-credentials.json";
+import ruPackages from "./locales/ru/packages.json";
+import ruTenants from "./locales/ru/tenants.json";
+import ruSystemSettings from "./locales/ru/system-settings.json";
+import ruImportExport from "./locales/ru/import-export.json";
+import ruV3Capabilities from "./locales/ru/v3-capabilities.json";
+import ruBackup from "./locales/ru/backup.json";
+import ruHooks from "./locales/ru/hooks.json";
+import ruWebhooks from "./locales/ru/webhooks.json";
+import ruWorkstations from "./locales/ru/workstations.json";
 
 const STORAGE_KEY = "goclaw:language";
 
 function getInitialLanguage(): string {
   const stored = localStorage.getItem(STORAGE_KEY);
-  if (stored === "en" || stored === "vi" || stored === "zh") return stored;
+  if (stored === "en" || stored === "vi" || stored === "zh" || stored === "ko" || stored === "ru") return stored;
   const lang = navigator.language.toLowerCase();
   if (lang.startsWith("vi")) return "vi";
   if (lang.startsWith("zh")) return "zh";
+  if (lang.startsWith("ko")) return "ko";
+  if (lang.startsWith("ru")) return "ru";
   return "en";
 }
 
@@ -148,6 +236,7 @@ const ns = [
   "v3-capabilities",
   "backup",
   "hooks",
+  "webhooks",
   "workstations",
 ] as const;
 
@@ -171,6 +260,7 @@ i18n.use(initReactI18next).init({
       "v3-capabilities": enV3Capabilities,
       backup: enBackup,
       hooks: enHooks,
+      webhooks: enWebhooks,
       workstations: enWorkstations,
     },
     vi: {
@@ -191,6 +281,7 @@ i18n.use(initReactI18next).init({
       "v3-capabilities": viV3Capabilities,
       backup: viBackup,
       hooks: viHooks,
+      webhooks: viWebhooks,
       workstations: viWorkstations,
     },
     zh: {
@@ -211,7 +302,47 @@ i18n.use(initReactI18next).init({
       "v3-capabilities": zhV3Capabilities,
       backup: zhBackup,
       hooks: zhHooks,
+      webhooks: zhWebhooks,
       workstations: zhWorkstations,
+    },
+    ko: {
+      common: koCommon, sidebar: koSidebar, topbar: koTopbar, login: koLogin,
+      overview: koOverview, chat: koChat, agents: koAgents, teams: koTeams,
+      sessions: koSessions, skills: koSkills, cron: koCron, config: koConfig,
+      channels: koChannels, providers: koProviders, traces: koTraces,
+      events: koEvents, usage: koUsage,
+      approvals: koApprovals, nodes: koNodes, logs: koLogs, tools: koTools,
+      mcp: koMcp, tts: koTts, setup: koSetup, memory: koMemory, vault: koVault, storage: koStorage,
+      "pending-messages": koPendingMessages,
+      contacts: koContacts, activity: koActivity, "api-keys": koApiKeys,
+      "cli-credentials": koCliCredentials,
+      packages: koPackages,
+      tenants: koTenants,
+      "system-settings": koSystemSettings,
+      "import-export": koImportExport,
+      "v3-capabilities": koV3Capabilities,
+      backup: koBackup,
+    },
+    ru: {
+      common: ruCommon, sidebar: ruSidebar, topbar: ruTopbar, login: ruLogin,
+      overview: ruOverview, chat: ruChat, agents: ruAgents, teams: ruTeams,
+      sessions: ruSessions, skills: ruSkills, cron: ruCron, config: ruConfig,
+      channels: ruChannels, providers: ruProviders, traces: ruTraces,
+      events: ruEvents, usage: ruUsage,
+      approvals: ruApprovals, nodes: ruNodes, logs: ruLogs, tools: ruTools,
+      mcp: ruMcp, tts: ruTts, setup: ruSetup, memory: ruMemory, vault: ruVault, storage: ruStorage,
+      "pending-messages": ruPendingMessages,
+      contacts: ruContacts, activity: ruActivity, "api-keys": ruApiKeys,
+      "cli-credentials": ruCliCredentials,
+      packages: ruPackages,
+      tenants: ruTenants,
+      "system-settings": ruSystemSettings,
+      "import-export": ruImportExport,
+      "v3-capabilities": ruV3Capabilities,
+      backup: ruBackup,
+      hooks: ruHooks,
+      webhooks: ruWebhooks,
+      workstations: ruWorkstations,
     },
   },
   ns: [...ns],

@@ -6,13 +6,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
 // mockPairingStore is a test implementation of store.PairingStore.
 type mockPairingStore struct {
 	pairedDevices map[string]map[string]bool // senderID -> channel -> paired
-	failIsPaired  bool                        // force IsPaired to return error
+	failIsPaired  bool                       // force IsPaired to return error
 }
 
 func newMockPairingStore() *mockPairingStore {
@@ -65,6 +66,13 @@ func (m *mockPairingStore) setPaired(senderID, channel string) {
 		m.pairedDevices[senderID] = make(map[string]bool)
 	}
 	m.pairedDevices[senderID][channel] = true
+}
+
+// setUnpaired removes a mock paired relationship.
+func (m *mockPairingStore) setUnpaired(senderID, channel string) {
+	if m.pairedDevices[senderID] != nil {
+		delete(m.pairedDevices[senderID], channel)
+	}
 }
 
 // TestCheckDMPolicy_PolicyDisabled rejects all messages.
@@ -142,12 +150,12 @@ func TestCheckDMPolicy_PolicyAllowlist(t *testing.T) {
 // TestCheckDMPolicy_PolicyPairing checks pairing status.
 func TestCheckDMPolicy_PolicyPairing(t *testing.T) {
 	tests := []struct {
-		name              string
-		senderID          string
-		allowList         []string
-		paired            bool
-		failPairingCheck  bool
-		wantResult        PolicyResult
+		name             string
+		senderID         string
+		allowList        []string
+		paired           bool
+		failPairingCheck bool
+		wantResult       PolicyResult
 	}{
 		{
 			name:             "Paired sender is allowed",
@@ -216,6 +224,72 @@ func TestCheckDMPolicy_DefaultToPairing(t *testing.T) {
 
 	if result != PolicyNeedsPairing {
 		t.Errorf("CheckDMPolicy with empty policy defaults to pairing, got %v; want PolicyNeedsPairing", result)
+	}
+}
+
+func TestHandleAuthorizedMessage_PairedDirectMessageBypassesAllowlistSafetyNet(t *testing.T) {
+	msgBus := bus.New()
+	bc := NewBaseChannel(TypeZaloPersonal, msgBus, []string{"195835936795841454"})
+	bc.SetName("zalo-cppai-pm")
+	bc.SetAgentID("cppai-pm")
+
+	ps := newMockPairingStore()
+	ps.setPaired("648444320145379814", "zalo-cppai-pm")
+	bc.SetPairingService(ps)
+
+	if got := bc.CheckDMPolicy(context.Background(), "648444320145379814", "pairing"); got != PolicyAllow {
+		t.Fatalf("CheckDMPolicy(pairing) = %v; want PolicyAllow", got)
+	}
+
+	bc.HandleAuthorizedMessage("648444320145379814", "648444320145379814", "xin chao", nil, nil, "direct")
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	msg, ok := msgBus.ConsumeInbound(ctx)
+	if !ok {
+		t.Fatal("expected paired direct message to publish inbound")
+	}
+	if msg.Channel != "zalo-cppai-pm" {
+		t.Fatalf("Channel = %q; want zalo-cppai-pm", msg.Channel)
+	}
+	if msg.SenderID != "648444320145379814" {
+		t.Fatalf("SenderID = %q; want 648444320145379814", msg.SenderID)
+	}
+	if msg.PeerKind != "direct" {
+		t.Fatalf("PeerKind = %q; want direct", msg.PeerKind)
+	}
+}
+
+func TestHandleMessage_PairedDirectMessageWithoutPolicyCheckStillDrops(t *testing.T) {
+	msgBus := bus.New()
+	bc := NewBaseChannel(TypeZaloPersonal, msgBus, []string{"195835936795841454"})
+	bc.SetName("zalo-cppai-pm")
+
+	ps := newMockPairingStore()
+	ps.setPaired("648444320145379814", "zalo-cppai-pm")
+	bc.SetPairingService(ps)
+
+	bc.HandleMessage("648444320145379814", "648444320145379814", "xin chao", nil, nil, "direct")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if msg, ok := msgBus.ConsumeInbound(ctx); ok {
+		t.Fatalf("expected direct message without explicit policy check to drop, got %+v", msg)
+	}
+}
+
+func TestHandleMessageMedia_UnpairedDirectMessageOutsideAllowlistStillDrops(t *testing.T) {
+	msgBus := bus.New()
+	bc := NewBaseChannel(TypeZaloPersonal, msgBus, []string{"195835936795841454"})
+	bc.SetName("zalo-cppai-pm")
+	bc.SetPairingService(newMockPairingStore())
+
+	bc.HandleMessage("648444320145379814", "648444320145379814", "xin chao", nil, nil, "direct")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if msg, ok := msgBus.ConsumeInbound(ctx); ok {
+		t.Fatalf("expected unpaired direct message outside allowlist to drop, got %+v", msg)
 	}
 }
 
@@ -498,6 +572,59 @@ func TestCheckGroupPolicy_PairingMarksGroupApproved(t *testing.T) {
 		t.Error("Group should be cached as approved after successful pairing check")
 	}
 }
+
+// TestManagerClearGroupApproval verifies the Manager clears the per-channel
+// in-memory approval cache used to short-circuit the pairing gate after a
+// pairing is revoked.
+func TestManagerClearGroupApproval(t *testing.T) {
+	bc := newApprovalChannel("telegram")
+	ps := newMockPairingStore()
+	bc.SetPairingService(ps)
+
+	mgr := NewManager(nil)
+	mgr.RegisterChannel("telegram", bc)
+
+	chatID := "chat_group_1"
+	ps.setPaired("group:"+chatID, "telegram")
+
+	ctx := context.Background()
+	if got := bc.CheckGroupPolicy(ctx, "user1", chatID, "pairing"); got != PolicyAllow {
+		t.Fatalf("paired group policy = %v; want PolicyAllow", got)
+	}
+	if !bc.IsGroupApproved(chatID) {
+		t.Fatal("group should be cached as approved before revocation")
+	}
+
+	// Revoke → cache must be cleared so the next message re-enters the pairing gate.
+	mgr.ClearGroupApproval("telegram", chatID)
+	if bc.IsGroupApproved(chatID) {
+		t.Fatal("group approval cache should be cleared after revocation")
+	}
+
+	// DB row is gone → next policy check must return PolicyNeedsPairing.
+	ps.setUnpaired("group:"+chatID, "telegram")
+	if got := bc.CheckGroupPolicy(ctx, "user1", chatID, "pairing"); got != PolicyNeedsPairing {
+		t.Fatalf("post-revoke group policy = %v; want PolicyNeedsPairing", got)
+	}
+
+	// Unknown channel names are a no-op (no panic).
+	mgr.ClearGroupApproval("nonexistent", chatID)
+}
+
+// approvalChannel wraps BaseChannel so it satisfies channels.Channel in tests.
+type approvalChannel struct {
+	*BaseChannel
+}
+
+func newApprovalChannel(name string) *approvalChannel {
+	return &approvalChannel{BaseChannel: NewBaseChannel(name, nil, nil)}
+}
+
+func (c *approvalChannel) Send(context.Context, bus.OutboundMessage) error { return nil }
+
+func (c *approvalChannel) Start(context.Context) error { return nil }
+
+func (c *approvalChannel) Stop(context.Context) error { return nil }
 
 // TestCheckDMPolicy_AllPolicies_TableDriven comprehensive table test.
 func TestCheckDMPolicy_AllPolicies_TableDriven(t *testing.T) {

@@ -37,6 +37,10 @@ const (
 	ShellDenyGroupsKey contextKey = "goclaw_shell_deny_groups"
 	// AgentKeyKey is the context key for the agent key/name (string identifier, e.g. "default").
 	AgentKeyKey contextKey = "goclaw_agent_key"
+	// AgentContextWindowKey carries the calling agent's configured context window.
+	AgentContextWindowKey contextKey = "goclaw_agent_context_window"
+	// AgentMaxTokensKey carries the calling agent's configured output reserve.
+	AgentMaxTokensKey contextKey = "goclaw_agent_max_tokens"
 	// TenantIDKey is the context key for the tenant UUID.
 	TenantIDKey contextKey = "goclaw_tenant_id"
 	// CrossTenantKey indicates the caller has cross-tenant access (owner/system admin).
@@ -45,6 +49,9 @@ const (
 	TenantSlugKey contextKey = "goclaw_tenant_slug"
 	// RoleKey is the context key for the caller's permission role (e.g. "admin", "operator", "viewer").
 	RoleKey contextKey = "goclaw_role"
+	// AvailableToolNamesKey carries this iteration's policy-resolved tool allowlist
+	// (canonical registry names) so a tool can introspect its own sibling tools.
+	AvailableToolNamesKey contextKey = "goclaw_available_tool_names"
 	// CredentialUserIDKey holds the resolved tenant user identity for credential lookups.
 	// Falls back to UserIDFromContext if not set.
 	CredentialUserIDKey contextKey = "goclaw_credential_user_id"
@@ -137,6 +144,38 @@ func CredentialUserIDFromContext(ctx context.Context) string {
 		return rc.CredentialUserID
 	}
 	return UserIDFromContext(ctx)
+}
+
+// WithAgentContextWindow returns a context carrying the configured agent window.
+func WithAgentContextWindow(ctx context.Context, window int) context.Context {
+	if window <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, AgentContextWindowKey, window)
+}
+
+// AgentContextWindowFromContext returns the configured agent window, or zero.
+func AgentContextWindowFromContext(ctx context.Context) int {
+	if v, ok := ctx.Value(AgentContextWindowKey).(int); ok && v > 0 {
+		return v
+	}
+	return 0
+}
+
+// WithAgentMaxTokens returns a context carrying the configured agent max_tokens.
+func WithAgentMaxTokens(ctx context.Context, maxTokens int) context.Context {
+	if maxTokens <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, AgentMaxTokensKey, maxTokens)
+}
+
+// AgentMaxTokensFromContext returns the configured agent max_tokens, or zero.
+func AgentMaxTokensFromContext(ctx context.Context) int {
+	if v, ok := ctx.Value(AgentMaxTokensKey).(int); ok && v > 0 {
+		return v
+	}
+	return 0
 }
 
 // WithAgentID returns a new context with the given agent UUID.
@@ -459,4 +498,23 @@ func RoleFromContext(ctx context.Context) string {
 		return v
 	}
 	return ""
+}
+
+// WithAvailableToolNames returns a new context carrying this iteration's
+// policy-resolved tool allowlist, so a tool can check whether a sibling tool
+// is available to the calling agent.
+func WithAvailableToolNames(ctx context.Context, names map[string]bool) context.Context {
+	return context.WithValue(ctx, AvailableToolNamesKey, names)
+}
+
+// AvailableToolNamesFromContext extracts the tool allowlist from context.
+// Returns nil when not set — callers MUST treat nil as "no restriction known"
+// (every tool available), matching the same nil convention already used by
+// RunState.Tool.AllowedTools (see ThinkStage.Execute): nil means either the
+// agent has no tool policy configured, or the caller never populated this key
+// at all (e.g. a code path outside the pipeline's per-iteration tool dispatch).
+// Never treat nil as "no tools available".
+func AvailableToolNamesFromContext(ctx context.Context) map[string]bool {
+	v, _ := ctx.Value(AvailableToolNamesKey).(map[string]bool)
+	return v
 }

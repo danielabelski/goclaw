@@ -20,7 +20,7 @@ type providerRow struct {
 	APIBase      string          `json:"api_base" db:"api_base"`
 	APIKey       string          `json:"api_key" db:"api_key"`
 	Enabled      bool            `json:"enabled" db:"enabled"`
-	Settings     json.RawMessage `json:"settings" db:"settings"`
+	Settings     sqliteJSONValue `json:"settings" db:"settings"`
 	CreatedAt    sqliteTime      `json:"created_at" db:"created_at"`
 	UpdatedAt    sqliteTime      `json:"updated_at" db:"updated_at"`
 	TenantID     uuid.UUID       `json:"tenant_id" db:"tenant_id"`
@@ -36,7 +36,7 @@ func (r *providerRow) toLLMProviderData() store.LLMProviderData {
 		APIBase:      r.APIBase,
 		APIKey:       r.APIKey,
 		Enabled:      r.Enabled,
-		Settings:     r.Settings,
+		Settings:     json.RawMessage(r.Settings),
 	}
 }
 
@@ -104,28 +104,30 @@ type mcpServerRow struct {
 	ToolPrefix  *string         `json:"tool_prefix" db:"tool_prefix"`
 	TimeoutSec  int             `json:"timeout_sec" db:"timeout_sec"`
 	Settings    json.RawMessage `json:"settings" db:"settings"`
-	Enabled     bool            `json:"enabled" db:"enabled"`
-	CreatedBy   string          `json:"created_by" db:"created_by"`
-	CreatedAt   sqliteTime      `json:"created_at" db:"created_at"`
-	UpdatedAt   sqliteTime      `json:"updated_at" db:"updated_at"`
+	Enabled        bool       `json:"enabled" db:"enabled"`
+	RequireUserCredentials bool `json:"require_user_credentials" db:"require_user_credentials"`
+	CreatedBy      string     `json:"created_by" db:"created_by"`
+	CreatedAt      sqliteTime `json:"created_at" db:"created_at"`
+	UpdatedAt      sqliteTime `json:"updated_at" db:"updated_at"`
 }
 
 func (r *mcpServerRow) toMCPServerData() store.MCPServerData {
 	return store.MCPServerData{
-		BaseModel:   store.BaseModel{ID: r.ID, CreatedAt: r.CreatedAt.Time, UpdatedAt: r.UpdatedAt.Time},
-		Name:        r.Name,
-		DisplayName: derefStr(r.DisplayName),
-		Transport:   r.Transport,
-		Command:     derefStr(r.Command),
-		Args:        r.Args,
-		URL:         derefStr(r.URL),
-		Headers:     r.Headers,
-		Env:         r.Env,
-		APIKey:      derefStr(r.APIKey),
-		ToolPrefix:  derefStr(r.ToolPrefix),
-		TimeoutSec:  r.TimeoutSec,
-		Settings:    r.Settings,
-		Enabled:     r.Enabled,
-		CreatedBy:   r.CreatedBy,
+		BaseModel:      store.BaseModel{ID: r.ID, CreatedAt: r.CreatedAt.Time, UpdatedAt: r.UpdatedAt.Time},
+		Name:           r.Name,
+		DisplayName:    derefStr(r.DisplayName),
+		Transport:      r.Transport,
+		Command:        derefStr(r.Command),
+		Args:           r.Args,
+		URL:            derefStr(r.URL),
+		Headers:        r.Headers,
+		Env:            r.Env,
+		APIKey:         derefStr(r.APIKey),
+		ToolPrefix:     derefStr(r.ToolPrefix),
+		TimeoutSec:     r.TimeoutSec,
+		Settings:       r.Settings,
+		Enabled:        r.Enabled,
+		RequireUserCredentials: r.RequireUserCredentials,
+		CreatedBy:      r.CreatedBy,
 	}
 }

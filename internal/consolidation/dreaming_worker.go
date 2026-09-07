@@ -33,6 +33,7 @@ type dreamingWorker struct {
 	registry      *providers.Registry     // provider resolution
 	alertDeps     bgalert.AlertDeps
 	usageCaps     *usagecaps.Service
+	agents        store.AgentCRUDStore // for resolving per-agent request budget
 
 	// threshold/debounce are the global defaults. Per-agent overrides come
 	// from resolveConfig which reads the agent's MemoryConfig.Dreaming JSONB.
@@ -164,6 +165,14 @@ func (w *dreamingWorker) Handle(ctx context.Context, event eventbus.DomainEvent)
 	if provider == nil {
 		slog.Warn("dreaming: no provider available", "tenant", event.TenantID, "agent", agentID)
 		return nil
+	}
+
+	// Wire the agent's configured request budget so the synthesis call passes
+	// the agent-only preflight guard instead of failing closed.
+	if agentUUID, perr := uuid.Parse(agentID); perr == nil {
+		ctx = withAgentRequestBudget(ctx, w.agents, agentUUID, "dreaming-synthesis")
+	} else {
+		ctx = withAgentRequestBudget(ctx, w.agents, uuid.Nil, "dreaming-synthesis")
 	}
 
 	// Build LLM prompt and call provider.

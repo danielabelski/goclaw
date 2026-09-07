@@ -21,6 +21,7 @@ import {
   getChannelRemediationMeta,
   getRenderableChannelStatus,
   getChannelStatusMeta,
+  shouldShowChannelDiagnosticsCard,
 } from "../channels-status-view";
 import { useChannelTimeline } from "./channel-detail-timeline-hook";
 import { ChannelDetailDialogs } from "./channel-detail-dialogs";
@@ -69,6 +70,7 @@ export function ChannelDetailPage({
     deleteContextGrant,
     setContextCredentials,
     deleteContextCredentials,
+    refreshDiscordMetadata,
   } = useChannelDetail(instanceId);
   const { agents } = useAgents();
   const { channels } = useChannels();
@@ -139,12 +141,7 @@ export function ChannelDetailPage({
 
   const timelineItems = useChannelTimeline(status, t);
 
-  const showDiagnosticsCard =
-    status?.state === "failed" ||
-    status?.state === "degraded" ||
-    !!status?.remediation ||
-    !!status?.consecutive_failures ||
-    !!status?.first_failed_at;
+  const showDiagnosticsCard = shouldShowChannelDiagnosticsCard(status);
 
   const neutralHealthNote =
     !showDiagnosticsCard &&
@@ -174,7 +171,7 @@ export function ChannelDetailPage({
       />
 
       <div className="p-3 sm:p-4">
-        <div className="max-w-4xl space-y-4">
+        <div className="w-full space-y-4">
           {showDiagnosticsCard && status && (
             <ChannelDiagnosticsCard
               status={status}
@@ -194,7 +191,7 @@ export function ChannelDetailPage({
             </div>
           )}
 
-          <PassiveMemorySection instanceId={instance.id} />
+          <PassiveMemorySection instanceId={instance.id} channelType={instance.channel_type} />
 
           <Tabs value={activeTab} onValueChange={setActiveTab}>
             <TabsList className="w-full justify-start overflow-x-auto overflow-y-hidden">
@@ -293,6 +290,7 @@ export function ChannelDetailPage({
         supportsReauth={supportsReauth}
         onDelete={onDelete}
         onUpdate={updateInstance}
+        onRefreshDiscordMetadata={refreshDiscordMetadata}
       />
     </div>
   );

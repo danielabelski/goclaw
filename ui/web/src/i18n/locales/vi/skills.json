@@ -101,7 +101,9 @@
     "summaryUploaded": "{{count}} đã tải lên",
     "summaryWarnings": "{{count}} cảnh báo",
     "summaryUnchanged": "{{count}} không đổi",
-    "summaryFailed": "{{count}} thất bại"
+    "summaryFailed": "{{count}} thất bại",
+    "securityViolations": "Vi phạm bảo mật:",
+    "violationLine": "Dòng {{line}}: {{reason}}"
   },
   "edit": {
     "title": "Chỉnh sửa skill",
@@ -175,7 +177,11 @@
     "filesShown": "{{shown}} / {{total}} tệp",
     "copyLink": "Copy link",
     "copySuccess": "Đã copy deeplink",
-    "copyFailed": "Không thể copy deeplink"
+    "copyFailed": "Không thể copy deeplink",
+    "editContent": "Chỉnh sửa nội dung",
+    "editContentLoading": "Đang tải...",
+    "editContentSystemHint": "Kỹ năng hệ thống chỉ đọc và không thể chỉnh sửa từ giao diện web.",
+    "editContentLoadFailed": "Không thể tải nội dung kỹ năng để chỉnh sửa"
   },
   "evolution": {
     "tab": "Tự tiến hóa",

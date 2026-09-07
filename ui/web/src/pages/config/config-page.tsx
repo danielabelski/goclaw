@@ -11,6 +11,7 @@ import { useMinLoading } from "@/hooks/use-min-loading";
 import { useDeferredLoading } from "@/hooks/use-deferred-loading";
 import { useIsMobile } from "@/hooks/use-media-query";
 import { ServerSection } from "./sections/server-section";
+import { BrandingSection } from "./sections/branding-section";
 import { BehaviorSection } from "./sections/behavior-section";
 import { AiDefaultsSection } from "./sections/ai-defaults-section";
 import { QuotaSection } from "./sections/quota-section";
@@ -22,10 +23,11 @@ import { TtsSection } from "./sections/tts-section";
 import { CronSection } from "./sections/cron-section";
 import { TelemetrySection } from "./sections/telemetry-section";
 import { BindingsSection } from "./sections/bindings-section";
+import { SystemMessagesSection } from "./sections/system-messages-section";
 
 export function ConfigPage() {
   const { t } = useTranslation("config");
-  const { config, hash, loading, saving, refresh, patch } = useConfig();
+  const { config, schema, hash, loading, saving, refresh, patch } = useConfig();
   const isMobile = useIsMobile();
   const spinning = useMinLoading(loading);
   const showSkeleton = useDeferredLoading(loading && !config);
@@ -99,12 +101,18 @@ export function ConfigPage() {
           <TabsTrigger value="quota">{t("tabs.quota")}</TabsTrigger>
           <TabsTrigger value="tools">{t("tabs.tools")}</TabsTrigger>
           <TabsTrigger value="integrations">{t("tabs.integrations")}</TabsTrigger>
+          <TabsTrigger value="systemMessages">{t("tabs.systemMessages")}</TabsTrigger>
         </TabsList>
 
         <TabsContent value="server" className="space-y-4">
           <ServerSection
             data={config.gateway as any}
             onSave={(v) => patch({ gateway: v })}
+            saving={saving}
+          />
+          <BrandingSection
+            data={config.branding as any}
+            onSave={(v) => patch({ branding: v })}
             saving={saving}
           />
         </TabsContent>
@@ -171,6 +179,15 @@ export function ConfigPage() {
           <BindingsSection
             data={config.bindings as any}
             onSave={(v) => patch({ bindings: v })}
+            saving={saving}
+          />
+        </TabsContent>
+
+        <TabsContent value="systemMessages" className="space-y-4">
+          <SystemMessagesSection
+            data={config.system_messages as any}
+            schema={schema}
+            onSave={(v) => patch({ system_messages: v })}
             saving={saving}
           />
         </TabsContent>

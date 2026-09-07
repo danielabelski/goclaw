@@ -23,6 +23,7 @@ func (c *Config) MaskedCopy() *Config {
 	// Mask provider API keys
 	maskNonEmpty(&cp.Providers.Anthropic.APIKey)
 	maskNonEmpty(&cp.Providers.OpenAI.APIKey)
+	maskNonEmpty(&cp.Providers.AtlasCloud.APIKey)
 	maskNonEmpty(&cp.Providers.APIRoute.APIKey)
 	maskNonEmpty(&cp.Providers.OpenRouter.APIKey)
 	maskNonEmpty(&cp.Providers.Groq.APIKey)
@@ -42,6 +43,7 @@ func (c *Config) MaskedCopy() *Config {
 
 	// Mask gateway token
 	maskNonEmpty(&cp.Gateway.Token)
+	maskNonEmpty(&cp.Gateway.MCPServerToken)
 
 	// Mask channel secrets
 	maskNonEmpty(&cp.Channels.Telegram.Token)
@@ -72,6 +74,7 @@ func (c *Config) StripSecrets() {
 	// Provider API keys
 	c.Providers.Anthropic.APIKey = ""
 	c.Providers.OpenAI.APIKey = ""
+	c.Providers.AtlasCloud.APIKey = ""
 	c.Providers.APIRoute.APIKey = ""
 	c.Providers.OpenRouter.APIKey = ""
 	c.Providers.Groq.APIKey = ""
@@ -91,6 +94,7 @@ func (c *Config) StripSecrets() {
 
 	// Gateway token
 	c.Gateway.Token = ""
+	c.Gateway.MCPServerToken = ""
 
 	// Channel secrets
 	c.Channels.Telegram.Token = ""
@@ -126,6 +130,7 @@ func (c *Config) StripMaskedSecrets() {
 	// Provider API keys
 	stripIfMasked(&c.Providers.Anthropic.APIKey)
 	stripIfMasked(&c.Providers.OpenAI.APIKey)
+	stripIfMasked(&c.Providers.AtlasCloud.APIKey)
 	stripIfMasked(&c.Providers.APIRoute.APIKey)
 	stripIfMasked(&c.Providers.OpenRouter.APIKey)
 	stripIfMasked(&c.Providers.Groq.APIKey)
@@ -145,6 +150,7 @@ func (c *Config) StripMaskedSecrets() {
 
 	// Gateway token
 	stripIfMasked(&c.Gateway.Token)
+	stripIfMasked(&c.Gateway.MCPServerToken)
 
 	// Channel secrets
 	stripIfMasked(&c.Channels.Telegram.Token)
@@ -178,6 +184,7 @@ func (c *Config) ApplyDBSecrets(secrets map[string]string) {
 	}
 
 	apply("gateway.token", &c.Gateway.Token)
+	apply("gateway.mcp_server_token", &c.Gateway.MCPServerToken)
 	apply("tts.openai.api_key", &c.Tts.OpenAI.APIKey)
 	apply("tts.elevenlabs.api_key", &c.Tts.ElevenLabs.APIKey)
 	apply("tts.minimax.api_key", &c.Tts.MiniMax.APIKey)
@@ -197,6 +204,7 @@ func (c *Config) ExtractDBSecrets() map[string]string {
 	}
 
 	collect("gateway.token", c.Gateway.Token)
+	collect("gateway.mcp_server_token", c.Gateway.MCPServerToken)
 	collect("tts.openai.api_key", c.Tts.OpenAI.APIKey)
 	collect("tts.elevenlabs.api_key", c.Tts.ElevenLabs.APIKey)
 	collect("tts.minimax.api_key", c.Tts.MiniMax.APIKey)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"slices"
 
 	"github.com/titanous/json5"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
 	"github.com/nextlevelbuilder/goclaw/internal/i18n"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/systemmessages"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
@@ -254,6 +256,60 @@ func (m *ConfigMethods) handleSchema(_ context.Context, client *gateway.Client, 
 				"type":        "object",
 				"description": "Gateway server settings (host, port, token)",
 			},
+			"branding": map[string]any{
+				"type":        "object",
+				"description": "Public app branding and SEO metadata",
+				"properties": map[string]any{
+					"app_name": map[string]any{
+						"type":        "string",
+						"description": "Application name shown in browser metadata and UI chrome",
+					},
+					"app_short_name": map[string]any{
+						"type":        "string",
+						"description": "Short application name for compact surfaces",
+					},
+					"meta_title": map[string]any{
+						"type":        "string",
+						"description": "HTML document title override",
+					},
+					"meta_description": map[string]any{
+						"type":        "string",
+						"description": "HTML meta description override",
+					},
+					"meta_keywords": map[string]any{
+						"type":        "string",
+						"description": "HTML meta keywords override",
+					},
+					"logo_url": map[string]any{
+						"type":        "string",
+						"description": "Logo URL or uploaded /branding-assets/* path",
+					},
+					"favicon_url": map[string]any{
+						"type":        "string",
+						"description": "Favicon URL or uploaded /branding-assets/* path",
+					},
+					"apple_touch_icon_url": map[string]any{
+						"type":        "string",
+						"description": "Apple touch icon URL or uploaded /branding-assets/* path",
+					},
+					"og_title": map[string]any{
+						"type":        "string",
+						"description": "Open Graph title override",
+					},
+					"og_description": map[string]any{
+						"type":        "string",
+						"description": "Open Graph description override",
+					},
+					"og_image_url": map[string]any{
+						"type":        "string",
+						"description": "Open Graph image URL or uploaded /branding-assets/* path",
+					},
+					"theme_color": map[string]any{
+						"type":        "string",
+						"description": "Browser theme-color value",
+					},
+				},
+			},
 			"tools": map[string]any{
 				"type":        "object",
 				"description": "Tool configuration (browser, exec, web search)",
@@ -301,12 +357,43 @@ func (m *ConfigMethods) handleSchema(_ context.Context, client *gateway.Client, 
 				"type":        "object",
 				"description": "Session storage configuration",
 			},
+			"system_messages": map[string]any{
+				"type":        "object",
+				"description": "Custom operator-facing system messages sent outside normal LLM replies",
+				"properties": map[string]any{
+					"default_locale": map[string]any{
+						"type":        "string",
+						"enum":        []string{"en", "vi", "zh", "ko", "ru"},
+						"description": "Default locale used when a channel caller does not provide a locale",
+					},
+					"messages": map[string]any{
+						"type":        "object",
+						"description": "Message template overrides keyed by message key and locale",
+					},
+				},
+				"definitions": systemMessageSchemaDefinitions(),
+			},
 		},
 	}
 
 	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"json": schema,
 	}))
+}
+
+func systemMessageSchemaDefinitions() []systemmessages.Definition {
+	defaults := systemmessages.Defaults()
+	keys := make([]string, 0, len(defaults))
+	for key := range defaults {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+
+	defs := make([]systemmessages.Definition, 0, len(keys))
+	for _, key := range keys {
+		defs = append(defs, defaults[key])
+	}
+	return defs
 }
 
 // saveSecretsToStore extracts non-LLM/non-channel secrets from the config

@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/google/uuid"
@@ -15,17 +16,18 @@ import (
 // the ProviderResolver interface consumed by PromptHandler. It applies a
 // simple fallback chain:
 //
-//  1. Explicit model alias → map to provider by convention (haiku/sonnet/opus → anthropic).
-//  2. System config `hooks.prompt.provider` / `hooks.prompt.model`.
-//  3. System config `background.provider` / `background.model`.
-//  4. First registered provider for the tenant.
+//  1. Explicit provider + model from the hook config.
+//  2. Legacy explicit model alias → map to provider by convention.
+//  3. System config `hooks.prompt.provider` / `hooks.prompt.model`.
+//  4. System config `background.provider` / `background.model`.
+//  5. First registered provider for the tenant.
 //
 // Keeping this adapter in `handlers` rather than the higher-level
 // `providerresolve` package avoids a new import cycle (providerresolve →
 // store → hooks would introduce a diamond).
 type RegistryResolver struct {
-	Registry   *providers.Registry
-	SysConfig  store.SystemConfigStore
+	Registry                *providers.Registry
+	SysConfig               store.SystemConfigStore
 	DefaultProviderForAlias func(alias string) string
 }
 
@@ -33,19 +35,36 @@ type RegistryResolver struct {
 // registry MUST be non-nil. sysConfig may be nil (fallback to step 4 only).
 func NewRegistryResolver(registry *providers.Registry, sysConfig store.SystemConfigStore) *RegistryResolver {
 	return &RegistryResolver{
-		Registry:               registry,
-		SysConfig:              sysConfig,
+		Registry:                registry,
+		SysConfig:               sysConfig,
 		DefaultProviderForAlias: defaultProviderForAlias,
 	}
 }
 
 // ResolveForHook implements ProviderResolver.
-func (r *RegistryResolver) ResolveForHook(ctx context.Context, tenantID uuid.UUID, preferredModel string) (providers.Provider, string, error) {
+func (r *RegistryResolver) ResolveForHook(ctx context.Context, tenantID uuid.UUID, preferredProvider, preferredModel string) (providers.Provider, string, error) {
 	if r == nil || r.Registry == nil {
 		return nil, "", errors.New("hook resolver: nil registry")
 	}
 
-	// Step 1: explicit alias → provider name.
+	// Step 1: an explicit provider is authoritative. Never silently route its
+	// model to another provider when a hook is misconfigured.
+	if providerName := strings.TrimSpace(preferredProvider); providerName != "" {
+		p, err := r.Registry.GetForTenant(tenantID, providerName)
+		if err != nil {
+			return nil, "", fmt.Errorf("hook resolver: configured provider %q: %w", providerName, err)
+		}
+		if p == nil {
+			return nil, "", fmt.Errorf("hook resolver: configured provider %q returned nil", providerName)
+		}
+		model := strings.TrimSpace(preferredModel)
+		if model == "" {
+			model = p.DefaultModel()
+		}
+		return p, model, nil
+	}
+
+	// Step 2: legacy explicit alias → provider name.
 	if preferredModel != "" {
 		if name := r.providerForAlias(preferredModel); name != "" {
 			if p, err := r.Registry.GetForTenant(tenantID, name); err == nil && p != nil {
@@ -54,18 +73,19 @@ func (r *RegistryResolver) ResolveForHook(ctx context.Context, tenantID uuid.UUI
 		}
 	}
 
-	// Step 2: system config hooks.prompt.*
+	// Step 3: system config hooks.prompt.*
 	configs := r.loadConfigs(ctx, tenantID)
 	if p, m, ok := r.tryConfig(tenantID, configs["hooks.prompt.provider"], configs["hooks.prompt.model"], preferredModel); ok {
 		return p, m, nil
 	}
 
-	// Step 3: fall back to background.*
+	// Step 4: fall back to background.*
 	if p, m, ok := r.tryConfig(tenantID, configs["background.provider"], configs["background.model"], preferredModel); ok {
 		return p, m, nil
 	}
 
-	// Step 4: first registered provider for the tenant.
+	// Step 5: first registered provider for the tenant. This path remains only
+	// for backward compatibility with hooks that predate explicit providers.
 	names := r.Registry.ListForTenant(tenantID)
 	if len(names) == 0 {
 		return nil, "", errors.New("hook resolver: no providers registered for tenant")

@@ -32,6 +32,7 @@ func wireExtraTools(
 	agentCfg config.AgentDefaults,
 	globalSkillsDir string,
 	builtinSkillsDir string,
+	cronCommandEnabled bool,
 ) (heartbeatTool *tools.HeartbeatTool, hasMemory bool) {
 	// web_search: tenant-scoped resolve requires stores + msgBus — register here.
 	toolsReg.Register(tools.NewWebSearchTool(pgStores.ConfigSecrets, msgBus))
@@ -42,7 +43,10 @@ func wireExtraTools(
 	toolsReg.Register(tools.NewWaitTool())
 
 	// Cron tool (agent-facing)
-	toolsReg.Register(tools.NewCronTool(pgStores.Cron))
+	cronTool := tools.NewCronTool(pgStores.Cron)
+	cronTool.SetProviderStore(pgStores.Providers)
+	cronTool.SetCommandEnabled(cronCommandEnabled)
+	toolsReg.Register(cronTool)
 	slog.Info("cron tool registered")
 
 	// Heartbeat tool (agent-facing)
@@ -63,7 +67,15 @@ func wireExtraTools(
 	toolsReg.Register(tools.NewSendFileTool(workspace, agentCfg.RestrictToWorkspace))
 	// Group members tool (list members in group chats)
 	toolsReg.Register(tools.NewListGroupMembersTool())
-	slog.Info("session + message + send_file tools registered")
+	// Zalo group list tool (resolve a group's real chat ID from its display name)
+	toolsReg.Register(tools.NewListGroupsTool())
+	// Telegram manager tool (admin/forum/message management; gated by tool policy)
+	// create_forum_topic is kept as a backward-compatible wrapper for topic.create.
+	toolsReg.Register(tools.NewCreateForumTopicTool(nil))
+	toolsReg.Register(tools.NewTelegramManagerTool())
+	// MCP credential manager tool (view and manage per-user MCP credentials)
+	toolsReg.Register(tools.NewMCPCredentialManagerTool())
+	slog.Info("session + message + send_file + telegram_manager + mcp_credential_manager tools registered")
 
 	// Register legacy tool aliases (backward-compat names from policy.go).
 	for alias, canonical := range tools.LegacyToolAliases() {
@@ -95,46 +107,30 @@ func wireExtraTools(
 	if pgStores.Skills != nil {
 		skillsAllowPaths = append(skillsAllowPaths, pgStores.Skills.Dirs()...)
 	}
-	// Expand user-configured allowed paths (for cross-drive access on Windows).
-	// These paths are validated per-request in resolvePath for tenant isolation.
-	var userAllowPaths []string
-	for _, p := range agentCfg.AllowedPaths {
-		expanded := config.ExpandHome(p)
-		if expanded != "" {
-			userAllowPaths = append(userAllowPaths, expanded)
-		}
-	}
-
 	if readTool, ok := toolsReg.Get("read_file"); ok {
 		if pa, ok := readTool.(tools.PathAllowable); ok {
 			pa.AllowPaths(skillsAllowPaths...)
 			pa.AllowPaths(filepath.Join(dataDir, "cli-workspaces"))
-			pa.AllowPaths(userAllowPaths...)
 		}
 	}
 	if listTool, ok := toolsReg.Get("list_files"); ok {
 		if pa, ok := listTool.(tools.PathAllowable); ok {
 			pa.AllowPaths(skillsAllowPaths...)
-			pa.AllowPaths(userAllowPaths...)
-		}
-	}
-	// Write and edit tools also get user-configured allowed paths for cross-drive access.
-	if writeTool, ok := toolsReg.Get("write_file"); ok {
-		if pa, ok := writeTool.(tools.PathAllowable); ok {
-			pa.AllowPaths(userAllowPaths...)
-		}
-	}
-	if editTool, ok := toolsReg.Get("edit"); ok {
-		if pa, ok := editTool.(tools.PathAllowable); ok {
-			pa.AllowPaths(userAllowPaths...)
 		}
 	}
 	if sendFileTool, ok := toolsReg.Get("send_file"); ok {
 		if pa, ok := sendFileTool.(tools.PathAllowable); ok {
 			pa.AllowPaths(skillsAllowPaths...)
-			pa.AllowPaths(userAllowPaths...)
 		}
 	}
+
+	// User-configured allowed paths (config agents.defaults.allowed_paths, for
+	// cross-drive access on Windows and shared dirs outside the workspace).
+	// Applied via a helper so cmd/gateway.go can re-apply it after
+	// ApplySystemConfigs overlays system_configs['allowed_paths'] — see
+	// applyUserAllowedPaths. Paths are validated per-request in resolvePath for
+	// tenant isolation.
+	applyUserAllowedPaths(toolsReg, agentCfg.AllowedPaths)
 
 	// Memory tools are PG-backed; always available.
 	hasMemory = true
@@ -158,6 +154,39 @@ func wireExtraTools(
 	}
 
 	return heartbeatTool, hasMemory
+}
+
+// fsAllowPathTools are the filesystem tools that honour user-configured allowed
+// paths beyond the agent workspace (config agents.defaults.allowed_paths).
+var fsAllowPathTools = []string{"read_file", "list_files", "write_file", "edit", "send_file"}
+
+// applyUserAllowedPaths grants the user-configured allowed paths to the
+// filesystem tools. ExpandHome resolves a leading "~".
+//
+// Called twice during startup: once while tools are wired (from config.json),
+// and again from cmd/gateway.go after ApplySystemConfigs overlays
+// system_configs['allowed_paths']. Tool wiring runs before that overlay, so
+// without the re-apply DB-driven allowed paths never reach the tools — the
+// AllowPaths analogue of the rate-limiter re-apply (#1111). Safe to call
+// repeatedly: AllowPaths is additive and the prefix check is membership-based,
+// so a duplicated prefix is harmless.
+func applyUserAllowedPaths(toolsReg *tools.Registry, allowedPaths []string) {
+	var paths []string
+	for _, p := range allowedPaths {
+		if expanded := config.ExpandHome(p); expanded != "" {
+			paths = append(paths, expanded)
+		}
+	}
+	if len(paths) == 0 {
+		return
+	}
+	for _, name := range fsAllowPathTools {
+		if t, ok := toolsReg.Get(name); ok {
+			if pa, ok := t.(tools.PathAllowable); ok {
+				pa.AllowPaths(paths...)
+			}
+		}
+	}
 }
 
 // wireWorkstationTools registers workstation_exec and claude_remote tools (Standard edition only).

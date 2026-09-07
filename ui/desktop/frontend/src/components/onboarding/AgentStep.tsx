@@ -1,6 +1,7 @@
-import { useState, useMemo, useEffect } from 'react'
+import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import { getApiClient } from '../../lib/api'
+import { slugify, isValidSlug } from '../../lib/slug'
 import { agentService } from '../../services/agent-service'
 
 import { SummoningModal } from './SummoningModal'
@@ -28,6 +29,13 @@ export function AgentStep({ provider, model, onBack, onComplete }: AgentStepProp
   const { t } = useTranslation(['desktop', 'agents', 'common'])
   const [selectedPresetIdx, setSelectedPresetIdx] = useState<number>(0)
   const [description, setDescription] = useState('')
+  // Identity is editable state, only *prefilled* from the selected preset. It must
+  // survive description edits — deselecting a preset never rewrites the name/key.
+  const [displayName, setDisplayName] = useState('')
+  const [agentKey, setAgentKey] = useState('')
+  const [displayNameEdited, setDisplayNameEdited] = useState(false)
+  const [agentKeyEdited, setAgentKeyEdited] = useState(false)
+  const [emoji, setEmoji] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [createdAgent, setCreatedAgent] = useState<{ id: string; name: string } | null>(null)
@@ -39,62 +47,87 @@ export function AgentStep({ provider, model, onBack, onComplete }: AgentStepProp
     return t(`${preset.ns}:presets.${preset.key}.prompt`)
   }
 
-  // Init description from first preset
+  // Label format: "🦊 Fox Spirit" — the display name drops the emoji prefix
+  function getPresetName(idx: number): string {
+    const preset = PRESET_KEYS[idx]
+    if (!preset) return ''
+    const label = t(`${preset.ns}:presets.${preset.key}.label`) as string
+    return label.replace(/^\S+\s+/, '').trim() || label.trim()
+  }
+
+  // Init key + emoji from the first preset; name and prompt are filled by the
+  // locale-sync effects below.
   useEffect(() => {
-    if (!description) setDescription(getPresetPrompt(0))
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    setAgentKey(PRESET_KEYS[0].agentKey)
+    setEmoji(PRESET_KEYS[0].emoji)
   }, [])
 
-  const displayName = useMemo(() => {
-    const preset = PRESET_KEYS[selectedPresetIdx]
-    if (preset) {
-      const label = t(`${preset.ns}:presets.${preset.key}.label`) as string
-      // Label format: "🦊 Fox Spirit" — strip emoji prefix
-      return label.replace(/^\S+\s*/, '')
-    }
-    return 'Fox Spirit'
-  }, [selectedPresetIdx, t])
+  const presetPrompt = selectedPresetIdx >= 0 ? getPresetPrompt(selectedPresetIdx) : undefined
+  const presetName = selectedPresetIdx >= 0 ? getPresetName(selectedPresetIdx) : undefined
 
-  // Agent key: stable English slug, never translated
-  const agentKey = useMemo(() => {
-    const preset = PRESET_KEYS[selectedPresetIdx]
-    return preset?.agentKey ?? 'little-fox'
-  }, [selectedPresetIdx])
-  const selectedEmoji = PRESET_KEYS[selectedPresetIdx]?.emoji ?? '🦊'
-
-  // Sync description when preset changes
+  // Language-aware re-sync: while a preset is active and the field is untouched,
+  // follow the translated preset text. Deps are plain strings, so this only fires
+  // when the translation actually changes (locale switch), not on every render.
   useEffect(() => {
-    if (selectedPresetIdx >= 0) {
-      setDescription(getPresetPrompt(selectedPresetIdx))
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedPresetIdx])
+    if (presetPrompt === undefined) return
+    setDescription(presetPrompt)
+  }, [presetPrompt])
+
+  useEffect(() => {
+    if (presetName === undefined || displayNameEdited) return
+    setDisplayName(presetName)
+  }, [presetName, displayNameEdited])
+
+  const trimmedName = displayName.trim()
+  const keyValid = isValidSlug(agentKey)
+  const canSubmit = !!trimmedName && keyValid && !!description.trim()
+
+  const handleSelectPreset = (idx: number) => {
+    const preset = PRESET_KEYS[idx]
+    if (!preset) return
+    setSelectedPresetIdx(idx)
+    setDescription(getPresetPrompt(idx))
+    setDisplayName(getPresetName(idx))
+    setDisplayNameEdited(false)
+    setEmoji(preset.emoji)
+    setAgentKey(preset.agentKey)
+    setAgentKeyEdited(false)
+  }
 
   const handleDescriptionChange = (value: string) => {
     setDescription(value)
-    if (selectedPresetIdx >= 0) {
-      const presetPrompt = getPresetPrompt(selectedPresetIdx)
-      if (value !== presetPrompt) setSelectedPresetIdx(-1)
-    }
+    // Editing the prompt only clears the preset highlight — identity stays as typed.
+    if (selectedPresetIdx >= 0 && value !== presetPrompt) setSelectedPresetIdx(-1)
+  }
+
+  const handleDisplayNameChange = (value: string) => {
+    setDisplayNameEdited(true)
+    setDisplayName(value)
+    if (!agentKeyEdited) setAgentKey(slugify(value))
+  }
+
+  const handleAgentKeyChange = (value: string) => {
+    setAgentKeyEdited(true)
+    setAgentKey(value)
   }
 
   const handleSubmit = async () => {
-    if (!description.trim()) return
+    if (!canSubmit) return
     setLoading(true)
     setError('')
     try {
       const result = await getApiClient().post<{ id: string }>('/v1/agents', {
         agent_key: agentKey,
-        display_name: displayName.trim() || undefined,
+        display_name: trimmedName,
         provider: provider.name,
         model: model || '',
         agent_type: 'predefined',
         is_default: true,
         // Promoted fields at top level — agent_description triggers summoning on backend
         agent_description: description.trim() || null,
-        emoji: selectedEmoji || null,
+        emoji: emoji.trim() || null,
       })
-      setCreatedAgent({ id: result.id, name: displayName.trim() || agentKey })
+      setCreatedAgent({ id: result.id, name: trimmedName || agentKey })
     } catch (err) {
       setError(err instanceof Error ? err.message : t('common:failedToCreateAgent'))
     } finally {
@@ -140,6 +173,50 @@ export function AgentStep({ provider, model, onBack, onComplete }: AgentStepProp
         )}
       </div>
 
+      {/* Agent identity — editable name + key, prefilled from the preset */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div className="space-y-1.5">
+          <label htmlFor="onboard-agent-name" className="block text-sm font-medium text-text-secondary">
+            {t('agents:create.displayName')}
+          </label>
+          <div className="flex gap-2">
+            <input
+              id="onboard-agent-emoji"
+              value={emoji}
+              onChange={(e) => setEmoji(e.target.value)}
+              maxLength={2}
+              placeholder="🤖"
+              title={t('agents:create.emojiHint')}
+              className="w-14 shrink-0 text-center w-full bg-surface-tertiary border border-border rounded-lg px-3 py-2.5 text-base md:text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-1 focus:ring-accent"
+            />
+            <input
+              id="onboard-agent-name"
+              value={displayName}
+              onChange={(e) => handleDisplayNameChange(e.target.value)}
+              placeholder={t('agents:create.displayNamePlaceholder')}
+              className="w-full bg-surface-tertiary border border-border rounded-lg px-3 py-2.5 text-base md:text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-1 focus:ring-accent"
+            />
+          </div>
+        </div>
+
+        <div className="space-y-1.5">
+          <label htmlFor="onboard-agent-key" className="block text-sm font-medium text-text-secondary">
+            {t('agents:create.agentKey')}
+          </label>
+          <input
+            id="onboard-agent-key"
+            value={agentKey}
+            onChange={(e) => handleAgentKeyChange(e.target.value)}
+            onBlur={(e) => setAgentKey(slugify(e.target.value))}
+            placeholder={t('agents:create.agentKeyPlaceholder')}
+            className="w-full bg-surface-tertiary border border-border rounded-lg px-3 py-2.5 text-base md:text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-1 focus:ring-accent"
+          />
+          <p className={agentKey && !keyValid ? 'text-xs text-error' : 'text-xs text-text-muted'}>
+            {t('agents:create.agentKeyHint')}
+          </p>
+        </div>
+      </div>
+
       {/* Preset personality buttons */}
       <div className="space-y-2">
         <label className="block text-sm font-medium text-text-secondary">{t('agents:detail.personality')}</label>
@@ -148,7 +225,7 @@ export function AgentStep({ provider, model, onBack, onComplete }: AgentStepProp
             <button
               key={preset.key}
               type="button"
-              onClick={() => setSelectedPresetIdx(idx)}
+              onClick={() => handleSelectPreset(idx)}
               className={[
                 'cursor-pointer rounded-full border px-3 py-1 text-xs transition-colors',
                 selectedPresetIdx === idx
@@ -185,7 +262,7 @@ export function AgentStep({ provider, model, onBack, onComplete }: AgentStepProp
         </button>
         <button
           onClick={handleSubmit}
-          disabled={loading || !description.trim()}
+          disabled={loading || !canSubmit}
           className="px-6 py-2.5 bg-accent text-white rounded-lg font-medium hover:bg-accent-hover transition-colors disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2"
         >
           {loading && <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />}

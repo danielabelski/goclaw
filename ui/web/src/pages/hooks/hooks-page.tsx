@@ -23,53 +23,13 @@ import { HookTestPanel } from "./components/hook-test-panel";
 import { HookOverviewTab } from "./components/hook-overview-tab";
 import { HookHistoryTable } from "./components/hook-history-table";
 import { BetaInfoCard } from "./components/beta-info-card";
+import { buildHookConfig } from "./hook-form-config";
 import type { HookFormData } from "@/schemas/hooks.schema";
 
 const HOOK_EVENTS = [
   "session_start", "user_prompt_submit", "pre_tool_use",
-  "post_tool_use", "stop", "subagent_start", "subagent_stop",
+  "post_tool_use", "post_model_response", "stop", "subagent_start", "subagent_stop",
 ] as const;
-
-// parseHeaders accepts an empty string, an empty object string, or a JSON
-// object. Returns {} for empty/whitespace-only input. Throws a typed Error
-// with a friendly message on malformed JSON so the caller can surface via toast.
-function parseHeaders(raw: string | undefined): Record<string, unknown> {
-  const trimmed = (raw ?? "").trim();
-  if (!trimmed) return {};
-  try {
-    const parsed = JSON.parse(trimmed);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-    throw new Error("headers must be a JSON object");
-  } catch (err) {
-    // eslint-disable-next-line preserve-caught-error -- JSON.parse error message already captured verbatim in thrown message
-    throw new Error(
-      "Invalid headers JSON: " + (err instanceof Error ? err.message : String(err)),
-    );
-  }
-}
-
-function buildConfig(data: HookFormData): Record<string, unknown> {
-  if (data.handler_type === "http") {
-    return {
-      url: data.url ?? "",
-      method: data.method ?? "POST",
-      headers: parseHeaders(data.headers),
-      body_template: data.body_template ?? "",
-    };
-  }
-  if (data.handler_type === "script") {
-    // Backend goja handler reads cfg.Config.source (Phase 03). Zod caps at 32 KiB.
-    return { source: data.script_source ?? "" };
-  }
-  // prompt
-  return {
-    prompt_template: data.prompt_template ?? "",
-    model: data.model ?? "haiku",
-    max_invocations_per_turn: data.max_invocations_per_turn ?? 5,
-  };
-}
 
 export function HooksPage() {
   // Route params — single source of truth (CLAUDE.md)
@@ -114,7 +74,7 @@ export function HooksPage() {
   const handleCreate = async (data: HookFormData) => {
     let config: Record<string, unknown>;
     try {
-      config = buildConfig(data);
+      config = buildHookConfig(data);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
       return;
@@ -139,7 +99,7 @@ export function HooksPage() {
     if (!editTarget) return;
     let config: Record<string, unknown>;
     try {
-      config = buildConfig(data);
+      config = buildHookConfig(data);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
       return;

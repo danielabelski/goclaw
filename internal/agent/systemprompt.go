@@ -186,7 +186,7 @@ var coreToolSummaries = map[string]string{
 	"send_file":              "Send an EXISTING workspace file as a chat attachment — use to resend/share files; does NOT create or modify the file (use write_file for that)",
 	"list_files":             "List directory contents",
 	"exec":                   "Run shell commands",
-	"memory_search":          "Search indexed memory files (MEMORY.md + memory/*.md)",
+	"memory_search":          "Search memory docs + episodic memory; time filters for dates/recency",
 	"memory_get":             "Read specific sections of memory files",
 	"spawn":                  "Spawn a self-clone subagent to handle a task in the background",
 	"web_search":             "Search the web",
@@ -207,7 +207,7 @@ var coreToolSummaries = map[string]string{
 	"session_status":         "Show session status (model, tokens, compaction count)",
 	"sessions_history":       "Fetch message history for a session",
 	"sessions_send":          "Send a message into another session",
-	"read_image":             "Analyze images — call with path from <media:image> tags, or a direct HTTP/HTTPS URL via the 'url' parameter",
+	"read_image":             "Analyze images — use the exact logical path from <media:image> tags; media_id and direct HTTP/HTTPS URLs are also supported",
 	"read_audio":             "Analyze audio — call with media_id from <media:audio> tags",
 	"read_video":             "Analyze video — call with media_id from <media:video> tags, or a direct HTTP/HTTPS URL via the 'url' parameter",
 	"create_video":           "Generate videos from text descriptions using AI",
@@ -217,6 +217,7 @@ var coreToolSummaries = map[string]string{
 	"knowledge_graph_search": "Find people, projects, and their connections — use for relationship questions (who works with whom, project dependencies) that memory_search may miss",
 	"team_tasks":             "Team task board — track progress, manage dependencies (spawn auto-creates delegation tasks)",
 	"list_group_members":     "List all members of the current group chat (Feishu/Lark only)",
+	"zalo_list_groups":       "List all Zalo groups the account belongs to (group_id + name) — resolve a group's real ID before sending/forwarding to it by name (Zalo only)",
 	"create_forum_topic":     "Create a forum topic in a Telegram supergroup",
 	"delegate":               "Delegate a task to a linked agent (requires agent_links). See ## Delegation Targets for available agents",
 	"memory_expand":          "Retrieve full session details from episodic memory results — use after memory_search returns episodic hits",
@@ -383,11 +384,17 @@ func BuildSystemPrompt(cfg SystemPromptConfig) string {
 	}
 
 	// 4. ## Skills — full + task (pinned skills use hybrid section)
-	if (isFull || isTask) && !cfg.IsBootstrap && (cfg.SkillsSummary != "" || cfg.HasSkillSearch || cfg.HasSkillManage || cfg.PinnedSkillsSummary != "") {
-		if cfg.PinnedSkillsSummary != "" {
-			// Hybrid mode: pinned skills inline + search for rest
-			lines = append(lines, buildSkillsHybridSection(cfg.PinnedSkillsSummary, cfg.HasSkillSearch, isFull && cfg.HasSkillManage)...)
-		} else if isTask {
+	// Pinned skills must always be inlined, even on bootstrap turns — only the
+	// search/manage guidance and non-pinned skill summary are suppressed then.
+	switch {
+	case (isFull || isTask) && cfg.PinnedSkillsSummary != "" && cfg.IsBootstrap:
+		// Bootstrap: pinned skills only, no search/manage guidance.
+		lines = append(lines, buildSkillsHybridSection(cfg.PinnedSkillsSummary, false, false)...)
+	case (isFull || isTask) && !cfg.IsBootstrap && cfg.PinnedSkillsSummary != "":
+		// Hybrid mode: pinned skills inline + search for rest
+		lines = append(lines, buildSkillsHybridSection(cfg.PinnedSkillsSummary, cfg.HasSkillSearch, isFull && cfg.HasSkillManage)...)
+	case (isFull || isTask) && !cfg.IsBootstrap && (cfg.SkillsSummary != "" || cfg.HasSkillSearch || cfg.HasSkillManage):
+		if isTask {
 			// Task mode without pinned: search-only
 			lines = append(lines, buildSkillsSection("", cfg.HasSkillSearch, false)...)
 		} else {
@@ -396,7 +403,7 @@ func BuildSystemPrompt(cfg SystemPromptConfig) string {
 	}
 
 	// 4.1. Pinned skills — minimal/none mode standalone (pinned skills are explicitly chosen, always relevant)
-	if (isMinimal || isNone) && !cfg.IsBootstrap && cfg.PinnedSkillsSummary != "" {
+	if (isMinimal || isNone) && cfg.PinnedSkillsSummary != "" {
 		lines = append(lines, buildPinnedSkillsMinimalSection(cfg.PinnedSkillsSummary)...)
 	}
 
@@ -431,11 +438,6 @@ func BuildSystemPrompt(cfg SystemPromptConfig) string {
 	// None mode skips team sections entirely — identity-only prompt has no team awareness.
 	if !isNone && !cfg.IsBootstrap && cfg.IsTeamContext && hasTeamWorkspace(cfg.ToolNames) {
 		lines = append(lines, buildTeamWorkspaceSection(cfg.TeamWorkspace)...)
-	}
-
-	// 6.4. ## Team Members — inject roster so agent knows who to assign tasks to
-	if !isNone && !cfg.IsBootstrap && cfg.IsTeamContext && len(cfg.TeamMembers) > 0 {
-		lines = append(lines, buildTeamMembersSection(cfg.TeamMembers, cfg.TeamGuidance)...)
 	}
 
 	// 6.45. ## Delegation Targets — from agent_links (ModeDelegate or ModeTeam with targets)
@@ -611,6 +613,10 @@ func sanitizePromptContextValue(value string) string {
 // --- Section builders ---
 
 func buildToolingSection(toolNames []string, hasSandbox bool, shellDenyGroups map[string]bool) []string {
+	if len(toolNames) == 0 {
+		return nil
+	}
+
 	lines := []string{
 		"## Tooling",
 		"",
@@ -667,7 +673,7 @@ func buildToolingSection(toolNames []string, hasSandbox bool, shellDenyGroups ma
 		lines = append(lines,
 			"",
 			"### Media Files",
-			`When users send media (<media:image path="...">, <media:video id="...">, <media:audio id="...">, <media:document path="...">), use the corresponding read_* tool with the path/media_id. For archives (.zip, .tar.gz, etc.), use exec with the document path to inspect/extract the archive.`,
+			`When users send media (<media:image id="..." path="...">, <media:video id="...">, <media:audio id="...">, <media:document path="...">), use the corresponding read_* tool with the exact path/media_id from the tag. Never reconstruct or guess an absolute workspace path. For archives (.zip, .tar.gz, etc.), use exec with the document path to inspect/extract the archive.`,
 			"You have full vision/audio/video capabilities. NEVER say you cannot see images or files.",
 		)
 	}
@@ -711,29 +717,14 @@ func buildSkillsSection(skillsSummary string, hasSkillSearch, hasSkillManage boo
 	if skillsSummary != "" {
 		// Inline mode: skills XML is in the prompt (like TS).
 		// Agent scans <available_skills> descriptions directly.
-		lines = append(lines,
-			"## Skills (mandatory)",
-			"",
-			"Before replying, scan `<available_skills>` below.",
-			"If a skill clearly applies, read its SKILL.md at the `<location>` path with `read_file`, then follow it.",
-			"If multiple could apply, choose the most specific one. Never read more than one skill up front.",
-			"If none apply, proceed normally.",
-			"",
-			skillsSummary,
-			"",
-		)
+		lines = append(lines, "## Skills (mandatory)", "")
+		lines = append(lines, skillLoadingProtocolLines()...)
+		lines = append(lines, skillsSummary, "")
 	} else if hasSkillSearch {
 		// Search mode: too many skills to inline, agent uses skill_search tool.
+		lines = append(lines, "## Skills (mandatory)", "")
+		lines = append(lines, skillLoadingProtocolLines()...)
 		lines = append(lines,
-			"## Skills (mandatory)",
-			"",
-			"Before replying, check if a skill applies:",
-			"1. Run `skill_search` with **English keywords** describing the domain (e.g. \"weather\", \"translate\", \"github\").",
-			"   Even if the user writes in another language, always search in English.",
-			"2. If a match is found, read its SKILL.md at the returned `location` with `read_file`, then follow it.",
-			"3. If multiple skills match, choose the most specific one. Never read more than one skill up front.",
-			"4. If no match, proceed normally.",
-			"",
 			"Constraints:",
 			"- Prefer `skill_search` over `browser` or `web_search` when the domain might have a skill.",
 			"- If skill_search returns no results, fall back to other tools freely.",

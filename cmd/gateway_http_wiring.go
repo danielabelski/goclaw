@@ -16,6 +16,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/store/pg"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
+	"github.com/nextlevelbuilder/goclaw/internal/webhooks"
 )
 
 // httpHandlers bundles the results of wireHTTP() for passing to wireHTTPHandlersOnServer.
@@ -32,6 +33,7 @@ type httpHandlers struct {
 	secureCLI        *httpapi.SecureCLIHandler
 	secureCLIGrant   *httpapi.SecureCLIGrantHandler
 	mcpUserCreds     *httpapi.MCPUserCredentialsHandler
+	mcpOAuth         *httpapi.MCPOAuthHandler
 }
 
 // wireHTTPHandlersOnServer registers all HTTP handler objects onto the gateway server.
@@ -64,10 +66,13 @@ func (d *gatewayDeps) wireHTTPHandlersOnServer(
 		d.server.SetMCPHandler(h.mcp)
 	}
 	if h.mcpUserCreds != nil {
-		if mcpPool != nil {
-			h.mcpUserCreds.SetPoolEvictor(mcpPool)
-		}
 		d.server.SetMCPUserCredentialsHandler(h.mcpUserCreds)
+	}
+	if h.mcpOAuth != nil {
+		if mcpPool != nil {
+			h.mcpOAuth.SetEvictor(mcpPool)
+		}
+		d.server.SetMCPOAuthHandler(h.mcpOAuth)
 	}
 	if h.channelInstances != nil {
 		d.server.SetChannelInstancesHandler(h.channelInstances)
@@ -136,6 +141,8 @@ func (d *gatewayDeps) wireHTTPHandlersOnServer(
 		})
 	}
 
+	d.server.SetBrandingAssetsHandler(httpapi.NewBrandingAssetsHandler(d.dataDir))
+
 	// Usage analytics API
 	if d.pgStores.Snapshots != nil {
 		d.server.SetUsageHandler(httpapi.NewUsageHandler(d.pgStores.Snapshots, d.pgStores.UsageEvents, d.pgStores.DB))
@@ -179,9 +186,13 @@ func (d *gatewayDeps) wireHTTPHandlersOnServer(
 
 		// Webhook admin CRUD — available in all editions (Standard + Lite).
 		// Runtime routes (/v1/webhooks/message, /v1/webhooks/llm) are mounted by phases 05/06.
+		// adminH is captured so the test endpoint (POST /v1/webhooks/{id}/test) can be wired
+		// with the runtime invokers (llm/message handlers) once they are constructed below.
+		var adminH *httpapi.WebhooksAdminHandler
 		if d.pgStores != nil && d.pgStores.Webhooks != nil {
-			adminH := httpapi.NewWebhooksAdminHandler(
+			adminH = httpapi.NewWebhooksAdminHandler(
 				d.pgStores.Webhooks,
+				d.pgStores.WebhookCalls,
 				d.pgStores.Tenants,
 				d.msgBus,
 			)
@@ -191,13 +202,14 @@ func (d *gatewayDeps) wireHTTPHandlersOnServer(
 
 		// Webhook message endpoint — Standard edition only (channels required).
 		// Phase 05b: POST /v1/webhooks/message → sync channel send (text + optional media).
+		var msgH *httpapi.WebhookMessageHandler
 		if edition.Current().AllowsChannels() &&
 			d.pgStores != nil &&
 			d.pgStores.Webhooks != nil &&
 			d.pgStores.WebhookCalls != nil &&
 			d.pgStores.ChannelInstances != nil &&
 			d.channelMgr != nil {
-			msgH := httpapi.NewWebhookMessageHandler(
+			msgH = httpapi.NewWebhookMessageHandler(
 				d.channelMgr,
 				d.pgStores.ChannelInstances,
 				d.pgStores.WebhookCalls,
@@ -212,19 +224,28 @@ func (d *gatewayDeps) wireHTTPHandlersOnServer(
 		// Phase 06: POST /v1/webhooks/llm → sync agent run (≤30s) or async enqueue.
 		// LocalhostOnly enforcement is handled by WebhookAuthMiddleware at request time.
 		// lane=nil → handler self-creates internal default lane (4-slot).
+		var llmH *httpapi.WebhookLLMHandler
 		if d.pgStores != nil &&
 			d.pgStores.Webhooks != nil &&
 			d.pgStores.WebhookCalls != nil &&
 			d.agentRouter != nil {
-			llmH := httpapi.NewWebhookLLMHandler(
+			llmH = httpapi.NewWebhookLLMHandler(
 				d.agentRouter,
 				d.pgStores.WebhookCalls,
 				d.pgStores.Webhooks,
 				sharedWebhookLimiter, // K10: shared limiter
 				nil,                  // lane: nil → internal default (4-slot); configurable in future via cfg
+				webhooks.ResolveTimeoutSec(d.cfg.Gateway.WebhookSyncTimeoutSec),
+				webhooks.ResolveStream(d.cfg.Gateway.WebhookStream),
 			)
 			llmH.SetEncKey(webhookEncKey) // K6: decrypt secret at HMAC verify time
 			d.server.SetWebhookLLMHandler(llmH)
+		}
+
+		// Wire the admin test endpoint with runtime invokers. msgH is nil on Lite — the
+		// admin handler guards on nil and rejects message tests there.
+		if adminH != nil {
+			adminH.SetTesters(llmH, msgH)
 		}
 	}
 
@@ -325,6 +346,9 @@ func (d *gatewayDeps) wireHTTPHandlersOnServer(
 		// Wire WS method — provider nil means each request resolves key via secretStore at HTTP layer.
 		// For WS, use same cache. Provider is resolved via secretStore at WS level in a future phase.
 		methods.NewVoicesMethods(voiceCache, nil).Register(d.server.Router())
+		// Wire the same cache + secret store into the CRUD MCP server (see
+		// internal/mcp/crud_server.go, mounted at /api/mcp/ in BuildMux()).
+		d.server.SetVoiceCache(voiceCache, secretStore)
 	}
 
 	// TTS synthesize endpoint — shares audio.Manager with setupTTS.

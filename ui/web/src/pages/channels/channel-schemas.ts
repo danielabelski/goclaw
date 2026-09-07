@@ -5,7 +5,7 @@ import { reasoningDeliveryOptions } from "./reasoning-delivery-config";
 export interface FieldDef {
   key: string;
   label: string;
-  type: "text" | "password" | "number" | "boolean" | "select" | "tags" | "tristate" | "textarea" | "tool-select" | "skill-select";
+  type: "text" | "password" | "number" | "boolean" | "select" | "multi-select" | "tags" | "tristate" | "textarea" | "tool-select" | "skill-select" | "mcp-select";
   placeholder?: string;
   required?: boolean;
   defaultValue?: string | number | boolean | string[];
@@ -71,6 +71,15 @@ export const groupPolicyOptions = [
 const mentionModeOptions = [
   { value: "strict", label: "Default (follow @mention setting)" },
   { value: "yield", label: "Multi-bot (respond unless another bot is @mentioned)" },
+];
+
+const telegramManagerActionOptions = [
+  { value: "topic", label: "Manage topics" },
+  { value: "message", label: "Manage messages" },
+  { value: "member", label: "Manage members" },
+  { value: "invite", label: "Manage invite links" },
+  { value: "chat", label: "Manage chat settings" },
+  { value: "join_request", label: "Approve join requests" },
 ];
 
 // --- Credentials schemas ---
@@ -156,13 +165,15 @@ export const configSchema: Record<string, FieldDef[]> = {
     { key: "media_max_mb", label: "Max Media Size (MB)", type: "number", defaultValue: 20, help: "Default: 20 MB (cloud API). Increase when using local Bot API server." },
     { key: "link_preview", label: "Link Preview", type: "boolean", defaultValue: true },
     { key: "allow_from", label: "Allowed Users", type: "tags", help: "User IDs or @usernames, one per line or comma-separated" },
+    { key: "telegram_manager.enabled", label: "Telegram Management Tool", type: "boolean", defaultValue: false, help: "Enable the hidden Telegram-only management tool for agents using this channel." },
+    { key: "telegram_manager.allowed_actions", label: "Telegram Management Permissions", type: "multi-select", options: telegramManagerActionOptions, help: "Choose which Telegram management actions the hidden tool may run for agents using this channel. The tool stays hidden unless at least one permission is selected." },
     ...chatBehaviorOverrideFields,
   ],
   discord: [
     { key: "dm_policy", label: "DM Policy", type: "select", options: dmPolicyOptions, defaultValue: "pairing" },
     { key: "group_policy", label: "Group Policy", type: "select", options: groupPolicyOptions, defaultValue: "pairing" },
     { key: "require_mention", label: "Require @mention in groups", type: "boolean", defaultValue: true },
-    { key: "history_limit", label: "Group History Limit", type: "number", defaultValue: 50, help: "Max pending group messages for context (0 = disabled)" },
+    { key: "history_limit", label: "Group History Limit", type: "number", defaultValue: 200, help: "Max pending group messages for context (0 = disabled)" },
     { key: "allow_from", label: "Allowed Users", type: "tags", help: "Discord user IDs" },
     ...chatBehaviorOverrideFields,
   ],
@@ -282,13 +293,20 @@ export const configSchema: Record<string, FieldDef[]> = {
     { key: "history_limit", label: "Group History Limit", type: "number", defaultValue: 0, help: "Max pending group messages for context (0 = disabled)" },
     { key: "streaming", label: "Streaming", type: "boolean", defaultValue: true, help: "Stream response progressively." },
     { key: "reaction_level", label: "Reaction Level", type: "select", options: [{ value: "off", label: "Off" }, { value: "minimal", label: "Minimal" }, { value: "full", label: "Full" }], defaultValue: "minimal", help: "Typing/status reactions while the agent is processing." },
+    { key: "activity_indicator", label: "Activity Indicator", type: "boolean", defaultValue: true, help: "Show a native \"agent is working\" indicator (thinking/searching/generating…) while the agent processes. Ephemeral, not a chat message." },
     { key: "text_chunk_limit", label: "Text Chunk Limit", type: "number", defaultValue: 4000, help: "Max characters per outbound message." },
     { key: "media_max_mb", label: "Max Media Size (MB)", type: "number", defaultValue: 20, help: "Max inbound media download size." },
     { key: "allow_from", label: "Allowed Users (DM)", type: "tags", help: "Bitrix24 user IDs allowed to DM the bot. Empty = no allowlist filter." },
     { key: "group_allow_from", label: "Allowed Users (Group)", type: "tags", help: "Separate allowlist for group senders." },
     ...chatBehaviorOverrideFields,
-    { key: "mcp_server_name", label: "MCP Server Name", type: "text", advanced: true, placeholder: "bitrix24-prod", help: "Optional — name from mcp_servers table. Must be set together with MCP Base URL to enable per-user MCP credential auto-onboard. Leave both empty to disable." },
-    { key: "mcp_base_url", label: "MCP Base URL", type: "text", advanced: true, placeholder: "https://mcp.example.com", help: "Optional — HTTPS root of the partner MCP server. Channel POSTs {mcp_base_url}/api/auto-onboard to mint per-user credentials on first-sight. The MCP server authenticates each call via the caller's Bitrix access_token, so no admin secret is required." },
+    // Preferred single-select input backed by mcp_servers.require_user_credentials.
+    // Base URL is resolved from the selected row at Start() — no separate field needed.
+    { key: "mcp_server_id", label: "MCP Server", type: "mcp-select", help: "Optional — pick a per-user MCP server (only servers with \"Require user credentials\" ticked appear here). Channel POSTs {server.url}/api/auto-onboard on first-sight to mint the caller's per-user credential. Leave empty to disable MCP provisioning for this channel." },
+    // Legacy string fields — kept for backward-compat with configs written before
+    // the mcp_server_id rollout. Phase 5 migrates every existing channel to
+    // mcp_server_id and drops these entries.
+    { key: "mcp_server_name", label: "MCP Server Name (legacy)", type: "text", advanced: true, placeholder: "bitrix24-prod", help: "Deprecated — use \"MCP Server\" dropdown instead. Kept for backward-compat with pre-Phase-89 configs; will be removed once every channel is migrated." },
+    { key: "mcp_base_url", label: "MCP Base URL (legacy)", type: "text", advanced: true, placeholder: "https://mcp.example.com", help: "Deprecated — see the \"MCP Server\" dropdown. Legacy base URL used only when the new dropdown is empty and the legacy name is set." },
   ],
 };
 

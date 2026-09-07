@@ -59,6 +59,38 @@ func TestCountMessages_Cache(t *testing.T) {
 	}
 }
 
+// TestCountMessages_CacheIsTokenizerScoped is the regression guard for the
+// stale cross-tokenizer count bug: the same message counted under a cl100k
+// model then an o200k model must re-encode (different tokenizer) rather than
+// return the first tokenizer's cached count. This matters most on fallback
+// candidates that switch tokenizer mid-run.
+func TestCountMessages_CacheIsTokenizerScoped(t *testing.T) {
+	c := NewTiktokenCounter()
+	// A string whose cl100k and o200k token counts differ.
+	msgs := []providers.Message{
+		{Role: "user", Content: "internationalization tokenization pseudopseudohypoparathyroidism"},
+	}
+
+	cl := c.CountMessages("claude-sonnet-4-5-20250929", msgs) // cl100k_base
+	o2 := c.CountMessages("gpt-4o", msgs)                     // o200k_base
+
+	if cl <= 0 || o2 <= 0 {
+		t.Fatalf("counts must be positive: cl=%d o2=%d", cl, o2)
+	}
+	// The two tokenizers should produce different counts for this string; if they
+	// were sharing a cache entry, o2 would equal cl (the stale bug).
+	if cl == o2 {
+		t.Fatalf("cl100k and o200k returned identical count %d — cache is not tokenizer-scoped", cl)
+	}
+	// Two distinct tokenizers => two cache entries for the one message.
+	c.mu.RLock()
+	cacheLen := len(c.msgCache)
+	c.mu.RUnlock()
+	if cacheLen != 2 {
+		t.Errorf("cache has %d entries, want 2 (one per tokenizer)", cacheLen)
+	}
+}
+
 func TestCountMessages_Overhead(t *testing.T) {
 	c := NewTiktokenCounter()
 	msgs := []providers.Message{

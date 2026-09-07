@@ -32,6 +32,11 @@ const OptPeerKind = "peer_kind"
 // OptWorkspace passes the agent workspace path so MCP bridge tools can resolve file paths.
 const OptWorkspace = "workspace"
 
+// OptDelegationID and OptDelegationInputs pass signed artifact-run context to
+// MCP bridge tools. They are runtime-only and are not included in model prompts.
+const OptDelegationID = "delegation_id"
+const OptDelegationInputs = "delegation_inputs"
+
 // OptTenantID passes the tenant UUID string for per-session MCP config.
 // Required for memory indexing and tenant-scoped queries via bridge tools.
 const OptTenantID = "tenant_id"
@@ -39,21 +44,30 @@ const OptTenantID = "tenant_id"
 // OptLocalKey passes the composite local key (e.g. "-100123:topic:42") for forum topic routing.
 const OptLocalKey = "local_key"
 
+// OptAllowedToolNames passes the agent's policy-filtered canonical GoClaw tool
+// names ([]string) for the current turn. Used to derive --disallowedTools for
+// the Claude CLI subprocess so native CLI tools (Bash, Edit, Write, Read,
+// WebFetch, WebSearch) are only permitted when their GoClaw equivalent is
+// allowed by the agent's tool policy. A nil/absent value is treated as "no
+// tools allowed" (fail closed).
+const OptAllowedToolNames = "allowed_tool_names"
+
 // ClaudeCLIProvider implements Provider by shelling out to the `claude` CLI binary.
 // It acts as a thin proxy: CLI manages session history, tool execution, and context.
 // GoClaw only forwards the latest user message and streams back the response.
 type ClaudeCLIProvider struct {
-	name              string         // provider name (default: "claude-cli")
-	cliPath           string         // path to claude binary (default: "claude")
-	defaultModel      string         // default: "sonnet"
-	baseWorkDir       string         // base dir for agent workspaces
-	mcpConfigData     *MCPConfigData // per-session MCP config data
-	permMode          string         // permission mode (default: "bypassPermissions")
-	hooksSettingsPath string         // generated settings.json with security hooks (empty = no hooks)
-	hooksCleanup      func()         // cleanup function for hooks temp files
-	mu                sync.Mutex     // protects workdir creation
-	sessionMu         sync.Map       // key: string, value: *sync.Mutex — per-session lock
-	mcpConfigDirs     sync.Map       // key: string (dir path), value: struct{} — tracks per-session MCP config dirs for cleanup
+	name                       string         // provider name (default: "claude-cli")
+	cliPath                    string         // path to claude binary (default: "claude")
+	defaultModel               string         // default: "sonnet"
+	baseWorkDir                string         // base dir for agent workspaces
+	mcpConfigData              *MCPConfigData // per-session MCP config data
+	permMode                   string         // permission mode (default: "bypassPermissions")
+	hooksSettingsPath          string         // generated settings.json with security hooks (empty = no hooks)
+	hooksCleanup               func()         // cleanup function for hooks temp files
+	mu                         sync.Mutex     // protects workdir creation
+	sessionMu                  sync.Map       // key: string, value: *sync.Mutex — per-session lock
+	mcpConfigDirs              sync.Map       // key: string (dir path), value: struct{} — tracks per-session MCP config dirs for cleanup
+	invalidDisallowedToolNames sync.Map       // key: string, value: struct{} — Claude CLI deny rules rejected by this CLI version
 }
 
 // ClaudeCLIOption configures the provider.

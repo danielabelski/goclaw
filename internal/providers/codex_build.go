@@ -122,7 +122,7 @@ func (p *CodexProvider) buildRequestBody(req ChatRequest, stream bool) map[strin
 					"output_format":  "png",
 					"partial_images": 1,
 				})
-			} else {
+			} else if t.Function != nil {
 				// Function tool path (default). Works with both value-type and pointer Function
 				// fields — we only access t.Function when type is not "image_generation".
 				tools = append(tools, map[string]any{
@@ -138,6 +138,20 @@ func (p *CodexProvider) buildRequestBody(req ChatRequest, stream bool) map[strin
 
 	if level, ok := req.Options[OptThinkingLevel].(string); ok && level != "" && level != "off" {
 		body["reasoning"] = map[string]any{"effort": level}
+	}
+
+	// Prompt caching params (prompt_cache_key, prompt_cache_retention) are accepted
+	// only by native OpenAI endpoints. The ChatGPT subscription OAuth backend
+	// (chatgpt.com/backend-api) rejects them with HTTP 400, so gate on the endpoint —
+	// the same native-only policy CacheMiddleware already applies. Server-side prefix
+	// caching still works on the OAuth backend without these params.
+	if isOpenAINativeEndpoint(p.apiBase) {
+		if cacheKey, ok := req.Options[OptPromptCacheKey]; ok {
+			body["prompt_cache_key"] = cacheKey
+		}
+		if retention, ok := req.Options[OptPromptCacheRetention]; ok {
+			body["prompt_cache_retention"] = retention
+		}
 	}
 
 	return body

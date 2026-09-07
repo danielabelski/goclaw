@@ -306,7 +306,7 @@ func TestCodexProviderChatStream(t *testing.T) {
 		events := []string{
 			`{"type":"response.output_text.delta","delta":"Hello"}`,
 			`{"type":"response.output_text.delta","delta":" world"}`,
-			`{"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}`,
+			`{"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7,"input_tokens_details":{"cached_tokens":4}}}}`,
 		}
 
 		for _, e := range events {
@@ -344,6 +344,12 @@ func TestCodexProviderChatStream(t *testing.T) {
 	}
 	if result.Usage.TotalTokens != 7 {
 		t.Errorf("TotalTokens = %d, want 7", result.Usage.TotalTokens)
+	}
+	if result.Usage.CacheReadTokens != 4 {
+		t.Errorf("CacheReadTokens = %d, want 4", result.Usage.CacheReadTokens)
+	}
+	if !result.Usage.PromptTokensIncludeCachedSegments {
+		t.Error("PromptTokensIncludeCachedSegments = false, want true")
 	}
 }
 
@@ -1085,6 +1091,83 @@ func TestCodexProviderBuildRequestBodyWithImages(t *testing.T) {
 	}
 }
 
+func TestCodexBuildRequestBody_NilFunction_HandlesGracefully(t *testing.T) {
+	p := NewCodexProvider("test", &staticTokenSource{token: "test"}, "", "gpt-4o")
+
+	req := ChatRequest{
+		Messages: []Message{{Role: "user", Content: "Draw and search"}},
+		Tools: []ToolDefinition{
+			{
+				Type:     "some_unsupported_native_tool",
+				Function: nil,
+			},
+			{
+				Type: "function",
+				Function: &ToolFunctionSchema{
+					Name:        "web_search",
+					Description: "Search the web",
+					Parameters:  map[string]any{"type": "object"},
+				},
+			},
+		},
+	}
+
+	body := p.buildRequestBody(req, false)
+
+	tools, ok := body["tools"].([]map[string]any)
+	if !ok {
+		t.Fatalf("tools is not []map[string]any: %T", body["tools"])
+	}
+
+	// Should only serialize the function tool and ignore the native tool with nil Function
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 tool in Codex request, got %d", len(tools))
+	}
+
+	tool := tools[0]
+	if tool["type"] != "function" || tool["name"] != "web_search" {
+		t.Errorf("expected function tool 'web_search', got: %v", tool)
+	}
+}
+
+func TestCodexBuildRequestBodyPromptCacheControls(t *testing.T) {
+	req := ChatRequest{
+		Messages: []Message{{Role: "user", Content: "Hello"}},
+		Options: map[string]any{
+			OptPromptCacheKey:       "agent/session/provider",
+			OptPromptCacheRetention: "24h",
+		},
+	}
+
+	// Native OpenAI endpoint accepts prompt cache params.
+	native := NewCodexProvider("test", &staticTokenSource{token: "tok"}, "https://api.openai.com/v1", "gpt-4o")
+	body := native.buildRequestBody(req, true)
+	if got := body["prompt_cache_key"]; got != "agent/session/provider" {
+		t.Fatalf("native prompt_cache_key = %v, want agent/session/provider", got)
+	}
+	if got := body["prompt_cache_retention"]; got != "24h" {
+		t.Fatalf("native prompt_cache_retention = %v, want 24h", got)
+	}
+
+	// ChatGPT subscription OAuth backend (default apiBase) rejects these params
+	// with HTTP 400, so they must be omitted.
+	oauth := NewCodexProvider("test", &staticTokenSource{token: "tok"}, "", "gpt-4o")
+	oauthBody := oauth.buildRequestBody(req, true)
+	if _, ok := oauthBody["prompt_cache_key"]; ok {
+		t.Fatal("prompt_cache_key must not be sent to the ChatGPT OAuth backend")
+	}
+	if _, ok := oauthBody["prompt_cache_retention"]; ok {
+		t.Fatal("prompt_cache_retention must not be sent to the ChatGPT OAuth backend")
+	}
+}
+
+func TestCodexProviderCapabilitiesCacheControl(t *testing.T) {
+	p := NewCodexProvider("test", &staticTokenSource{token: "tok"}, "", "gpt-4o")
+	if !p.Capabilities().CacheControl {
+		t.Fatal("CodexProvider Capabilities().CacheControl = false, want true")
+	}
+}
+
 func TestCodexProviderRetriesPreOutputResponseFailed(t *testing.T) {
 	var calls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1156,5 +1239,6 @@ func TestCodexProviderDoesNotRetryAfterVisibleOutput(t *testing.T) {
 	}
 	if len(chunks) != 1 || chunks[0] != "partial" {
 		t.Fatalf("chunks = %#v, want [partial]", chunks)
+
 	}
 }

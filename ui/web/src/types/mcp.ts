@@ -1,3 +1,32 @@
+export interface MCPOAuthSettings {
+  auth_type?: "oauth" | "";
+  use_dcr?: boolean;
+  grant_type?: "pkce" | "authorization_code" | "client_credentials";
+  auth_endpoint?: string;
+  token_endpoint?: string;
+  client_id?: string;
+  /** Write-only — never returned by the API (stored encrypted). */
+  client_secret?: string;
+  scope?: string;
+}
+
+export interface MCPServerSettings {
+  require_user_credentials?: boolean;
+  tool_hints?: {
+    global?: string;
+    tools?: Record<string, string>;
+  };
+  oauth?: MCPOAuthSettings;
+}
+
+export interface MCPOAuthStatus {
+  has_token: boolean;
+  client_id?: string;
+  issuer?: string;
+  expires_at?: string;
+  expired?: boolean;
+}
+
 export interface MCPServerData {
   id: string;
   name: string;
@@ -10,14 +39,16 @@ export interface MCPServerData {
   env: Record<string, string> | null;
   tool_prefix: string;
   timeout_sec: number;
-  settings?: {
-    require_user_credentials?: boolean;
-    tool_hints?: {
-      global?: string;
-      tools?: Record<string, string>;
-    };
-  };
+  settings?: MCPServerSettings;
   enabled: boolean;
+  /**
+   * True when the server mints credentials per-user at message time
+   * (Bitrix24 auto-onboard etc.). Promoted from `settings.require_user_credentials`
+   * to a top-level column; the settings entry stays for one release cycle
+   * so legacy readers keep working. Prefer this field over the settings
+   * entry when both are present.
+   */
+  require_user_credentials?: boolean;
   created_by: string;
   agent_count?: number;
   created_at: string;
@@ -35,14 +66,14 @@ export interface MCPServerInput {
   env?: Record<string, string>;
   tool_prefix?: string;
   timeout_sec?: number;
-  settings?: {
-    require_user_credentials?: boolean;
-    tool_hints?: {
-      global?: string;
-      tools?: Record<string, string>;
-    };
-  };
+  settings?: MCPServerSettings;
   enabled?: boolean;
+  /**
+   * Top-level twin of `settings.require_user_credentials`. Send both while
+   * the server backend is still on the migration window (readers may hit
+   * either field); after Phase 5 lands the settings entry disappears.
+   */
+  require_user_credentials?: boolean;
 }
 
 export interface MCPToolInfo {
@@ -62,7 +93,6 @@ export interface MCPAgentGrant {
 }
 
 export interface MCPUserCredentialStatus {
-  user_id?: string;
   has_credentials: boolean;
   has_api_key: boolean;
   has_headers: boolean;

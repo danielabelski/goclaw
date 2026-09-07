@@ -24,16 +24,16 @@ type PruneStats struct {
 // PipelineDeps bundles all external dependencies stages need.
 // Passed to NewDefaultPipeline; individual stages receive what they need via closure or direct field access.
 type PipelineDeps struct {
-	TokenCounter tokencount.TokenCounter
-	EventBus     eventbus.DomainEventBus
-	Config       PipelineConfig
+	TokenCounter  tokencount.TokenCounter
+	BudgetCounter tokencount.BudgetCounter
+	EventBus      eventbus.DomainEventBus
+	Config        PipelineConfig
 	// Hooks is the hook dispatcher. nil = no hooks (zero-overhead fast path).
 	Hooks hooks.Dispatcher
 
-	// ResolveContextWindow returns the effective context window (in tokens) for
-	// a given provider/model pair. Nil = always use Config.ContextWindow.
-	// Invoked ONCE per run by ContextStage and stored in RunState.Context.EffectiveContextWindow.
-	ResolveContextWindow func(provider, model string) int
+	// ResolveContextWindow returns this agent's configured context window.
+	// Model/provider are intentionally absent from the budget authority surface.
+	ResolveContextWindow func() int
 
 	// Callbacks from agent.Loop — Phase 8 adapter wires these.
 	EmitEvent func(event any)
@@ -121,9 +121,17 @@ type PipelineDeps struct {
 	DeduplicateMediaSuffix func(content, suffix string) string
 	IsSilentReply          func(content string) bool
 	EmitSessionCompleted   func(ctx context.Context, sessionKey string, msgCount, tokensUsed, compactionCount int)
-	UpdateMetadata         func(ctx context.Context, sessionKey string, usage providers.Usage) error
-	BootstrapCleanup       func(ctx context.Context, state *RunState) error
-	MaybeSummarize         func(ctx context.Context, sessionKey string)
+	// UpdateMetadata persists run token accounting: usage is the run-cumulative
+	// total (billing/AccumulateTokens); lastUsage is the final iteration's own
+	// usage — its ContextTokens() is the session's current context size
+	// (SetLastPromptTokens → sessions context display + compaction calibration).
+	// msgCount is the message count captured alongside lastUsage.
+	UpdateMetadata   func(ctx context.Context, sessionKey string, usage, lastUsage providers.Usage, msgCount int) error
+	BootstrapCleanup func(ctx context.Context, state *RunState) error
+	// MaybeSummarize takes midLoopCompacted: when the final-request guard already
+	// compacted mid-loop this run, post-turn summarization lowers its trigger
+	// threshold so the compaction is PERSISTED (episodic Bug B / anti-loop).
+	MaybeSummarize func(ctx context.Context, sessionKey string, midLoopCompacted bool)
 }
 
 // FireHook is nil-safe. Returns FireResult{Decision: DecisionAllow} when no

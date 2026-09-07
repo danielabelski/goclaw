@@ -8,9 +8,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
+	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
@@ -61,17 +63,30 @@ func (f *fakeVaultStore) GetDocumentsByIDs(ctx context.Context, tenantID string,
 
 // newVaultReadTestTool builds a VaultReadTool with a temp workspace and a
 // fake store pre-seeded with docs.
+//
+// The tool is given the GLOBAL workspace root, mirroring boot wiring. The
+// returned path is the TENANT-scoped root of the first seeded doc — the
+// directory the tool resolves per request, and therefore where test content
+// must be written. Tests set no slug on the context, so the tenant directory
+// is UUID-named (see config.TenantWorkspace).
 func newVaultReadTestTool(t *testing.T, docs ...*store.VaultDocument) (*VaultReadTool, string) {
 	t.Helper()
-	ws := t.TempDir()
+	base := t.TempDir()
 	fake := &fakeVaultStore{byID: make(map[string]*store.VaultDocument)}
 	for _, d := range docs {
 		fake.byID[d.TenantID+":"+d.ID] = d
 	}
 	tool := NewVaultReadTool()
 	tool.SetVaultStore(fake)
-	tool.SetWorkspace(ws)
-	return tool, ws
+	tool.SetWorkspace(base)
+
+	contentRoot := base
+	if len(docs) > 0 {
+		if tid, err := uuid.Parse(docs[0].TenantID); err == nil {
+			contentRoot = config.TenantWorkspace(base, tid, "")
+		}
+	}
+	return tool, contentRoot
 }
 
 // writeFile creates a file under workspace with the given relative path.
@@ -456,6 +471,122 @@ func TestVaultRead_Oversize_Truncated(t *testing.T) {
 	}
 	if !strings.Contains(res.ForLLM, "truncated") {
 		t.Fatalf("expected truncation marker, got: %s", res.ForLLM)
+	}
+}
+
+// --- 12b. non-ASCII text whose rune straddles the sniff window → readable. ---
+func TestVaultRead_MultibyteRuneAtSniffBoundary_Allowed(t *testing.T) {
+	// The sniff window ends at vaultReadUTF8SniffBytes. Pad with ASCII so the
+	// window ends inside a multi-byte rune, leaving 1 or 2 bytes of it dangling.
+	cases := []struct {
+		name    string
+		padding int
+		char    string // 2-byte and 3-byte Vietnamese characters
+	}{
+		{"two-byte rune split", vaultReadUTF8SniffBytes - 1, "â"},
+		{"three-byte rune split after one byte", vaultReadUTF8SniffBytes - 1, "ấ"},
+		{"three-byte rune split after two bytes", vaultReadUTF8SniffBytes - 2, "ấ"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tenantID := uuid.New()
+			agentID := uuid.New()
+			docID := uuid.New()
+			doc := &store.VaultDocument{
+				ID: docID.String(), TenantID: tenantID.String(),
+				Scope: "shared", Path: "npk.md", Title: "NPK", DocType: "note",
+			}
+			tool, ws := newVaultReadTestTool(t, doc)
+			// ~25KB total so the file is well past the sniff window.
+			body := strings.Repeat("a", tc.padding) + strings.Repeat(tc.char+" phân bón ", 2000)
+			if len(body) <= vaultReadUTF8SniffBytes {
+				t.Fatalf("fixture must exceed the sniff window, got %d bytes", len(body))
+			}
+			if utf8.ValidString(body[:vaultReadUTF8SniffBytes]) {
+				t.Fatalf("fixture must split a rune at the sniff boundary")
+			}
+			writeFile(t, ws, "npk.md", body)
+
+			res := tool.Execute(makeCtx(tenantID, agentID),
+				map[string]any{"doc_id": docID.String()})
+			if res.IsError {
+				t.Fatalf("valid UTF-8 document rejected: %s", res.ForLLM)
+			}
+			if !strings.Contains(res.ForLLM, "phân bón") {
+				t.Fatalf("expected document content, got: %.120s", res.ForLLM)
+			}
+		})
+	}
+}
+
+// --- 12c. binary content past the sniff window → still rejected. ---
+func TestVaultRead_LargeBinaryContent_UTF8Rejected(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		Scope: "shared", Path: "renamed-png.md", Title: "Blob", DocType: "note",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+	// PNG magic bytes plus 20KB of invalid sequences: trimming the tail of the
+	// sniff window must not rescue this.
+	blob := append([]byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A},
+		bytes.Repeat([]byte{0xFF, 0xFE, 0xC3, 0x28}, 5000)...)
+	writeBytes(t, ws, "renamed-png.md", blob)
+
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": docID.String()})
+	if !res.IsError || !strings.Contains(res.ForLLM, "UTF-8") {
+		t.Fatalf("expected UTF-8 rejection, got: %.120s", res.ForLLM)
+	}
+}
+
+// --- 12d. broken byte at the end of a file shorter than the sniff window. ---
+func TestVaultRead_ShortFileTrailingBrokenByte_Rejected(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		Scope: "shared", Path: "short.md", Title: "Short", DocType: "note",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+	// Nothing is truncated here, so the trailing 0xC3 is the file's own byte
+	// and must still be reported as broken.
+	writeBytes(t, ws, "short.md", append([]byte("bảng giá phân bón"), 0xC3))
+
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": docID.String()})
+	if !res.IsError || !strings.Contains(res.ForLLM, "UTF-8") {
+		t.Fatalf("expected UTF-8 rejection, got: %.120s", res.ForLLM)
+	}
+}
+
+// --- 12e. max_bytes landing inside a rune → no broken character in output. ---
+func TestVaultRead_MaxBytes_CutInsideRune_NoReplacementChar(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		Scope: "shared", Path: "gia.md", Title: "Gia", DocType: "note",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+	body := strings.Repeat("ấm ", 500) // 5 bytes per repetition
+	writeFile(t, ws, "gia.md", body)
+
+	// 101 is not a multiple of 5, so the cap falls inside the 3-byte "ấ".
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": docID.String(), "max_bytes": float64(101)})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "truncated") {
+		t.Fatalf("expected truncation marker, got: %.120s", res.ForLLM)
+	}
+	if strings.ContainsRune(res.ForLLM, utf8.RuneError) {
+		t.Fatalf("truncated output contains a broken character: %q", res.ForLLM)
 	}
 }
 
@@ -916,4 +1047,119 @@ func TestVaultRead_TrulyMissingReturnsNotFound(t *testing.T) {
 	if !res.IsError || !strings.Contains(res.ForLLM, "not found") {
 		t.Fatalf("expected document not found, got: %s", res.ForLLM)
 	}
+}
+
+// --- 18. Regression: non-master tenant content lives under tenants/<slug>/.
+// The tool holds the GLOBAL root, so a global-root join misses the file and
+// every non-master tenant reads ENOENT while vault_search (DB-only) still
+// returns the doc. Mirrors the production failure on tenant "alpha". ---
+func TestVaultRead_NonMasterTenant_ResolvesUnderTenantRoot(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		Scope: "shared", Path: "agents/ho-tro/Refund Flow.md",
+		Title: "Refund Flow", DocType: "note",
+	}
+	base := t.TempDir()
+	fake := &fakeVaultStore{byID: map[string]*store.VaultDocument{
+		tenantID.String() + ":" + docID.String(): doc,
+	}}
+	tool := NewVaultReadTool()
+	tool.SetVaultStore(fake)
+	tool.SetWorkspace(base)
+
+	// Written by the tenant-aware write path; slug comes from context.
+	tenantRoot := config.TenantWorkspace(base, tenantID, "alpha")
+	writeFile(t, tenantRoot, "agents/ho-tro/Refund Flow.md", "refund body")
+
+	ctx := store.WithTenantSlug(makeCtx(tenantID, agentID), "alpha")
+	res := tool.Execute(ctx, map[string]any{"doc_id": docID.String()})
+	if res.IsError {
+		t.Fatalf("tenant doc must resolve under tenants/<slug>/, got: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "refund body") {
+		t.Fatalf("content missing: %s", res.ForLLM)
+	}
+}
+
+// --- 19. Master tenant keeps using the base root (no tenants/ segment), so
+// the fix above must not regress single-tenant and master installs. ---
+func TestVaultRead_MasterTenant_UsesBaseRoot(t *testing.T) {
+	agentID := uuid.New()
+	docID := uuid.New()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: store.MasterTenantID.String(),
+		Scope: "shared", Path: "agents/ho-tro/note.md",
+		Title: "Note", DocType: "note",
+	}
+	base := t.TempDir()
+	fake := &fakeVaultStore{byID: map[string]*store.VaultDocument{
+		store.MasterTenantID.String() + ":" + docID.String(): doc,
+	}}
+	tool := NewVaultReadTool()
+	tool.SetVaultStore(fake)
+	tool.SetWorkspace(base)
+
+	// No tenants/ segment for master.
+	writeFile(t, base, "agents/ho-tro/note.md", "master body")
+
+	res := tool.Execute(makeCtx(store.MasterTenantID, agentID),
+		map[string]any{"doc_id": docID.String()})
+	if res.IsError {
+		t.Fatalf("master doc must resolve at base root, got: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "master body") {
+		t.Fatalf("content missing: %s", res.ForLLM)
+	}
+}
+
+// --- 20. Slug absent from context (channel/cron runs) → fall back to the
+// TenantStore lookup, since a UUID-named directory would miss the slug-named
+// one the write path created. ---
+func TestVaultRead_SlugMissingFromContext_FallsBackToTenantStore(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		Scope: "shared", Path: "agents/ho-tro/note.md",
+		Title: "Note", DocType: "note",
+	}
+	base := t.TempDir()
+	fake := &fakeVaultStore{byID: map[string]*store.VaultDocument{
+		tenantID.String() + ":" + docID.String(): doc,
+	}}
+	tool := NewVaultReadTool()
+	tool.SetVaultStore(fake)
+	tool.SetWorkspace(base)
+	tool.SetTenantStore(&fakeTenantStoreRead{slug: "alpha", id: tenantID})
+
+	writeFile(t, config.TenantWorkspace(base, tenantID, "alpha"),
+		"agents/ho-tro/note.md", "cron body")
+
+	// Context deliberately carries no slug.
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": docID.String()})
+	if res.IsError {
+		t.Fatalf("slug fallback must resolve the doc, got: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "cron body") {
+		t.Fatalf("content missing: %s", res.ForLLM)
+	}
+}
+
+// fakeTenantStoreRead resolves a single tenant slug for the fallback path.
+type fakeTenantStoreRead struct {
+	store.TenantStore
+	id   uuid.UUID
+	slug string
+}
+
+func (f *fakeTenantStoreRead) GetTenant(_ context.Context, id uuid.UUID) (*store.TenantData, error) {
+	if id != f.id {
+		return nil, os.ErrNotExist
+	}
+	return &store.TenantData{ID: f.id, Slug: f.slug}, nil
 }

@@ -28,25 +28,30 @@ type EpisodicSummary struct {
 	// Phase 10 — dreaming weighted scoring signals. Populated by
 	// EpisodicStore.RecordRecall; consumed by consolidation.ComputeRecallScore.
 	RecallCount    int        `json:"recall_count" db:"recall_count"`
-	RecallScore    float64    `json:"recall_score" db:"recall_score"`         // running average of memory_search hit scores
+	RecallScore    float64    `json:"recall_score" db:"recall_score"` // running average of memory_search hit scores
 	LastRecalledAt *time.Time `json:"last_recalled_at,omitempty" db:"last_recalled_at"`
 }
 
 // EpisodicSearchResult is a search hit with L0 summary.
 type EpisodicSearchResult struct {
-	EpisodicID string    `json:"episodic_id" db:"episodic_id"`
-	L0Abstract string    `json:"l0_abstract" db:"l0_abstract"`
-	Score      float64   `json:"score" db:"score"`
-	CreatedAt  time.Time `json:"created_at" db:"created_at"`
-	SessionKey string    `json:"session_key" db:"session_key"`
+	EpisodicID string     `json:"episodic_id" db:"episodic_id"`
+	L0Abstract string     `json:"l0_abstract" db:"l0_abstract"`
+	KeyTopics  []string   `json:"key_topics" db:"key_topics"`
+	Score      float64    `json:"score" db:"score"`
+	CreatedAt  time.Time  `json:"created_at" db:"created_at"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty" db:"expires_at"`
+	SessionKey string     `json:"session_key" db:"session_key"`
 }
 
 // EpisodicSearchOptions configures episodic search behavior.
 type EpisodicSearchOptions struct {
-	MaxResults   int
-	MinScore     float64
-	VectorWeight float64
-	TextWeight   float64
+	MaxResults     int
+	MinScore       float64
+	VectorWeight   float64
+	TextWeight     float64
+	CreatedAfter   *time.Time
+	CreatedBefore  *time.Time
+	IncludeExpired bool
 }
 
 // EpisodicStore manages Tier 2 episodic memory.
@@ -64,6 +69,7 @@ type EpisodicStore interface {
 
 	// Lifecycle
 	ExistsBySourceID(ctx context.Context, agentID, userID, sourceID string) (bool, error)
+	GetBySourceID(ctx context.Context, agentID, userID, sourceID string) (*EpisodicSummary, error)
 	PruneExpired(ctx context.Context) (int, error)
 
 	// Promotion lifecycle (used by consolidation pipeline)

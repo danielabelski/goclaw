@@ -140,9 +140,20 @@ func (h *SkillsHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 			"user_id", userID,
 			"violations", len(violations),
 			"first_rule", violations[0].Reason)
+		type guardViolationResponse struct {
+			Line   int    `json:"line"`
+			Reason string `json:"reason"`
+		}
+		violationsResponse := make([]guardViolationResponse, len(violations))
+		for idx, v := range violations {
+			violationsResponse[idx] = guardViolationResponse{
+				Line:   v.Line,
+				Reason: v.Reason,
+			}
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"error":      i18n.T(locale, i18n.MsgInvalidRequest, "skill content failed security scan"),
-			"violations": skills.FormatGuardViolations(violations),
+			"violations": violationsResponse,
 		})
 		return
 	}
@@ -233,7 +244,13 @@ func (h *SkillsHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
-		// Skip macOS/system artifacts
+		// Normalize Windows backslash separators in ZIP entries.
+		// ZIPs created on Windows may use `\` instead of `/` in paths,
+		// causing files like "scripts\search.py" to be extracted as a
+		// single flat file instead of scripts/search.py on Linux.
+		entryName = strings.ReplaceAll(entryName, "\\", "/")
+		// Skip macOS/system artifacts after separator normalization so
+		// entries like "__MACOSX\\._SKILL.md" are filtered too.
 		if skills.IsSystemArtifact(entryName) {
 			continue
 		}

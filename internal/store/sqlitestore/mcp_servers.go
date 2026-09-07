@@ -17,7 +17,7 @@ import (
 )
 
 const mcpServerSelectCols = `id, name, display_name, transport, command, args, url, headers, env,
-		 api_key, tool_prefix, timeout_sec, settings, enabled, created_by, created_at, updated_at`
+		 api_key, tool_prefix, timeout_sec, settings, enabled, require_user_credentials, created_by, created_at, updated_at`
 
 // SQLiteMCPServerStore implements store.MCPServerStore backed by SQLite.
 type SQLiteMCPServerStore struct {
@@ -59,12 +59,12 @@ func (s *SQLiteMCPServerStore) CreateServer(ctx context.Context, srv *store.MCPS
 
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO mcp_servers (id, name, display_name, transport, command, args, url, headers, env,
-		 api_key, tool_prefix, timeout_sec, settings, enabled, created_by, created_at, updated_at, tenant_id)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 api_key, tool_prefix, timeout_sec, settings, enabled, require_user_credentials, created_by, created_at, updated_at, tenant_id)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		srv.ID, srv.Name, nilStr(srv.DisplayName), srv.Transport, nilStr(srv.Command),
 		jsonOrEmpty(srv.Args), nilStr(srv.URL), encHeaders, encEnv,
 		nilStr(apiKey), nilStr(srv.ToolPrefix), srv.TimeoutSec,
-		jsonOrEmpty(srv.Settings), srv.Enabled, srv.CreatedBy, now, now, tenantID,
+		jsonOrEmpty(srv.Settings), srv.Enabled, srv.RequireUserCredentials, srv.CreatedBy, now, now, tenantID,
 	)
 	return err
 }
@@ -194,6 +194,41 @@ func (s *SQLiteMCPServerStore) DeleteServer(ctx context.Context, id uuid.UUID) e
 	}
 	_, err := s.db.ExecContext(ctx, "DELETE FROM mcp_servers WHERE id = ? AND tenant_id = ?", id, tid)
 	return err
+}
+
+// CacheToolDescriptions stores a map of tool name → cached tool info
+// (description + parameter schema) into the server's settings JSON under
+// the "tool_cache" key.
+// SQLite has no jsonb_set(); we read-modify-write the settings column instead.
+func (s *SQLiteMCPServerStore) CacheToolDescriptions(ctx context.Context, serverID uuid.UUID, toolInfo map[string]store.CachedToolInfo) error {
+	row := s.db.QueryRowContext(ctx, `SELECT COALESCE(settings, '{}') FROM mcp_servers WHERE id = ?`, serverID)
+	var rawSettings []byte
+	if err := row.Scan(&rawSettings); err != nil {
+		return fmt.Errorf("mcp_servers.cache_tool_descriptions read: %w", err)
+	}
+
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(rawSettings, &settings); err != nil {
+		settings = make(map[string]json.RawMessage)
+	}
+
+	cacheJSON, err := json.Marshal(toolInfo)
+	if err != nil {
+		return fmt.Errorf("marshal tool descriptions: %w", err)
+	}
+	settings["tool_cache"] = json.RawMessage(cacheJSON)
+
+	merged, err := json.Marshal(settings)
+	if err != nil {
+		return fmt.Errorf("marshal settings: %w", err)
+	}
+
+	_, err = s.db.ExecContext(ctx, `UPDATE mcp_servers SET settings = ?, updated_at = ? WHERE id = ?`,
+		string(merged), time.Now().UTC(), serverID)
+	if err != nil {
+		return fmt.Errorf("mcp_servers.cache_tool_descriptions write: %w", err)
+	}
+	return nil
 }
 
 // encryptJSON encrypts a JSON blob by wrapping ciphertext as a JSON string.

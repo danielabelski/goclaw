@@ -21,7 +21,7 @@ var (
 )
 
 const (
-	webhookPath        = "/channels/facebook/webhook"
+	webhookPath        = "/v1/channels/facebook/webhook"
 	dedupTTL           = 24 * time.Hour  // matches Facebook's max retry window
 	dedupCleanEvery    = 5 * time.Minute // how often to evict stale dedup entries
 	adminReplyCooldown = 5 * time.Minute

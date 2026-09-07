@@ -6,6 +6,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { hookFormSchema } from "@/schemas/hooks.schema";
+import { buildHookConfig } from "@/pages/hooks/hook-form-config";
 
 // --- Zod schema validation ---
 
@@ -33,6 +34,8 @@ describe("hookFormSchema — base cases", () => {
       handler_type: "prompt",
       matcher: "^bash$",
       prompt_template: "Evaluate the tool call.",
+      provider: "cppai",
+      model: "gpt-5.6-terra",
     });
     expect(result.success).toBe(true);
   });
@@ -42,6 +45,8 @@ describe("hookFormSchema — base cases", () => {
       ...base,
       handler_type: "prompt",
       prompt_template: "Evaluate the tool call.",
+      provider: "cppai",
+      model: "gpt-5.6-terra",
       matcher: "",
       if_expr: "",
     });
@@ -57,11 +62,28 @@ describe("hookFormSchema — base cases", () => {
       ...base,
       handler_type: "prompt",
       matcher: "^bash$",
+      provider: "cppai",
+      model: "gpt-5.6-terra",
     });
     expect(result.success).toBe(false);
     if (!result.success) {
       const paths = result.error.issues.map((e) => e.path.join("."));
       expect(paths).toContain("prompt_template");
+    }
+  });
+
+  it("rejects prompt hook without provider or model", () => {
+    const result = hookFormSchema.safeParse({
+      ...base,
+      handler_type: "prompt",
+      matcher: "^bash$",
+      prompt_template: "Evaluate the tool call.",
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const paths = result.error.issues.map((e) => e.path.join("."));
+      expect(paths).toContain("provider");
+      expect(paths).toContain("model");
     }
   });
 
@@ -113,14 +135,33 @@ describe("hooks i18n key contracts", () => {
     expect(zhKeys).toEqual(enKeys);
   });
 
+  it("ru locale has same top-level keys as en", async () => {
+    const en = await import("@/i18n/locales/en/hooks.json");
+    const ru = await import("@/i18n/locales/ru/hooks.json");
+    const enKeys = Object.keys(en as unknown as Record<string, unknown>).sort();
+    const ruKeys = Object.keys(ru as unknown as Record<string, unknown>).sort();
+    expect(ruKeys).toEqual(enKeys);
+  });
+
   it("decision keys exist in all locales", async () => {
-    for (const locale of ["en", "vi", "zh"]) {
+    for (const locale of ["en", "vi", "zh", "ru"]) {
       const mod = await import(`@/i18n/locales/${locale}/hooks.json`);
       const data = mod as unknown as Record<string, Record<string, string>>;
       expect(data.decision?.allow).toBeTruthy();
       expect(data.decision?.block).toBeTruthy();
       expect(data.decision?.error).toBeTruthy();
       expect(data.decision?.timeout).toBeTruthy();
+    }
+  });
+
+  it("prompt provider/model keys exist in all locales", async () => {
+    for (const locale of ["en", "vi", "zh", "ru"]) {
+      const mod = await import(`@/i18n/locales/${locale}/hooks.json`);
+      const data = mod as unknown as Record<string, Record<string, string>>;
+      expect(data.form?.provider).toBeTruthy();
+      expect(data.form?.model).toBeTruthy();
+      expect(data.validation?.promptProviderRequired).toBeTruthy();
+      expect(data.validation?.promptModelRequired).toBeTruthy();
     }
   });
 
@@ -136,14 +177,24 @@ describe("hooks i18n key contracts", () => {
 // --- buildConfig helper (re-tested inline) ---
 
 describe("hook config builder logic", () => {
-  it("prompt type config has prompt_template and model", () => {
-    const config = {
+  it("prompt type config persists provider and model", () => {
+    const config = buildHookConfig({
+      event: "pre_tool_use",
+      handler_type: "prompt",
+      scope: "tenant",
+      matcher: "^exec$",
+      timeout_ms: 5000,
+      on_timeout: "block",
+      priority: 100,
+      enabled: true,
       prompt_template: "Evaluate this.",
-      model: "haiku",
+      provider: "cppai",
+      model: "gpt-5.6-terra",
       max_invocations_per_turn: 5,
-    };
+    });
     expect(config.prompt_template).toBeTruthy();
-    expect(config.model).toBe("haiku");
+    expect(config.provider).toBe("cppai");
+    expect(config.model).toBe("gpt-5.6-terra");
     expect(config.max_invocations_per_turn).toBe(5);
   });
 

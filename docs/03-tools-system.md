@@ -98,11 +98,11 @@ The agent loop also uses this metadata for parallel tool-call scheduling. Only r
 
 | Tool | Description |
 |---|---|
-| `memory_search` | Search memory documents (BM25 + vector hybrid) — returns L1 abstracts |
+| `memory_search` | Search memory documents and episodic memory — supports episodic `created_at` filters via `timeRange`, `createdAfter`, and `createdBefore` |
 | `memory_get` | Retrieve a specific memory document by ID |
 | `memory_expand` | Load full episodic memory content (L2 deep retrieval) |
 
-Memory layers: L1 (`memory_search`) returns ranked abstracts; L2 (`memory_expand`) loads the full summary for a given episodic ID.
+Memory layers: L1 (`memory_search`) returns ranked abstracts; L2 (`memory_expand`) loads the full summary for a given episodic ID. Use `query: "*"` with an episodic time filter to list recent episodic memories without running document search.
 
 ### Sessions (`group:sessions`)
 
@@ -144,7 +144,7 @@ Memory layers: L1 (`memory_search`) returns ranked abstracts; L2 (`memory_expand
 
 | Tool | Description |
 |---|---|
-| `delegate` | Inter-agent task delegation via agent_links (async/sync modes with timeout) |
+| `delegate` | Inter-agent task delegation via `agent_links` (async/sync, optional structured input files, isolated output publication) |
 
 ### Teams (`group:team`)
 
@@ -169,6 +169,19 @@ Memory layers: L1 (`memory_search`) returns ranked abstracts; L2 (`memory_expand
 | `read_audio` | Transcribe audio to text using Gemini File API, native OpenAI audio input, or OpenAI-compatible transcription models; unsupported provider/model routes fail closed instead of sending audio as image data |
 | `read_document` | Extract and analyze documents (PDF, DOCX, images). Supports local-first extraction via pdftotext/pandoc before falling back to cloud vision (opt-in via config) |
 | `read_video` | Analyze/transcribe video content |
+
+Image attachments keep absolute paths only in internal `MediaRef` storage.
+Model-visible `<media:image>` tags expose an exact media ID plus a logical path
+such as `.uploads/photo.jpg` or delegated `inputs/photo.jpg`. Image tools resolve
+those values against the active workspace; they never infer another agent's
+absolute workspace path. Unknown image IDs fail instead of falling back to an
+unrelated image. Exact `media_id` lookup is an in-process convenience; Claude
+CLI/MCP uses the workspace-confined logical `path` under signed bridge context.
+
+For Agent Link artifact runs, Claude CLI MCP requests carry a signed delegation
+ID and staged-input root. Bridge tools therefore apply the same read-only
+`inputs/` policy as in-process tools, and generated media remains inside
+`outputs/` until the delegation manifest is validated and atomically published.
 
 ### Skills & Content
 
@@ -362,7 +375,7 @@ flowchart TD
 | `fs` | `read_file`, `write_file`, `list_files`, `edit`, `send_file` |
 | `runtime` | `exec` |
 | `web` | `web_search`, `web_fetch` |
-| `memory` | `memory_search`, `memory_get` |
+| `memory` | `memory_search`, `memory_get`, `memory_expand`, `knowledge_graph_search` |
 | `sessions` | `sessions_list`, `sessions_history`, `sessions_send`, `spawn`, `session_status` |
 | `automation` | `cron` |
 | `messaging` | `message`, `create_forum_topic`, `list_group_members` |
@@ -613,13 +626,51 @@ stateDiagram-v2
 
 | Constraint | Default |
 |---|---|
-| Max concurrent | 8 (across all parents) |
+| Max concurrent | 20 executing descendants per root agent |
 | Max spawn depth | 1 |
 | Max children per agent | 5 |
 | Archive after | 60 min |
 | Max iterations | 20 per subagent |
 
-**Actions:** `spawn` (async, returns immediately), `run` (sync, blocks until done), `list`, `cancel` (by ID / `"all"` / `"last"`), `steer` (cancel + respawn with new message).
+`maxSpawnDepth` applies only to an agent's own subagent tree. Agent Link
+delegation starts a new tree whose spawn depth, concurrency, fanout, retry, and
+model settings are resolved from the target agent.
+
+**Actions:** `spawn(action="spawn", mode="async"|"sync")`, `get`, `list`,
+`cancel` (by ID / `"all"` / `"last"`), `steer` (cancel + respawn with new
+message), and `wait`.
+
+An accepted async spawn returns its short runtime `task_id` plus a durable
+`completion_id`. Terminal status, the full text result, and workspace-safe
+logical media descriptors are written to `subagent_tasks` before the parent
+announcement is attempted. Announcement delivery retries a bounded number of
+times; if the inbound queue is still full or the gateway restarts after
+terminal persistence, the owning root agent can recover the result and logical
+file paths with:
+
+```text
+spawn(action="get", completion_id="<uuid>")
+```
+
+The lookup is scoped by tenant and immutable root-agent UUID. A same-key agent
+created later, another agent in the tenant, and delegation completion rows
+cannot satisfy the lookup.
+
+Terminal persistence uses per-attempt database deadlines and a longer bounded
+retry window than announcement delivery. If the database remains unavailable
+for the entire window, GoClaw does not falsely mark the announcement as
+delivered; a live announcement is still attempted. On the next startup that
+can reach the database, every non-terminal completion row left by the previous
+process is marked `failed` with an interruption reason, so it cannot remain
+`queued` or `running` forever. The single-process gateway retries this
+reconciliation before accepting traffic when the database is temporarily
+unavailable. Graceful gateway shutdown drains this completion lifecycle before
+provider and database teardown.
+
+Self-spawn and Agent Link callbacks also share a process safety cap (Standard:
+32; Lite: 2) and a bounded pending queue of 128. Inside an Agent Link artifact
+run, async `spawn` and async nested `delegate` are rejected; configured
+synchronous descendants complete before the outer artifact is published.
 
 Subagents share the same `SecureCLIStore` as their parent — the credentialed binary gate cannot be bypassed by delegating exec to a child.
 

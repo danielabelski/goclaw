@@ -68,10 +68,6 @@ func (c *LarkClient) getToken(ctx context.Context) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("lark token request failed with HTTP %d", resp.StatusCode)
-	}
-
 	var result struct {
 		Code              int    `json:"code"`
 		Msg               string `json:"msg"`
@@ -108,6 +104,9 @@ type apiResponse struct {
 	Code int             `json:"code"`
 	Msg  string          `json:"msg"`
 	Data json.RawMessage `json:"data"`
+	// Bot is only present on the legacy /open-apis/bot/v3/info endpoint,
+	// which returns the bot object at the top level instead of inside "data".
+	Bot json.RawMessage `json:"bot"`
 }
 
 // doJSON performs an authenticated JSON API call with auto token refresh.
@@ -154,10 +153,6 @@ func (c *LarkClient) doJSONOnce(ctx context.Context, method, path string, body a
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("lark api %s %s: failed with HTTP %d", method, path, resp.StatusCode)
-	}
-
 	var result apiResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("lark api decode: %w", err)
@@ -183,10 +178,6 @@ func (c *LarkClient) doDownload(ctx context.Context, path string) ([]byte, strin
 		return nil, "", fmt.Errorf("lark download %s: %w", path, err)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, "", fmt.Errorf("lark download %s: failed with HTTP %d", path, resp.StatusCode)
-	}
 
 	// Check for JSON error response
 	ct := resp.Header.Get("Content-Type")
@@ -255,10 +246,6 @@ func (c *LarkClient) doMultipart(ctx context.Context, path string, fields map[st
 		return nil, fmt.Errorf("lark upload %s: %w", path, err)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("lark upload %s: failed with HTTP %d", path, resp.StatusCode)
-	}
 
 	var result apiResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {

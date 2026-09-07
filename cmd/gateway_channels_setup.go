@@ -24,6 +24,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway/methods"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/systemmessages"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
@@ -74,7 +75,7 @@ func registerConfigChannels(cfg *config.Config, channelMgr *channels.Manager, ms
 		if strings.Contains(fmt.Sprintf("%T", pgStores.DB.Driver()), "sqlite") {
 			waDialect = "sqlite3"
 		}
-		wa, err := whatsapp.New(cfg.Channels.WhatsApp, msgBus, pgStores.Pairing, pgStores.DB, pgStores.PendingMessages, waDialect, audioMgr, pgStores.BuiltinTools)
+		wa, err := whatsapp.New(cfg.Channels.WhatsApp, msgBus, pgStores.Pairing, pgStores.DB, pgStores.PendingMessages, waDialect, audioMgr, pgStores.BuiltinTools, whatsapp.WithLegacyFirstDeviceFallback())
 		if err != nil {
 			channelMgr.RecordFailure(channels.TypeWhatsApp, "", err)
 			slog.Error("failed to initialize whatsapp channel", "error", err)
@@ -216,13 +217,16 @@ func wireChannelEventSubscribers(
 
 	// Wire pairing approval notification → channel (matching TS notifyPairingApproved).
 	botName := cfg.ResolveDisplayName("default")
+	messageResolver := systemmessages.NewResolver(cfg)
 	pairingMethods.SetOnApprove(func(ctx context.Context, channel, chatID, senderID string) {
 		// Browser/internal channels use WebSocket — UI polls approval status directly.
 		if channels.IsInternalChannel(channel) {
 			slog.Debug("pairing approved for internal channel, skipping notification", "channel", channel)
 			return
 		}
-		msg := fmt.Sprintf("✅ %s access approved. Send a message to start chatting.", botName)
+		msg := messageResolver.Render("", systemmessages.KeyPairingApproved, systemmessages.Vars{
+			"app_name": botName,
+		})
 		// Group pairings need group_id metadata so channels (e.g. Zalo) route to group API.
 		if strings.HasPrefix(senderID, "group:") {
 			msgBus.PublishOutbound(bus.OutboundMessage{
@@ -236,7 +240,9 @@ func wireChannelEventSubscribers(
 		}
 	})
 
-	// Wire pairing revocation → force disconnect active WebSocket sessions.
+	// Wire pairing revocation → force disconnect active WebSocket sessions and
+	// clear the in-memory group approval cache so a revoked group re-enters the
+	// pairing gate on its next message instead of the bot replying as usual.
 	msgBus.Subscribe(bus.TopicPairingRevoked, func(event bus.Event) {
 		if event.Name != bus.EventPairingRevoked {
 			return
@@ -246,6 +252,13 @@ func wireChannelEventSubscribers(
 			return
 		}
 		go server.DisconnectByPairing(payload.SenderID, payload.Channel)
+		// Group pairings use "group:<chatID>" as sender ID (telegram) or
+		// "<chatID>" (other channels); only group entries carry an
+		// approvedGroups cache entry worth clearing.
+		if groupChatID, isGroup := strings.CutPrefix(payload.SenderID, "group:"); isGroup {
+			slog.Debug("pairing revoked, clearing group approval cache", "channel", payload.Channel, "chat_id", groupChatID)
+			channelMgr.ClearGroupApproval(payload.Channel, groupChatID)
+		}
 	})
 
 	// Cascade: when an agent becomes inactive, disable its linked channel instances.

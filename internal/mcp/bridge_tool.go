@@ -39,9 +39,9 @@ func argMapKeys(m map[string]any) string {
 // safe reconnection without data races.
 type BridgeTool struct {
 	serverName        string
-	serverID          uuid.UUID    // MCP server ID (for grant recheck)
-	toolName          string       // original MCP tool name
-	registeredName    string       // may include prefix: "{prefix}__{toolName}"
+	serverID          uuid.UUID // MCP server ID (for grant recheck)
+	toolName          string    // original MCP tool name
+	registeredName    string    // may include prefix: "{prefix}__{toolName}"
 	description       string
 	descriptionSuffix string         // admin-authored hints appended to description (see WithHints)
 	inputSchema       map[string]any // JSON Schema for parameters
@@ -224,6 +224,22 @@ func (t *BridgeTool) Execute(ctx context.Context, args map[string]any) *tools.Re
 	// instead of omitting them, causing MCP servers to reject invalid values
 	// (e.g. empty string for UUID fields).
 	cleanedArgs := t.stripEmptyOptionalArgs(args)
+	var coercedPaths []string
+	var normalizeErr error
+	cleanedArgs, coercedPaths, normalizeErr = t.normalizeArgsForSchema(cleanedArgs)
+	if normalizeErr != nil {
+		return tools.ErrorResult(fmt.Sprintf(
+			"MCP tool %q argument error: %v. For object or array parameters, pass native JSON values, not stringified JSON.",
+			t.registeredName, normalizeErr))
+	}
+	if len(coercedPaths) > 0 {
+		slog.Warn("mcp.tool.args.coerced",
+			"server", t.serverName,
+			"tool", t.registeredName,
+			"user_id", store.UserIDFromContext(ctx),
+			"agent_id", store.AgentIDFromContext(ctx),
+			"paths", strings.Join(coercedPaths, ","))
+	}
 
 	req := mcpgo.CallToolRequest{}
 	req.Params.Name = t.toolName
@@ -354,12 +370,18 @@ func (t *BridgeTool) stripEmptyOptionalArgs(args map[string]any) map[string]any 
 		}
 		if s, ok := v.(string); ok {
 			// Strip known placeholder values (e.g. "optional", "null", "http://example.com").
+			// Logged: dropping an argument silently changes query semantics (a filtered
+			// call becomes unfiltered) and is otherwise invisible in traces.
 			if isPlaceholderValue(s) {
+				slog.Warn("mcp.tool.args.stripped",
+					"tool", t.registeredName, "arg", k, "value", s, "reason", "placeholder")
 				continue
 			}
 			// Type-aware empty string: keep for string-typed params (user may want empty),
 			// strip for non-string params (empty string is never valid for number/boolean/UUID).
 			if s == "" && t.propertyType(k) != "string" {
+				slog.Warn("mcp.tool.args.stripped",
+					"tool", t.registeredName, "arg", k, "reason", "empty_string_non_string_param")
 				continue
 			}
 		}
@@ -425,17 +447,40 @@ func detectLogicalErrorPayload(text string) (string, bool) {
 
 // isAllCapsPlaceholder detects LLM-generated all-caps placeholder strings
 // like "SHOULD_NOT_BE_HERE", "DO_NOT_SEND", "NOT_APPLICABLE", "PLACEHOLDER".
+//
+// NOTE: being all-caps is NOT sufficient. Real business identifiers are commonly
+// all-caps: bank codes (BKASH, NAGAD, ROCKET), currency codes (BDT, VND, USD),
+// country codes, ticker symbols, enum values (SUCCESS, PENDING). Silently dropping
+// those turns a filtered query into an unfiltered one — the MCP server still returns
+// 200 with the full result set, so neither the model nor the operator notices, and
+// the model then reports a wrong number with full confidence.
+//
+// Only treat a value as a placeholder when it is multi-word (contains "_") or matches
+// a known single-word placeholder.
 func isAllCapsPlaceholder(s string) bool {
 	trimmed := strings.TrimSpace(s)
 	if len(trimmed) < 3 {
 		return false
 	}
+	hasUnderscore := false
 	for _, r := range trimmed {
-		if r != '_' && (r < 'A' || r > 'Z') {
+		if r == '_' {
+			hasUnderscore = true
+			continue
+		}
+		if r < 'A' || r > 'Z' {
 			return false
 		}
 	}
-	return true
+	if hasUnderscore {
+		return true
+	}
+	switch trimmed {
+	case "PLACEHOLDER", "TODO", "TBD", "XXX", "NONE", "NULL", "UNKNOWN",
+		"VALUE", "STRING", "EXAMPLE", "CHANGEME", "REPLACE", "OMIT", "SKIP":
+		return true
+	}
+	return false
 }
 
 // wrapMCPContent wraps MCP tool results as external/untrusted content.

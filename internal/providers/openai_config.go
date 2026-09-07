@@ -8,21 +8,23 @@ import (
 // OpenAIProvider implements Provider for OpenAI-compatible APIs
 // (OpenAI, Groq, OpenRouter, DeepSeek, VLLM, etc.)
 type OpenAIProvider struct {
-	name         string
-	apiKey       string
-	apiBase      string
-	chatPath     string // defaults to "/chat/completions"
-	authPrefix   string // auth header prefix, defaults to "Bearer " if empty
-	defaultModel string
-	providerType string // DB provider_type (e.g. "gemini_native", "openai", "minimax_native")
-	siteURL      string // optional site URL for provider identification (e.g. OpenRouter HTTP-Referer)
-	siteTitle    string // optional site title for provider identification (e.g. OpenRouter X-Title)
-	extraHeaders map[string]string // static headers set on every outgoing request (e.g. fixed User-Agent for kimi_coding)
-	client       *http.Client
-	retryConfig  RetryConfig
-	middlewares  RequestMiddleware // composed middleware chain (nil = no-op)
-	registry     ModelRegistry    // model resolution registry (nil = skip)
-	noAuthHeader bool             // when true, doRequest() skips setting Authorization (e.g. Vertex OAuth transport injects its own)
+	name            string
+	apiKey          string
+	apiBase         string
+	chatPath        string // defaults to "/chat/completions"
+	authPrefix      string // auth header prefix, defaults to "Bearer " if empty
+	defaultModel    string
+	providerType    string            // DB provider_type (e.g. "gemini_native", "openai", "minimax_native")
+	siteURL         string            // optional site URL for provider identification (e.g. OpenRouter HTTP-Referer)
+	siteTitle       string            // optional site title for provider identification (e.g. OpenRouter X-Title)
+	extraHeaders    map[string]string // static headers set on every outgoing request (e.g. fixed User-Agent for kimi_coding)
+	client          *http.Client
+	retryConfig     RetryConfig
+	middlewares     RequestMiddleware // composed middleware chain (nil = no-op)
+	registry        ModelRegistry     // model resolution registry (nil = skip)
+	noAuthHeader    bool              // when true, doRequest() skips setting Authorization (e.g. Vertex OAuth transport injects its own)
+	ollamaNumCtx    *int              // optional Ollama options.num_ctx override (nil = use queried or default value)
+	thinkingEnabled *bool             // provider-level override for "think" on Ollama endpoints (nil = default off)
 }
 
 func NewOpenAIProvider(name, apiKey, apiBase, defaultModel string) *OpenAIProvider {
@@ -43,7 +45,7 @@ func NewOpenAIProvider(name, apiKey, apiBase, defaultModel string) *OpenAIProvid
 	}
 }
 
-// WithChatPath returns a copy with a custom chat completions path (e.g. "/text/chatcompletion_v2" for MiniMax native API).
+// WithChatPath returns a copy with a custom chat completions path.
 func (p *OpenAIProvider) WithChatPath(path string) *OpenAIProvider {
 	p.chatPath = path
 	return p
@@ -127,9 +129,41 @@ func (p *OpenAIProvider) WithoutAuthHeader() *OpenAIProvider {
 	return p
 }
 
-func (p *OpenAIProvider) Name() string           { return p.name }
-func (p *OpenAIProvider) DefaultModel() string   { return p.defaultModel }
-func (p *OpenAIProvider) SupportsThinking() bool { return true }
+// WithOllamaNumCtx sets a static options.num_ctx value injected on every Ollama request.
+// When set, this takes precedence over the value queried from /api/show and the built-in
+// default of 131072. A non-positive value is ignored.
+func (p *OpenAIProvider) WithOllamaNumCtx(n int) *OpenAIProvider {
+	if n > 0 {
+		p.ollamaNumCtx = &n
+	}
+	return p
+}
+
+// OllamaNumCtx returns the configured num_ctx override, or nil if not set.
+func (p *OpenAIProvider) OllamaNumCtx() *int {
+	return p.ollamaNumCtx
+}
+
+// WithThinkingEnabled sets the provider-level override for whether Ollama
+// endpoints should be asked to emit visible reasoning/thinking tokens
+// (sets body["think"] in buildRequestBody). nil (not calling this) preserves
+// the existing default of disabling thinking on Ollama endpoints.
+func (p *OpenAIProvider) WithThinkingEnabled(enabled *bool) *OpenAIProvider {
+	p.thinkingEnabled = enabled
+	return p
+}
+
+// ThinkingEnabled returns the configured provider-level thinking override, or nil if not set.
+func (p *OpenAIProvider) ThinkingEnabled() *bool {
+	return p.thinkingEnabled
+}
+
+func (p *OpenAIProvider) Name() string         { return p.name }
+func (p *OpenAIProvider) DefaultModel() string { return p.defaultModel }
+
+// SupportsThinking returns false for Ollama endpoints, which disable thinking by default
+// (models like qwq and deepseek-r1 have thinking on by default and goclaw suppresses it).
+func (p *OpenAIProvider) SupportsThinking() bool { return !p.isOllamaEndpoint() }
 func (p *OpenAIProvider) APIKey() string         { return p.apiKey }
 func (p *OpenAIProvider) APIBase() string        { return p.apiBase }
 func (p *OpenAIProvider) AuthPrefix() string     { return p.authPrefix }
@@ -141,7 +175,7 @@ func (p *OpenAIProvider) Capabilities() ProviderCapabilities {
 		Streaming:        true,
 		ToolCalling:      true,
 		StreamWithTools:  true,
-		Thinking:         true,
+		Thinking:         !p.isOllamaEndpoint(),
 		Vision:           true,
 		CacheControl:     false,
 		MaxContextWindow: 128_000,

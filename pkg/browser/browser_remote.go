@@ -16,13 +16,14 @@ import (
 
 // reconnectLocked re-establishes the CDP connection to a remote Chrome.
 // Must be called with m.mu held. Only works when remoteURL is set.
+// Not supported on Lightpanda (each page is its own connection).
 func (m *Manager) reconnectLocked() error {
+	if m.backend == BackendLightpanda {
+		return fmt.Errorf("reconnect not supported on lightpanda backend")
+	}
 	m.closeTenantContextsLocked()
 	m.browser = nil
-	m.pages = make(map[string]*rod.Page)
-	m.console = make(map[string][]ConsoleMessage)
-	m.pageTenants = make(map[string]string)
-	m.pageLastUsed = make(map[string]time.Time)
+	m.resetPageMapsLocked()
 	m.refs = NewRefStore()
 
 	controlURL, err := resolveRemoteCDP(m.remoteURL)
@@ -38,12 +39,50 @@ func (m *Manager) reconnectLocked() error {
 	return nil
 }
 
+// mostRecentPageLocked returns the page most recently accessed (via pageLastUsed).
+// Returns nil if no pages are open. Must be called with mu held.
+func (m *Manager) mostRecentPageLocked() *rod.Page {
+	var newestID string
+	var newestTime time.Time
+	for tid, lu := range m.pageLastUsed {
+		if newestID == "" || lu.After(newestTime) {
+			newestID = tid
+			newestTime = lu
+		}
+	}
+	if newestID == "" {
+		// Fallback: any page in the map (no last-used recorded).
+		for _, p := range m.pages {
+			return p
+		}
+		return nil
+	}
+	return m.pages[newestID]
+}
+
 // getPage looks up a page by targetID. If targetID is empty, returns the first available page.
 // Must be called with m.mu held. If the connection is dead and remoteURL is set,
-// it attempts one automatic reconnect.
+// it attempts one automatic reconnect (chrome only — lightpanda pages can't be
+// reconnected because each page IS a connection).
 func (m *Manager) getPage(targetID string) (*rod.Page, error) {
-	if m.browser == nil {
+	if !m.isRunningLocked() {
 		return nil, fmt.Errorf("browser not running")
+	}
+
+	// Lightpanda: local map is authoritative (no /json/list upstream). No
+	// auto-reconnect — a dead WS means the browser is gone server-side.
+	if m.backend == BackendLightpanda {
+		if targetID != "" {
+			if p, ok := m.pages[targetID]; ok {
+				return p, nil
+			}
+			return nil, fmt.Errorf("tab not found: %s", targetID)
+		}
+		// No targetID: most-recently-used page from the local map.
+		if p := m.mostRecentPageLocked(); p != nil {
+			return p, nil
+		}
+		return nil, fmt.Errorf("no tabs open")
 	}
 
 	// If targetID specified, look in cache first

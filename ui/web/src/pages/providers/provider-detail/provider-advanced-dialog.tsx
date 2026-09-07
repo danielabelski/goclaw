@@ -39,6 +39,11 @@ function deriveState(provider: ProviderData) {
     acpIdleTTL: (s?.idle_ttl as string) || "",
     acpPermMode: (s?.perm_mode as string) || "approve-all",
     acpWorkDir: (s?.work_dir as string) || "",
+    numCtx: (s?.num_ctx as string) || "",
+    thinkingEnabled:
+      typeof s?.thinking_enabled === "boolean"
+        ? (s.thinking_enabled as boolean)
+        : null,
   };
 }
 
@@ -64,6 +69,8 @@ export function ProviderAdvancedDialog({
   const [acpIdleTTL, setAcpIdleTTL] = useState(init.acpIdleTTL);
   const [acpPermMode, setAcpPermMode] = useState(init.acpPermMode);
   const [acpWorkDir, setAcpWorkDir] = useState(init.acpWorkDir);
+  const [numCtx, setNumCtx] = useState(init.numCtx);
+  const [thinkingEnabled, setThinkingEnabled] = useState(init.thinkingEnabled);
 
   // Re-sync when dialog opens
   useEffect(() => {
@@ -75,7 +82,9 @@ export function ProviderAdvancedDialog({
     setAcpIdleTTL(s.acpIdleTTL);
     setAcpPermMode(s.acpPermMode);
     setAcpWorkDir(s.acpWorkDir);
-     
+    setNumCtx(s.numCtx);
+    setThinkingEnabled(s.thinkingEnabled);
+
   }, [open, provider]);
 
   const [saving, setSaving] = useState(false);
@@ -98,6 +107,13 @@ export function ProviderAdvancedDialog({
         if (Object.keys(settings).length > 0) data.settings = settings;
       } else if (isStandard) {
         data.api_base = apiBase.trim() || undefined;
+        // Handle Ollama-specific settings
+        if (provider.provider_type === "ollama" || provider.provider_type === "ollama_cloud") {
+          const settings: Record<string, unknown> = {};
+          if (numCtx.trim()) settings.num_ctx = parseInt(numCtx.trim(), 10);
+          if (thinkingEnabled !== null) settings.thinking_enabled = thinkingEnabled;
+          if (Object.keys(settings).length > 0) data.settings = settings;
+        }
       }
 
       await onUpdate(provider.id, data);
@@ -153,6 +169,55 @@ export function ProviderAdvancedDialog({
                   placeholder={typeInfo?.placeholder || typeInfo?.apiBase || "https://api.example.com/v1"}
                   className="text-base md:text-sm"
                 />
+              </div>
+            </>
+          )}
+
+          {/* Ollama Configuration */}
+          {(provider.provider_type === "ollama" || provider.provider_type === "ollama_cloud") && (
+            <>
+              <ConfigGroupHeader
+                title={t("ollama.title")}
+                description={t("ollama.description")}
+              />
+              <div className="space-y-2">
+                <Label htmlFor="numCtx">{t("ollama.numCtx")}</Label>
+                <Input
+                  id="numCtx"
+                  type="number"
+                  value={numCtx}
+                  onChange={(e) => setNumCtx(e.target.value)}
+                  placeholder={t("ollama.numCtxPlaceholder")}
+                  min="512"
+                  max="1000000"
+                  className="text-base md:text-sm"
+                />
+                <p className="text-xs text-muted-foreground">{t("ollama.numCtxHelp")}</p>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="thinkingEnabled">{t("ollama.thinkingEnabled")}</Label>
+                <Select
+                  value={
+                    thinkingEnabled === null
+                      ? "default"
+                      : thinkingEnabled
+                        ? "on"
+                        : "off"
+                  }
+                  onValueChange={(v) =>
+                    setThinkingEnabled(v === "default" ? null : v === "on")
+                  }
+                >
+                  <SelectTrigger id="thinkingEnabled" className="text-base md:text-sm">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="default">{t("ollama.thinkingEnabledDefault")}</SelectItem>
+                    <SelectItem value="on">{t("ollama.thinkingEnabledOn")}</SelectItem>
+                    <SelectItem value="off">{t("ollama.thinkingEnabledOff")}</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">{t("ollama.thinkingEnabledHelp")}</p>
               </div>
             </>
           )}

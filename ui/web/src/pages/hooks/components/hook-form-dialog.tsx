@@ -16,11 +16,12 @@ import { hookFormSchema, type HookFormData } from "@/schemas/hooks.schema";
 import type { HookConfig } from "@/hooks/use-hooks";
 import { useAuthStore } from "@/stores/use-auth-store";
 import { useAgents } from "@/pages/agents/hooks/use-agents";
+import { ProviderModelSelect } from "@/components/shared/provider-model-select";
 import { ScriptEditor } from "./script-editor";
 
 const HOOK_EVENTS = [
   "session_start", "user_prompt_submit", "pre_tool_use",
-  "post_tool_use", "stop", "subagent_start", "subagent_stop",
+  "post_tool_use", "post_model_response", "stop", "subagent_start", "subagent_stop",
 ] as const;
 
 interface HookFormDialogProps {
@@ -39,7 +40,7 @@ export function HookFormDialog({ open, onOpenChange, onSubmit, initial }: HookFo
     : (["tenant", "agent"] as const);
 
   const {
-    register, control, handleSubmit, watch, reset,
+    register, control, handleSubmit, watch, reset, setValue,
     formState: { errors, isSubmitting },
   } = useForm<HookFormData>({
     resolver: zodResolver(hookFormSchema),
@@ -54,12 +55,16 @@ export function HookFormDialog({ open, onOpenChange, onSubmit, initial }: HookFo
       priority: 100,
       enabled: true,
       method: "POST",
+      provider: "",
+      model: "",
       max_invocations_per_turn: 5,
     },
   });
 
   const handlerType = watch("handler_type");
   const scope = watch("scope");
+  const promptProvider = watch("provider") ?? "";
+  const promptModel = watch("model") ?? "";
   const { agents } = useAgents();
   // Builtin rows (Phase 04/05) ship with source='builtin'. UI + backend agree:
   // only `enabled` is mutable. All other inputs render as read-only, and the
@@ -94,6 +99,7 @@ export function HookFormDialog({ open, onOpenChange, onSubmit, initial }: HookFo
           headers: cfg.headers ? JSON.stringify(cfg.headers) : "",
           body_template: (cfg.body_template as string) ?? "",
           prompt_template: (cfg.prompt_template as string) ?? "",
+          provider: (cfg.provider as string) ?? "",
           model: (cfg.model as string) ?? "",
           max_invocations_per_turn: (cfg.max_invocations_per_turn as number) ?? 5,
           script_source: (cfg.source as string) ?? "",
@@ -326,19 +332,29 @@ export function HookFormDialog({ open, onOpenChange, onSubmit, initial }: HookFo
                 )}
               </div>
               <div className="space-y-1.5">
-                <Label>{t("form.model")}</Label>
-                <Controller control={control} name="model" render={({ field }) => (
-                  <Select value={field.value ?? "haiku"} onValueChange={field.onChange} disabled={isBuiltin}>
-                    <SelectTrigger className="text-base md:text-sm">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="haiku">haiku</SelectItem>
-                      <SelectItem value="sonnet">sonnet</SelectItem>
-                      <SelectItem value="opus">opus</SelectItem>
-                    </SelectContent>
-                  </Select>
-                )} />
+                <ProviderModelSelect
+                  provider={promptProvider}
+                  onProviderChange={(value) => {
+                    setValue("provider", value, { shouldDirty: true, shouldValidate: true });
+                    setValue("model", "", { shouldDirty: true, shouldValidate: true });
+                  }}
+                  model={promptModel}
+                  onModelChange={(value) => setValue("model", value, { shouldDirty: true, shouldValidate: true })}
+                  providerLabel={t("form.provider")}
+                  modelLabel={t("form.model")}
+                  showVerify
+                  disabled={isBuiltin}
+                />
+                {errors.provider && (
+                  <p className="text-xs text-destructive">
+                    {t(errors.provider.message ?? "validation.promptProviderRequired")}
+                  </p>
+                )}
+                {errors.model && (
+                  <p className="text-xs text-destructive">
+                    {t(errors.model.message ?? "validation.promptModelRequired")}
+                  </p>
+                )}
               </div>
               <div className="space-y-1.5">
                 <Label>{t("form.maxInvocationsPerTurn")}</Label>

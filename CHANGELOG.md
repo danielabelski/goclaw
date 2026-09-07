@@ -4,6 +4,16 @@ All notable changes to GoClaw are documented here. For full documentation, see [
 
 ## Unreleased
 
+### Changed
+
+- **Bitrix24 channel migrated to imbot v2 messaging API** — outbound text now uses
+  `imbot.v2.Chat.Message.send` (replacing `imbot.message.add`); bot verification/lookup
+  uses `imbot.v2.Bot.list` (replacing `imbot.bot.list` + the legacy `imbot.list` fallback);
+  bot teardown uses `imbot.v2.Bot.unregister` (replacing `imbot.unregister`). Bot
+  registration intentionally stays on v1 `imbot.register` — v2 `imbot.v2.Bot.register`
+  changes the event-delivery model (per-event handler URLs → `eventMode`), which would
+  require rewriting the inbound event parser. No user-facing behavior change.
+
 ### Added
 
 - **Behavior UX sidecar delivery overrides** — Adds sidecar-generated Quick
@@ -21,6 +31,14 @@ All notable changes to GoClaw are documented here. For full documentation, see [
   pre-write discovery via `vault_search`, `memory_search`, and
   `knowledge_graph_search` to surface related files before writing and
   avoid duplicates; documents Vault scope mirroring and id-routing rules.
+- **Bitrix24 channel 2-way media (file) transfer** — Inbound media downloads via
+  `imbot.v2.File.download` (one-time authenticated URL) with MIME preservation for
+  images, PDFs, audio, and video. Outbound uploads via `imbot.v2.File.upload` (base64).
+  Shared `media_max_mb` config knob (default 20 MB) caps both directions. Requires
+  `imbot` OAuth scope (no `disk` scope needed). Inbound handled by new
+  `internal/channels/bitrix24/download.go`; outbound by `send_media.go`. New
+  `BaseChannel.HandleMessageMedia()` method centralizes media-aware message handling.
+  See `docs/05-channels-messaging.md` § 16 (Bitrix24) for configuration.
 
 - **Skill agent manage grants** — Adds per-agent skill edit/delete grants with
   backend checks, HTTP/WS support, SQLite and PostgreSQL schema updates, and web

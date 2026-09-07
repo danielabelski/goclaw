@@ -11,6 +11,7 @@ import (
 
 	"github.com/nextlevelbuilder/goclaw/internal/agent"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	orch "github.com/nextlevelbuilder/goclaw/internal/orchestration"
 	"github.com/nextlevelbuilder/goclaw/internal/scheduler"
@@ -26,7 +27,9 @@ func makeDelegateAnnounceCallback(
 	msgBus *bus.MessageBus,
 ) func(sessionKey string, items []tools.AnnounceQueueItem, meta tools.AnnounceMetadata) {
 	return func(sessionKey string, items []tools.AnnounceQueueItem, meta tools.AnnounceMetadata) {
-		roster := subagentMgr.RosterForParent(meta.ParentAgent)
+		roster := subagentMgr.RosterForParent(tools.TaskScope{
+			TenantID: meta.OriginTenantID, RootAgentID: meta.RootAgentID, RootAgentKey: meta.ParentAgent,
+		})
 		content := tools.FormatBatchedAnnounce(items, roster)
 		senderID := fmt.Sprintf("subagent:batch-%d", len(items))
 		label := items[0].Label
@@ -34,12 +37,13 @@ func makeDelegateAnnounceCallback(
 			label = fmt.Sprintf("%d tasks", len(items))
 		}
 		batchMeta := map[string]string{
-			tools.MetaOriginChannel:    meta.OriginChannel,
-			tools.MetaOriginPeerKind:   meta.OriginPeerKind,
-			tools.MetaParentAgent:      meta.ParentAgent,
-			tools.MetaSubagentLabel:    label,
-			tools.MetaOriginTraceID:    meta.OriginTraceID,
-			tools.MetaOriginRootSpanID: meta.OriginRootSpanID,
+			tools.MetaOriginChannel:       meta.OriginChannel,
+			tools.MetaOriginPeerKind:      meta.OriginPeerKind,
+			tools.MetaParentAgent:         meta.ParentAgent,
+			tools.MetaSubagentRootAgentID: meta.RootAgentID.String(),
+			tools.MetaSubagentLabel:       label,
+			tools.MetaOriginTraceID:       meta.OriginTraceID,
+			tools.MetaOriginRootSpanID:    meta.OriginRootSpanID,
 		}
 		if meta.OriginLocalKey != "" {
 			batchMeta[tools.MetaOriginLocalKey] = meta.OriginLocalKey
@@ -68,7 +72,7 @@ func makeDelegateAnnounceCallback(
 			"tasks":   len(items),
 		})
 
-		msgBus.PublishInbound(bus.InboundMessage{
+		delivered := tools.PublishAsyncCompletion(context.Background(), msgBus, bus.InboundMessage{
 			Channel:  "system",
 			SenderID: senderID,
 			ChatID:   meta.OriginChatID,
@@ -78,6 +82,30 @@ func makeDelegateAnnounceCallback(
 			Metadata: batchMeta,
 			Media:    batchMedia,
 		})
+		for _, item := range items {
+			if !item.DurablyPersisted {
+				slog.Error("subagent.batch_announce_without_durable_terminal",
+					"task_id", item.SubagentID,
+					"completion_id", item.CompletionID,
+					"root_agent_id", meta.RootAgentID,
+					"delivered", delivered,
+				)
+				continue
+			}
+			subagentMgr.UpdateAnnouncementStatus(
+				store.WithTenantID(context.Background(), meta.OriginTenantID),
+				meta.RootAgentID,
+				item.CompletionID,
+				delivered,
+			)
+		}
+		if !delivered {
+			slog.Warn("subagent.batch_announce_deferred_to_ledger",
+				"root_agent_id", meta.RootAgentID,
+				"batch_size", len(items),
+				"reason", "inbound_bus_full",
+			)
+		}
 	}
 }
 
@@ -95,7 +123,7 @@ type subagentAnnounceEntry struct {
 
 // subagentAnnounceRouting holds shared routing info captured by the first enqueue.
 type subagentAnnounceRouting struct {
-	QueueKey         string    // tenant-scoped key for sync.Map (tenantID:sessionKey)
+	QueueKey         string    // tenant/root/session/topic/user/authority-scoped key
 	SessionKey       string    // original session key (no tenant prefix) for RunRequest
 	TenantID         uuid.UUID // preserved for tenant-scoped scheduling
 	OrigChannel      string
@@ -107,6 +135,7 @@ type subagentAnnounceRouting struct {
 	SenderID         string // real acting sender (preserves permission attribution through re-ingress, #915)
 	Role             string // caller's RBAC role; bypasses per-user grants for admin/operator/owner (#915)
 	ParentAgent      string
+	RootAgentID      uuid.UUID
 	ParentTraceID    uuid.UUID
 	ParentRootSpanID uuid.UUID
 	OutMeta          map[string]string
@@ -129,6 +158,7 @@ func processSubagentAnnounceLoop(
 	sched *scheduler.Scheduler,
 	msgBus *bus.MessageBus,
 	cfg *config.Config,
+	channelMgr *channels.Manager,
 ) {
 	// Ensure tenant scope is always set for the scheduler.
 	if r.TenantID != uuid.Nil {
@@ -154,7 +184,9 @@ func processSubagentAnnounceLoop(
 		}
 
 		// Refresh roster each iteration for up-to-date task statuses.
-		roster = subagentMgr.RosterForParent(r.ParentAgent)
+		roster = subagentMgr.RosterForParent(tools.TaskScope{
+			TenantID: r.TenantID, RootAgentID: r.RootAgentID, RootAgentKey: r.ParentAgent,
+		})
 		content := buildMergedSubagentAnnounce(entries, roster)
 
 		// Collect media from all entries.
@@ -176,6 +208,7 @@ func processSubagentAnnounceLoop(
 			Channel:          r.OrigChannel,
 			ChannelType:      r.OrigChannelType,
 			ChatID:           r.OrigChatID,
+			ChatTitle:        resolveGroupDisplayTitle(ctx, channelMgr, r.OrigChannel, r.OrigChatID, r.OrigPeerKind, ""),
 			PeerKind:         r.OrigPeerKind,
 			LocalKey:         r.OrigLocalKey,
 			UserID:           r.UserID,

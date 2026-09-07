@@ -63,15 +63,16 @@ func (m *CronMethods) handleList(ctx context.Context, client *gateway.Client, re
 func (m *CronMethods) handleCreate(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
 	locale := store.LocaleFromContext(ctx)
 	var params struct {
-		Name           string             `json:"name"`
-		Schedule       store.CronSchedule `json:"schedule"`
-		Message        string             `json:"message"`
-		Deliver        bool               `json:"deliver"`
-		DeliverChannel string             `json:"deliverChannel"`
-		DeliverTo      string             `json:"deliverTo"`
-		WakeHeartbeat  bool               `json:"wakeHeartbeat"`
-		Stateless      *bool              `json:"stateless"` // default true for new crons
-		AgentID        string             `json:"agentId"`
+		Name           string                 `json:"name"`
+		Schedule       store.CronSchedule     `json:"schedule"`
+		Message        string                 `json:"message"`
+		Command        *store.CronCommandSpec `json:"command"` // set → deterministic command payload (no LLM)
+		Deliver        bool                   `json:"deliver"`
+		DeliverChannel string                 `json:"deliverChannel"`
+		DeliverTo      string                 `json:"deliverTo"`
+		WakeHeartbeat  bool                   `json:"wakeHeartbeat"`
+		Stateless      *bool                  `json:"stateless"` // default true for new crons
+		AgentID        string                 `json:"agentId"`
 	}
 	if req.Params != nil {
 		json.Unmarshal(req.Params, &params)
@@ -85,7 +86,18 @@ func (m *CronMethods) handleCreate(ctx context.Context, client *gateway.Client, 
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidSlug, "name")))
 		return
 	}
-	if params.Message == "" {
+
+	isCommand := params.Command != nil
+	if isCommand {
+		if !m.cfg.Cron.CommandEnabled {
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrUnauthorized, i18n.T(locale, i18n.MsgCommandCronDisabled)))
+			return
+		}
+		if err := store.ValidateCronCommandSpec(params.Command); err != nil {
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, err.Error()))
+			return
+		}
+	} else if params.Message == "" {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgMsgRequired)))
 		return
 	}
@@ -93,6 +105,13 @@ func (m *CronMethods) handleCreate(ctx context.Context, client *gateway.Client, 
 	job, err := m.service.AddJob(ctx, params.Name, params.Schedule, params.Message, params.Deliver, params.DeliverChannel, params.DeliverTo, params.AgentID, client.UserID())
 	if err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, err.Error()))
+		return
+	}
+	// Anti-panic guard: a store may return (nil, nil) if the insert succeeded but
+	// the tenant-scoped readback failed (e.g. tenant asymmetry). Never dereference
+	// a nil job below.
+	if job == nil {
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, i18n.T(locale, i18n.MsgInternalError, "cron job created but could not be loaded")))
 		return
 	}
 
@@ -107,7 +126,16 @@ func (m *CronMethods) handleCreate(ctx context.Context, client *gateway.Client, 
 		if params.WakeHeartbeat {
 			patch.WakeHeartbeat = &params.WakeHeartbeat
 		}
-		if updated, pErr := m.service.UpdateJob(ctx, job.ID, patch); pErr == nil {
+		if isCommand {
+			patch.Command = params.Command
+		}
+		// Patch under a tenant-consistent context: the job was inserted under
+		// job.TenantID (which falls back to MasterTenantID for nil-tenant /
+		// master-scope connections). Using the raw ctx here would make
+		// lockCronJobForMutation miss the row for nil-tenant callers, silently
+		// dropping the stateless/command patch.
+		updateCtx := store.WithTenantID(ctx, job.TenantID)
+		if updated, pErr := m.service.UpdateJob(updateCtx, job.ID, patch); pErr == nil {
 			job = updated
 		}
 	}
@@ -241,6 +269,21 @@ func (m *CronMethods) handleUpdate(ctx context.Context, client *gateway.Client, 
 	if err := store.CheckCronCredentialOwner(ctx, existing); err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrUnauthorized, i18n.T(locale, i18n.MsgPermissionDenied, "cron job credential context")))
 		return
+	}
+
+	// A command payload on update must clear the same gate as create: command
+	// cron must be enabled and the spec must be valid. Without this, a normal job
+	// could be mutated into a command job (or persisted with an invalid spec) on a
+	// gateway where command cron is disabled.
+	if params.Patch.Command != nil {
+		if !m.cfg.Cron.CommandEnabled {
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrUnauthorized, i18n.T(locale, i18n.MsgCommandCronDisabled)))
+			return
+		}
+		if err := store.ValidateCronCommandSpec(params.Patch.Command); err != nil {
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, err.Error()))
+			return
+		}
 	}
 
 	job, err := m.service.UpdateJob(ctx, jobID, params.Patch)

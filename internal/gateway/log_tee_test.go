@@ -33,7 +33,12 @@ func TestLogTeeAggregateIncludesWithAttrsAndGroupEntries(t *testing.T) {
 func TestLogTeeAggregateRedactsSensitiveAttrs(t *testing.T) {
 	tee := NewLogTee(slog.NewTextHandler(io.Discard, nil))
 	rec := slog.NewRecord(time.Now(), slog.LevelInfo, "secret", 0)
-	rec.AddAttrs(slog.String("api_token", "leak"), slog.String("source", "test"))
+	rec.AddAttrs(
+		slog.String("api_token", "leak"),
+		slog.Int("total_tokens", 123),
+		slog.Int("last_prompt_tokens", 100),
+		slog.String("source", "test"),
+	)
 	if err := tee.Handle(context.Background(), rec); err != nil {
 		t.Fatal(err)
 	}
@@ -41,5 +46,11 @@ func TestLogTeeAggregateRedactsSensitiveAttrs(t *testing.T) {
 	attrs, _ := entries[0]["attrs"].(map[string]any)
 	if attrs["api_token"] != redactedValue {
 		t.Fatalf("attrs = %+v", attrs)
+	}
+	if attrs["total_tokens"] != "123" {
+		t.Fatalf("total_tokens = %#v, want 123", attrs["total_tokens"])
+	}
+	if attrs["last_prompt_tokens"] != "100" {
+		t.Fatalf("last_prompt_tokens = %#v, want 100", attrs["last_prompt_tokens"])
 	}
 }

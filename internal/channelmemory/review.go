@@ -22,21 +22,27 @@ func (s *Service) Approve(ctx context.Context, itemID uuid.UUID, approver string
 		return nil, fmt.Errorf("item is not approvable")
 	}
 	sourceID := item.SourceID
-	exists, err := s.Episodic.ExistsBySourceID(ctx, item.AgentID.String(), item.UserID, sourceID)
+	// Passive channel extraction is reusable channel context, not a personal
+	// memory of the channel instance creator or current sender.
+	memoryUserID := ""
+	exists, err := s.Episodic.ExistsBySourceID(ctx, item.AgentID.String(), memoryUserID, sourceID)
 	if err != nil {
 		return nil, err
 	}
 	if !exists {
+		retention := s.retentionDuration(ctx, item)
+		keyTopics := memoryKeyTopics(item)
 		ep := &store.EpisodicSummary{
 			TenantID:   item.TenantID,
 			AgentID:    item.AgentID,
-			UserID:     item.UserID,
+			UserID:     memoryUserID,
 			SessionKey: "channel:" + item.ChannelInstanceID.String(),
 			Summary:    item.Summary,
-			KeyTopics:  decodeStrings(item.Topics),
+			KeyTopics:  keyTopics,
+			L0Abstract: item.Summary,
 			SourceID:   sourceID,
 			SourceType: "channel",
-			ExpiresAt:  new(time.Now().UTC().Add(90 * 24 * time.Hour)),
+			ExpiresAt:  timePtr(time.Now().UTC().Add(retention)),
 		}
 		if err := s.Episodic.Create(ctx, ep); err != nil {
 			return nil, err
@@ -53,9 +59,18 @@ func (s *Service) Approve(ctx context.Context, itemID uuid.UUID, approver string
 					EpisodicID:  ep.ID.String(),
 					SessionKey:  ep.SessionKey,
 					Summary:     item.Summary,
+					KeyTopics:   keyTopics,
 					KeyEntities: decodeStrings(item.Entities),
 				},
 			})
+		}
+	} else {
+		ep, err := s.Episodic.GetBySourceID(ctx, item.AgentID.String(), memoryUserID, sourceID)
+		if err != nil {
+			return nil, err
+		}
+		if ep != nil {
+			item.EpisodicID = ep.ID.String()
 		}
 	}
 	now := time.Now().UTC()
@@ -70,6 +85,17 @@ func (s *Service) Approve(ctx context.Context, itemID uuid.UUID, approver string
 	}
 	item.Status = store.ChannelMemoryItemWritten
 	return item, nil
+}
+
+func (s *Service) retentionDuration(ctx context.Context, item *store.ChannelMemoryExtractionItem) time.Duration {
+	cfg := DefaultConfig()
+	if s.Channels != nil && item != nil {
+		inst, err := s.Channels.Get(ctx, item.ChannelInstanceID)
+		if err == nil && inst != nil {
+			cfg = ParseConfig(inst.Config)
+		}
+	}
+	return time.Duration(cfg.RetentionHours) * time.Hour
 }
 
 func (s *Service) Reject(ctx context.Context, itemID uuid.UUID, actor string) error {

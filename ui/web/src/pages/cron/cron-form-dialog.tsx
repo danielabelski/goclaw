@@ -13,7 +13,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import type { CronSchedule } from "./hooks/use-cron";
+import type { CronCommandSpec, CronSchedule } from "./hooks/use-cron";
 import { slugify } from "@/lib/slug";
 import { useAgents } from "@/pages/agents/hooks/use-agents";
 import { cronCreateSchema, type CronCreateFormData } from "@/schemas/cron.schema";
@@ -24,7 +24,8 @@ interface CronFormDialogProps {
   onSubmit: (data: {
     name: string;
     schedule: CronSchedule;
-    message: string;
+    message?: string;
+    command?: CronCommandSpec;
     agentId?: string;
   }) => Promise<void>;
 }
@@ -38,7 +39,14 @@ export function CronFormDialog({ open, onOpenChange, onSubmit }: CronFormDialogP
     mode: "onChange",
     defaultValues: {
       name: "",
+      payloadKind: "agent_turn",
       message: "",
+      commandArgvText: "sh\n-c\necho hello",
+      commandCwd: "",
+      commandTimeoutSeconds: "",
+      commandNoOutputTimeoutSeconds: "",
+      commandOutputMaxBytes: "",
+      commandInput: "",
       agentId: "",
       scheduleKind: "every",
       everyValue: "60",
@@ -47,6 +55,7 @@ export function CronFormDialog({ open, onOpenChange, onSubmit }: CronFormDialogP
   });
 
   const scheduleKind = watch("scheduleKind");
+  const payloadKind = watch("payloadKind");
 
   const onFormSubmit = async (data: CronCreateFormData) => {
     let schedule: CronSchedule;
@@ -58,10 +67,22 @@ export function CronFormDialog({ open, onOpenChange, onSubmit }: CronFormDialogP
       schedule = { kind: "at", atMs: Date.now() + 60000 };
     }
 
+    const command = data.payloadKind === "command"
+      ? {
+        argv: (data.commandArgvText || "").split("\n").map((v) => v.trim()).filter(Boolean),
+        cwd: data.commandCwd?.trim() || undefined,
+        timeoutSeconds: data.commandTimeoutSeconds ? Number(data.commandTimeoutSeconds) : undefined,
+        noOutputTimeoutSeconds: data.commandNoOutputTimeoutSeconds ? Number(data.commandNoOutputTimeoutSeconds) : undefined,
+        outputMaxBytes: data.commandOutputMaxBytes ? Number(data.commandOutputMaxBytes) : undefined,
+        input: data.commandInput || undefined,
+      } satisfies CronCommandSpec
+      : undefined;
+
     await onSubmit({
       name: data.name,
       schedule,
-      message: data.message,
+      message: data.payloadKind === "agent_turn" ? data.message : undefined,
+      command,
       agentId: data.agentId || undefined,
     });
     onOpenChange(false);
@@ -115,6 +136,24 @@ export function CronFormDialog({ open, onOpenChange, onSubmit }: CronFormDialogP
             />
           </div>
 
+
+          <div className="space-y-2">
+            <Label>{t("create.payloadType")}</Label>
+            <div className="flex gap-2">
+              {(["agent_turn", "command"] as const).map((kind) => (
+                <Button
+                  key={kind}
+                  type="button"
+                  variant={payloadKind === kind ? "default" : "outline"}
+                  size="sm"
+                  onClick={() => setValue("payloadKind", kind, { shouldValidate: true })}
+                >
+                  {kind === "command" ? t("payload.command") : t("payload.agent")}
+                </Button>
+              ))}
+            </div>
+          </div>
+
           <div className="space-y-2">
             <Label>{t("create.scheduleType")}</Label>
             <div className="flex gap-2">
@@ -160,17 +199,56 @@ export function CronFormDialog({ open, onOpenChange, onSubmit }: CronFormDialogP
             </p>
           )}
 
-          <div className="space-y-2">
-            <Label>{t("create.message")}</Label>
-            <Textarea
-              {...register("message")}
-              placeholder={t("create.messagePlaceholder")}
-              rows={3}
-            />
-            {errors.message && (
-              <p className="text-xs text-destructive">{errors.message.message}</p>
-            )}
-          </div>
+          {payloadKind === "agent_turn" ? (
+            <div className="space-y-2">
+              <Label>{t("create.message")}</Label>
+              <Textarea
+                {...register("message")}
+                placeholder={t("create.messagePlaceholder")}
+                rows={3}
+              />
+              {errors.message && (
+                <p className="text-xs text-destructive">{errors.message.message}</p>
+              )}
+            </div>
+          ) : (
+            <div className="space-y-3 rounded-md border p-3">
+              <div className="space-y-2">
+                <Label>{t("detail.commandArgv")}</Label>
+                <Textarea {...register("commandArgvText")} rows={4} className="font-mono text-base md:text-sm" />
+                {errors.commandArgvText ? (
+                  <p className="text-xs text-destructive">{errors.commandArgvText.message}</p>
+                ) : (
+                  <p className="text-xs text-muted-foreground">{t("detail.commandArgvHelp")}</p>
+                )}
+              </div>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label>{t("detail.commandCwd")}</Label>
+                  <Input {...register("commandCwd")} placeholder={t("detail.defaultWorkingDirectory")} />
+                </div>
+                <div className="space-y-2">
+                  <Label>{t("detail.commandTimeout")}</Label>
+                  <Input type="number" min={0} {...register("commandTimeoutSeconds")} placeholder={t("detail.defaultValue")} />
+                  {errors.commandTimeoutSeconds && <p className="text-xs text-destructive">{errors.commandTimeoutSeconds.message}</p>}
+                </div>
+                <div className="space-y-2">
+                  <Label>{t("detail.commandNoOutputTimeout")}</Label>
+                  <Input type="number" min={0} {...register("commandNoOutputTimeoutSeconds")} placeholder={t("detail.none")} />
+                  {errors.commandNoOutputTimeoutSeconds && <p className="text-xs text-destructive">{errors.commandNoOutputTimeoutSeconds.message}</p>}
+                </div>
+                <div className="space-y-2">
+                  <Label>{t("detail.commandOutputLimit")}</Label>
+                  <Input type="number" min={0} {...register("commandOutputMaxBytes")} placeholder={t("detail.defaultValue")} />
+                  {errors.commandOutputMaxBytes && <p className="text-xs text-destructive">{errors.commandOutputMaxBytes.message}</p>}
+                </div>
+              </div>
+              <div className="space-y-2">
+                <Label>{t("detail.commandInput")}</Label>
+                <Textarea {...register("commandInput")} rows={3} className="font-mono text-base md:text-sm" placeholder={t("detail.none")} />
+              </div>
+            </div>
+          )}
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={isSubmitting}>
@@ -178,7 +256,7 @@ export function CronFormDialog({ open, onOpenChange, onSubmit }: CronFormDialogP
           </Button>
           <Button
             onClick={handleSubmit(onFormSubmit)}
-            disabled={isSubmitting || !!errors.name || !!errors.message}
+            disabled={isSubmitting || !!errors.name || (payloadKind === "agent_turn" ? !!errors.message : !!errors.commandArgvText)}
           >
             {isSubmitting ? t("create.creating") : t("create.create")}
           </Button>

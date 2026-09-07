@@ -36,6 +36,12 @@ func (l *Loop) processToolResult(
 	hadBootstrap bool,
 ) (toolMsg providers.Message, warningMsgs []providers.Message, action toolResultAction) {
 
+	// Agent Link outputs are not valid outbound media until the runtime has
+	// validated and atomically published the delegation manifest. Apply this
+	// before logs, events, loop detection, or message construction so no
+	// pre-publication MEDIA marker escapes through observability surfaces.
+	tools.ApplyDelegationArtifactResultPolicy(ctx, result)
+
 	// Record for loop detection.
 	argsHash := rs.loopDetector.record(registryName, tc.Arguments)
 	rs.loopDetector.recordResult(argsHash, result.ForLLM)
@@ -85,20 +91,58 @@ func (l *Loop) processToolResult(
 
 	// Collect MEDIA: paths from tool results.
 	// Prefer result.Media (explicit) over ForLLM MEDIA: prefix (legacy) to avoid duplicates.
+	mediaRoots := l.mediaEgressRoots(ctx)
 	if len(result.Media) > 0 {
+		// Egress containment: a tool that sets result.Media[].Path to a path
+		// outside every allowed scope (e.g. /etc/passwd from a prompt-injected
+		// path) must not reach a channel's file-upload sink. Confine here at the
+		// source so every channel is covered. The allowed roots mirror what the
+		// producing tools (create_*, send_file, delegate) may legitimately write
+		// to — agent workspace, team workspace, and tenant-allowed paths — so a
+		// cross-workspace file (e.g. a teammate-produced file in the shared team
+		// workspace, or a synchronous delegatee's output) is not wrongly dropped.
 		for i, mf := range result.Media {
+			cleaned, ok := confineToAnyRoot(mf.Path, mediaRoots)
+			if !ok {
+				slog.Warn("security.media_path_rejected",
+					"agent", l.id, "tool", tc.Name, "path", mf.Path,
+					"reason", "outside agent workspace")
+				continue
+			}
 			ct := mf.MimeType
 			if ct == "" {
-				ct = mimeFromExt(filepath.Ext(mf.Path))
+				ct = mimeFromExt(filepath.Ext(cleaned))
 			}
-			mr := MediaResult{Path: mf.Path, ContentType: ct, Caption: mf.Caption}
+			mr := MediaResult{Path: cleaned, ContentType: ct, Caption: mf.Caption}
 			if result.MediaPrompts != nil {
 				mr.Prompt = result.MediaPrompts[i]
 			}
 			rs.mediaResults = append(rs.mediaResults, mr)
+			// The file is now queued for the run's automatic outbound delivery.
+			// Mark it so a later message(MEDIA:same_path) self-send cannot publish
+			// the same attachment before the final response is dispatched.
+			if dm := tools.DeliveredMediaFromCtx(ctx); dm != nil {
+				dm.Mark(cleaned)
+			}
 		}
 	} else if mr := parseMediaResult(result.ForLLM); mr != nil {
-		rs.mediaResults = append(rs.mediaResults, *mr)
+		// Security (egress boundary): a tool's MEDIA:<path> output is taken
+		// verbatim, so confine it to the agent workspace before it can reach an
+		// outbound channel's file-upload sink (e.g. Bitrix imbot.v2.File.upload,
+		// Telegram sendDocument). A malicious or buggy tool emitting
+		// MEDIA:/etc/passwd is dropped here — fixing every channel at the source
+		// rather than per-channel. Mirrors extractMediaFromContent containment.
+		if cleaned, ok := confineToAnyRoot(mr.Path, mediaRoots); ok {
+			mr.Path = cleaned
+			rs.mediaResults = append(rs.mediaResults, *mr)
+			if dm := tools.DeliveredMediaFromCtx(ctx); dm != nil {
+				dm.Mark(cleaned)
+			}
+		} else {
+			slog.Warn("security.media_path_rejected",
+				"agent", l.id, "tool", tc.Name, "path", mr.Path,
+				"reason", "outside agent workspace")
+		}
 	}
 	// Auto-attach workspace media to task (covers create_image/audio/video).
 	if teamWs := tools.ToolTeamWorkspaceFromCtx(ctx); teamWs != "" {
@@ -114,6 +158,7 @@ func (l *Loop) processToolResult(
 		Role:       "tool",
 		Content:    result.ForLLM,
 		ToolCallID: tc.ID,
+		ToolName:   tc.Name,
 		IsError:    result.IsError,
 	}
 

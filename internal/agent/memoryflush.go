@@ -232,6 +232,7 @@ func (l *Loop) runMemoryFlush(ctx context.Context, sessionKey string, settings *
 				Role:       "tool",
 				Content:    result.ForLLM,
 				ToolCallID: tc.ID,
+				ToolName:   tc.Name,
 			})
 		}
 	}

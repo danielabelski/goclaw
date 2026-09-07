@@ -1,8 +1,11 @@
 package cmd
 
 import (
+	"context"
+
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/channelmemory"
+	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/eventbus"
 	httpapi "github.com/nextlevelbuilder/goclaw/internal/http"
@@ -33,6 +36,7 @@ func wireHTTP(stores *store.Stores, defaultWorkspace, dataDir, bundledSkillsDir 
 		agentsH = httpapi.NewAgentsHandler(stores.Agents, stores.Providers, providerReg, stores.DB, stores.Tracing, defaultWorkspace, msgBus, summoner, isOwner)
 		agentsH.SetImportStores(stores.Memory, stores.KnowledgeGraph)
 		agentsH.SetDataDir(dataDir)
+		agentsH.SetDisabledToolsStore(stores.BuiltinToolTenantCfgs)
 		if stores.SecureCLI != nil && stores.SecureCLIGrants != nil {
 			if agentCreds, ok := stores.SecureCLI.(store.SecureCLIAgentCredentialStore); ok {
 				agentsH.SetGatewayOperatorBootstrap(stores.SecureCLI, stores.SecureCLIGrants, agentCreds, gatewayAddr)
@@ -65,7 +69,7 @@ func wireHTTP(stores *store.Stores, defaultWorkspace, dataDir, bundledSkillsDir 
 	}
 	var mcpUserCredsH *httpapi.MCPUserCredentialsHandler
 	if stores != nil && stores.MCP != nil {
-		mcpUserCredsH = httpapi.NewMCPUserCredentialsHandler(stores.MCP, stores.Tenants)
+		mcpUserCredsH = httpapi.NewMCPUserCredentialsHandler(stores.MCP, stores.Tenants, msgBus)
 	}
 
 	if stores != nil && stores.ChannelInstances != nil {
@@ -134,6 +138,7 @@ func makeChannelMemoryService(stores *store.Stores, domainBus eventbus.DomainEve
 	return &channelmemory.Service{
 		Channels:      stores.ChannelInstances,
 		Pending:       stores.PendingMessages,
+		Contacts:      stores.Contacts,
 		Extractions:   stores.ChannelMemory,
 		Episodic:      stores.Episodic,
 		EventBus:      domainBus,
@@ -142,4 +147,23 @@ func makeChannelMemoryService(stores *store.Stores, domainBus eventbus.DomainEve
 		UsageCaps:     usageCapSvc,
 		Redactor:      channelmemory.NewRedactor(),
 	}
+}
+
+type channelMemoryContextProvider interface {
+	ResolveMemoryExtractionContext(ctx context.Context, inst *store.ChannelInstanceData, group store.PendingMessageGroup) (channelmemory.ExtractionContext, error)
+}
+
+func resolveChannelMemoryExtractionContext(ctx context.Context, mgr *channels.Manager, inst *store.ChannelInstanceData, group store.PendingMessageGroup) (channelmemory.ExtractionContext, error) {
+	if mgr == nil || inst == nil || inst.Name == "" {
+		return channelmemory.ExtractionContext{}, nil
+	}
+	ch, ok := mgr.GetChannel(inst.Name)
+	if !ok {
+		return channelmemory.ExtractionContext{}, nil
+	}
+	provider, ok := ch.(channelMemoryContextProvider)
+	if !ok {
+		return channelmemory.ExtractionContext{}, nil
+	}
+	return provider.ResolveMemoryExtractionContext(ctx, inst, group)
 }

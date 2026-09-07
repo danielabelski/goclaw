@@ -32,6 +32,7 @@ export interface InitState {
   embMaxChunkLen: string;
   embChunkOverlap: string;
   intentClassify: boolean;
+  teamWorkClassify: boolean;
   compProvider: string;
   compModel: string;
   compThreshold: string;
@@ -42,6 +43,7 @@ export interface InitState {
   kgMinConfidence: string;
   bgProvider: string;
   bgModel: string;
+  providerRequestTimeoutSec: string;
   skillUploadMaxSize: string;
   skillSlashEnabled: boolean;
   skillSlashSuggest: boolean;
@@ -53,10 +55,12 @@ export const DEFAULTS: InitState = {
   embProvider: "", embModel: "",
   embMaxChunkLen: "", embChunkOverlap: "",
   intentClassify: true,
+  teamWorkClassify: false,
   compProvider: "", compModel: "",
   compThreshold: "", compKeepRecent: "", compMaxTokens: "",
   kgProvider: "", kgModel: "", kgMinConfidence: "0.75",
   bgProvider: "", bgModel: "",
+  providerRequestTimeoutSec: "",
   skillUploadMaxSize: "20",
   skillSlashEnabled: true,
   skillSlashSuggest: true,

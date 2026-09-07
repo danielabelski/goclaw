@@ -1,36 +1,43 @@
 package http
 
 import (
-	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 
 	"github.com/google/uuid"
 
+	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/permissions"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
 // MCPUserCredentialsHandler handles per-user MCP credential endpoints.
 type MCPUserCredentialsHandler struct {
 	store       store.MCPServerStore
 	tenantStore store.TenantStore
-	poolEvictor MCPUserPoolEvictor
-}
-
-// MCPUserPoolEvictor evicts pooled user connections after credential rotation.
-type MCPUserPoolEvictor interface {
-	EvictUser(tenantID uuid.UUID, serverName, userID string)
+	msgBus      *bus.MessageBus
 }
 
 // NewMCPUserCredentialsHandler creates a handler for MCP user credential endpoints.
-func NewMCPUserCredentialsHandler(s store.MCPServerStore, ts store.TenantStore) *MCPUserCredentialsHandler {
-	return &MCPUserCredentialsHandler{store: s, tenantStore: ts}
+func NewMCPUserCredentialsHandler(s store.MCPServerStore, ts store.TenantStore, msgBus *bus.MessageBus) *MCPUserCredentialsHandler {
+	return &MCPUserCredentialsHandler{store: s, tenantStore: ts, msgBus: msgBus}
 }
 
-// SetPoolEvictor wires the MCP connection pool used by runtime execution.
-func (h *MCPUserCredentialsHandler) SetPoolEvictor(e MCPUserPoolEvictor) { h.poolEvictor = e }
+// emitMCPCacheInvalidate broadcasts an MCP cache-invalidate event so per-user pool
+// connections are evicted (mcp.pool.all_user_connections_evicted) and agent Loop
+// caches reload after credentials change — otherwise the pooled per-user connection
+// keeps the stale credential until idle TTL. Mirrors MCPHandler.emitCacheInvalidate.
+func (h *MCPUserCredentialsHandler) emitMCPCacheInvalidate() {
+	if h.msgBus == nil {
+		return
+	}
+	h.msgBus.Broadcast(bus.Event{
+		Name:    protocol.EventCacheInvalidate,
+		Payload: bus.CacheInvalidatePayload{Kind: bus.CacheKindMCP},
+	})
+}
 
 // RegisterRoutes registers MCP user credential routes.
 func (h *MCPUserCredentialsHandler) RegisterRoutes(mux *http.ServeMux) {
@@ -114,7 +121,9 @@ func (h *MCPUserCredentialsHandler) handleSet(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	h.evictUserConnection(r.Context(), serverID, userID)
+	// Drop pooled per-user connections so the new credentials take effect immediately.
+	h.emitMCPCacheInvalidate()
+
 	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 }
 
@@ -139,18 +148,11 @@ func (h *MCPUserCredentialsHandler) handleGet(w http.ResponseWriter, r *http.Req
 
 	creds, err := h.store.GetUserCredentials(r.Context(), serverID, userID)
 	if err != nil || creds == nil {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"user_id":         userID,
-			"has_credentials": false,
-			"has_api_key":     false,
-			"has_headers":     false,
-			"has_env":         false,
-		})
+		writeJSON(w, http.StatusOK, map[string]any{"has_credentials": false})
 		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"user_id":         userID,
 		"has_credentials": true,
 		"has_api_key":     creds.APIKey != "",
 		"has_headers":     len(creds.Headers) > 0,
@@ -182,21 +184,10 @@ func (h *MCPUserCredentialsHandler) handleDelete(w http.ResponseWriter, r *http.
 		return
 	}
 
-	h.evictUserConnection(r.Context(), serverID, userID)
-	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
-}
+	// Drop pooled per-user connections so the removed credentials stop being used.
+	h.emitMCPCacheInvalidate()
 
-func (h *MCPUserCredentialsHandler) evictUserConnection(ctx context.Context, serverID uuid.UUID, userID string) {
-	if h.poolEvictor == nil || userID == "" {
-		return
-	}
-	srv, err := h.store.GetServer(ctx, serverID)
-	if err != nil || srv == nil {
-		slog.Warn("mcp.user_credentials.evict_lookup_failed", "server_id", serverID, "user", userID, "error", err)
-		return
-	}
-	tid := store.TenantIDFromContext(ctx)
-	h.poolEvictor.EvictUser(tid, srv.Name, userID)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
 // httpStatusText returns a short error message for common HTTP status codes.

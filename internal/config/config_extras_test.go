@@ -283,6 +283,7 @@ func TestApplySystemConfigs(t *testing.T) {
 		"tools.browser.enabled":     "false",
 		"tools.browser.remote_url":  "ws://chrome:9222",
 		"tools.browser.max_pages":   "9",
+		"cron.command_enabled":      "true",
 	})
 
 	if cfg.Agents.Defaults.Provider != "openai" {
@@ -306,6 +307,9 @@ func TestApplySystemConfigs(t *testing.T) {
 	if cfg.Tools.Browser.MaxPages != 9 {
 		t.Errorf("tools.browser.max_pages: got %d", cfg.Tools.Browser.MaxPages)
 	}
+	if !cfg.Cron.CommandEnabled {
+		t.Error("cron.command_enabled: got false, want true")
+	}
 }
 
 // --- Save / Load round-trip ---
@@ -317,6 +321,13 @@ func TestSaveLoad_RoundTrip(t *testing.T) {
 	cfg := Default()
 	cfg.Gateway.Port = 7654
 	cfg.DataDir = "/test/data"
+	cfg.Branding = BrandingConfig{
+		AppName:         "Acme AI",
+		MetaTitle:       "Acme AI Console",
+		MetaDescription: "Private AI agent gateway",
+		LogoURL:         "/branding-assets/logo.png",
+		FaviconURL:      "/branding-assets/favicon.ico",
+	}
 
 	if err := Save(path, cfg); err != nil {
 		t.Fatalf("Save error: %v", err)
@@ -332,6 +343,31 @@ func TestSaveLoad_RoundTrip(t *testing.T) {
 	}
 	if loaded.DataDir != "/test/data" {
 		t.Errorf("DataDir round-trip: got %q", loaded.DataDir)
+	}
+	if loaded.Branding.AppName != "Acme AI" {
+		t.Errorf("branding app name round-trip: got %q", loaded.Branding.AppName)
+	}
+	if loaded.Branding.MetaTitle != "Acme AI Console" {
+		t.Errorf("branding meta title round-trip: got %q", loaded.Branding.MetaTitle)
+	}
+	if loaded.Branding.LogoURL != "/branding-assets/logo.png" {
+		t.Errorf("branding logo URL round-trip: got %q", loaded.Branding.LogoURL)
+	}
+}
+
+func TestConfigExtras_CloneAndReplaceFrom(t *testing.T) {
+	src := Default()
+	src.Branding = BrandingConfig{AppName: "Custom GoClaw", ThemeColor: "#123456"}
+
+	clone := src.Clone()
+	if clone.Branding.AppName != "Custom GoClaw" || clone.Branding.ThemeColor != "#123456" {
+		t.Fatalf("Clone branding = %#v", clone.Branding)
+	}
+
+	dst := Default()
+	dst.ReplaceFrom(src)
+	if dst.Branding.AppName != "Custom GoClaw" || dst.Branding.ThemeColor != "#123456" {
+		t.Fatalf("ReplaceFrom branding = %#v", dst.Branding)
 	}
 }
 

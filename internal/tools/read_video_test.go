@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/nextlevelbuilder/goclaw/internal/security"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
 type mockCredentialProvider struct {
@@ -52,72 +53,50 @@ func TestReadVideo_PrivateURL_Error(t *testing.T) {
 	}
 }
 
-func TestReadVideo_GeminiURL_Validation(t *testing.T) {
+// TestReadVideo_GeminiURL_FailsClosedUnderAgentBudget locks the fail-closed
+// contract for a streamed video URL. The stream is never buffered, so its bytes
+// cannot be counted into completeInput; under an agent budget the call refuses
+// before any transport rather than undercounting. Because every tool LLM call
+// is agent-scoped in production, this refusal — not the downstream
+// Content-Length / 2 GB / HTTP-status checks — is the reachable behavior. Those
+// transport validations remain in callProvider for defense in depth but are
+// unreachable once an agent budget is present.
+func TestReadVideo_GeminiURL_FailsClosedUnderAgentBudget(t *testing.T) {
 	security.SetAllowLoopbackForTest(true)
 	defer security.SetAllowLoopbackForTest(false)
 
-	// Missing Content-Length should fail before upload.
-	ts1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Transfer-Encoding", "chunked")
-		w.Write([]byte("chunked data mock video"))
+	// A server that would otherwise satisfy the static-streaming constraints
+	// (valid Content-Length, 2xx). The call must still fail closed before it is
+	// ever contacted, because the payload cannot be counted.
+	hits := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusOK)
+		w.Write(make([]byte, 1024))
 	}))
-	defer ts1.Close()
+	defer ts.Close()
 
 	tool := NewReadVideoTool(nil, nil)
 	cp := &mockCredentialProvider{apiKey: "test-key"}
 
-	params1 := map[string]any{
+	ctx := store.WithAgentContextWindow(context.Background(), 200_000)
+	ctx = store.WithAgentMaxTokens(ctx, 32_000)
+
+	params := map[string]any{
 		"prompt":         "describe this video",
-		"url":            ts1.URL,
+		"url":            ts.URL,
 		"_provider_type": "gemini",
 	}
 
-	_, _, err := tool.callProvider(context.Background(), cp, "gemini", "gemini-2.5-flash", params1)
+	_, _, err := tool.callProvider(ctx, cp, "gemini", "gemini-2.5-flash", params)
 	if err == nil {
-		t.Fatalf("expected error for missing Content-Length")
+		t.Fatalf("expected fail-closed for an unverifiable streamed video URL under an agent budget")
 	}
-	if !strings.Contains(err.Error(), "URL does not support static streaming") {
-		t.Errorf("unexpected error for missing Content-Length: %v", err)
+	if !strings.Contains(err.Error(), "cannot verify streamed native media") {
+		t.Errorf("unexpected error, want fail-closed refusal: %v", err)
 	}
-
-	// Content-Length over the Gemini File API limit should fail before upload.
-	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Length", "2147483649") // 2GB + 1 byte
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer ts2.Close()
-
-	params2 := map[string]any{
-		"prompt":         "describe this video",
-		"url":            ts2.URL,
-		"_provider_type": "gemini",
-	}
-
-	_, _, err = tool.callProvider(context.Background(), cp, "gemini", "gemini-2.5-flash", params2)
-	if err == nil {
-		t.Fatalf("expected error for Content-Length exceeding 2GB")
-	}
-	if !strings.Contains(err.Error(), "exceeds the maximum limit of 2 GB") {
-		t.Errorf("unexpected error for limit exceed: %v", err)
-	}
-
-	// Non-2xx status should be reported before upload.
-	ts3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer ts3.Close()
-
-	params3 := map[string]any{
-		"prompt":         "describe this video",
-		"url":            ts3.URL,
-		"_provider_type": "gemini",
-	}
-
-	_, _, err = tool.callProvider(context.Background(), cp, "gemini", "gemini-2.5-flash", params3)
-	if err == nil {
-		t.Fatalf("expected error for HTTP 404 status code")
-	}
-	if !strings.Contains(err.Error(), "video URL returned status code 404") {
-		t.Errorf("unexpected error for HTTP status code: %v", err)
+	if hits != 0 {
+		t.Errorf("fail-closed must refuse before any transport, but the URL was contacted %d time(s)", hits)
 	}
 }

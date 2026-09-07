@@ -106,8 +106,9 @@ func InstallSingleDep(ctx context.Context, dep string) (bool, string) {
 			}
 			defer release()
 		}
-		cmd := exec.CommandContext(ctx, "pip3", "install", "--no-cache-dir", "--break-system-packages", pkg)
-		out, err := cmd.CombinedOutput()
+		// pipRunInstall retries without the PEP 668 flag when pip rejects it
+		// (pip < 23.0, see issue #956).
+		out, err := pipRunInstall(ctx, []string{"install", "--no-cache-dir", pipBreakSystemPackagesFlag, pkg})
 		if err != nil {
 			msg := fmt.Sprintf("%s: %v", strings.TrimSpace(string(out)), err)
 			slog.Error("skills: dep install failed", "dep", dep, "error", msg)
@@ -183,8 +184,9 @@ func InstallDeps(ctx context.Context, manifest *SkillManifest, missing []string)
 		slog.Info("skills: installing pip packages", "pkgs", pipPkgs)
 		var successful []string
 		for _, pkg := range pipPkgs {
-			cmd := exec.CommandContext(ctx, "pip3", "install", "--no-cache-dir", "--break-system-packages", pkg)
-			if out, err := cmd.CombinedOutput(); err != nil {
+			// pipRunInstall retries without the PEP 668 flag when pip rejects it.
+			out, err := pipRunInstall(ctx, []string{"install", "--no-cache-dir", pipBreakSystemPackagesFlag, pkg})
+			if err != nil {
 				result.Errors = append(result.Errors, fmt.Sprintf("pip %s: %s (%v)", pkg, strings.TrimSpace(string(out)), err))
 				if hint := pipBuildFailHint(pkg, string(out)); hint != "" {
 					slog.Warn("skills: dep install hint", "pkg", pkg, "hint", hint)

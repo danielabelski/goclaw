@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -353,7 +354,18 @@ func TestThinkStage_UsageAccumulation(t *testing.T) {
 			return &providers.ChatResponse{
 				Content:      "hello",
 				FinishReason: "stop",
-				Usage:        &providers.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15},
+				Usage: &providers.Usage{
+					PromptTokens:                      10 * callCount,
+					CompletionTokens:                  5,
+					TotalTokens:                       10*callCount + 5,
+					CacheCreationTokens:               2,
+					CacheReadTokens:                   3,
+					PromptTokensIncludeCachedSegments: callCount == 2,
+					ThinkingTokens:                    4,
+					RequestCount:                      1,
+					ImageCount:                        1,
+					WebSearchCount:                    1,
+				},
 			}, nil
 		},
 	}
@@ -364,14 +376,27 @@ func TestThinkStage_UsageAccumulation(t *testing.T) {
 	_ = stage.Execute(context.Background(), state)
 	_ = stage.Execute(context.Background(), state)
 
-	if state.Think.TotalUsage.PromptTokens != 20 {
-		t.Errorf("PromptTokens = %d, want 20", state.Think.TotalUsage.PromptTokens)
+	if state.Think.TotalUsage.PromptTokens != 30 {
+		t.Errorf("PromptTokens = %d, want 30", state.Think.TotalUsage.PromptTokens)
 	}
 	if state.Think.TotalUsage.CompletionTokens != 10 {
 		t.Errorf("CompletionTokens = %d, want 10", state.Think.TotalUsage.CompletionTokens)
 	}
-	if state.Think.TotalUsage.TotalTokens != 30 {
-		t.Errorf("TotalTokens = %d, want 30", state.Think.TotalUsage.TotalTokens)
+	if state.Think.TotalUsage.TotalTokens != 40 {
+		t.Errorf("TotalTokens = %d, want 40", state.Think.TotalUsage.TotalTokens)
+	}
+	if state.Think.TotalUsage.CacheCreationTokens != 4 || state.Think.TotalUsage.CacheReadTokens != 6 {
+		t.Errorf("cache tokens = %d/%d, want 4/6", state.Think.TotalUsage.CacheCreationTokens, state.Think.TotalUsage.CacheReadTokens)
+	}
+	if !state.Think.TotalUsage.PromptTokensIncludeCachedSegments {
+		t.Error("PromptTokensIncludeCachedSegments = false, want true")
+	}
+	if state.Think.TotalUsage.ThinkingTokens != 8 || state.Think.TotalUsage.RequestCount != 2 ||
+		state.Think.TotalUsage.ImageCount != 2 || state.Think.TotalUsage.WebSearchCount != 2 {
+		t.Errorf("extended usage = %+v, want thinking/request/image/web = 8/2/2/2", state.Think.TotalUsage)
+	}
+	if state.Think.LastUsage.PromptTokens != 20 || state.Think.LastUsage.TotalTokens != 25 {
+		t.Errorf("LastUsage = %+v, want last prompt=20 total=25", state.Think.LastUsage)
 	}
 }
 
@@ -1981,6 +2006,27 @@ func TestObserveStage_LateInjectionAfterFinalContinuesRun(t *testing.T) {
 	}
 }
 
+func TestObserveStage_MovesTaggedThinkingIntoFinalThinking(t *testing.T) {
+	t.Parallel()
+	stage := NewObserveStage(&PipelineDeps{})
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		Content:  "Visible <thinking>hidden reasoning</thinking> answer",
+		Thinking: "native",
+	}
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if state.Observe.FinalContent != "Visible  answer" {
+		t.Errorf("FinalContent = %q, want %q", state.Observe.FinalContent, "Visible  answer")
+	}
+	if state.Observe.FinalThinking != "native\nhidden reasoning" {
+		t.Errorf("FinalThinking = %q, want %q", state.Observe.FinalThinking, "native\nhidden reasoning")
+	}
+}
+
 func TestObserveStage_FinalContent_SetWhenNoToolCalls(t *testing.T) {
 	t.Parallel()
 	deps := &PipelineDeps{}
@@ -2610,6 +2656,32 @@ func TestFinalizeStage_PopulatesFileSizes_SkipsNonexistent(t *testing.T) {
 
 // --- ContextStage tests ---
 
+func TestContextStage_AppendsHookAdditionalContextToSystemPromptInput(t *testing.T) {
+	t.Parallel()
+	var capturedExtra string
+	deps := &PipelineDeps{
+		Hooks: toolStageHookDispatcher{fire: func(_ context.Context, ev hooks.Event) (hooks.FireResult, error) {
+			if ev.HookEvent == hooks.EventUserPromptSubmit {
+				return hooks.FireResult{Decision: hooks.DecisionAllow, AdditionalContext: "mandatory workflow"}, nil
+			}
+			return hooks.FireResult{Decision: hooks.DecisionAllow}, nil
+		}},
+		BuildMessages: func(_ context.Context, input *RunInput, _ []providers.Message, _ string) ([]providers.Message, error) {
+			capturedExtra = input.ExtraSystemPrompt
+			return []providers.Message{{Role: "system", Content: input.ExtraSystemPrompt}}, nil
+		},
+	}
+	state := defaultState()
+	state.Input.ExtraSystemPrompt = "existing context"
+	stage := NewContextStage(deps)
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if capturedExtra != "existing context\n\nmandatory workflow" {
+		t.Fatalf("extra system prompt=%q", capturedExtra)
+	}
+}
+
 func TestContextStage_ResolveWorkspace(t *testing.T) {
 	t.Parallel()
 	wantWS := &workspace.WorkspaceContext{ActivePath: "/resolved"}
@@ -2998,7 +3070,7 @@ func TestFinalizeStage_MaybeSummarize_Called(t *testing.T) {
 	t.Parallel()
 	summarizeCalled := false
 	deps := &PipelineDeps{
-		MaybeSummarize: func(_ context.Context, sessionKey string) {
+		MaybeSummarize: func(_ context.Context, sessionKey string, _ bool) {
 			if sessionKey == "sess-1" {
 				summarizeCalled = true
 			}
@@ -3210,5 +3282,402 @@ func TestPruneStage_CacheTtlGate_MarkTouchedOnlyOnMutation(t *testing.T) {
 	}
 	if atomic.LoadInt32(&touchCalled) != 0 {
 		t.Error("MarkCacheTouched should NOT be called when prune returns no mutation")
+	}
+}
+
+func TestThinkStage_AllowedTools_MixedFunctionAndNativeTools_NoPanic(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		BuildFilteredTools: func(state *RunState) ([]providers.ToolDefinition, error) {
+			return []providers.ToolDefinition{
+				{
+					Type: "function",
+					Function: &providers.ToolFunctionSchema{
+						Name: "read_file",
+					},
+				},
+				{
+					Type:     "image_generation",
+					Function: nil,
+				},
+			}, nil
+		},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return &providers.ChatResponse{
+				Content:      "ok",
+				FinishReason: "stop",
+			}, nil
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+
+	if state.Tool.AllowedTools == nil {
+		t.Fatal("AllowedTools should not be nil")
+	}
+	if !state.Tool.AllowedTools["read_file"] {
+		t.Error("expected read_file in AllowedTools")
+	}
+	if state.Tool.AllowedTools[""] {
+		t.Error("AllowedTools should not contain empty key for native tools")
+	}
+	if len(state.Tool.AllowedTools) != 1 {
+		t.Errorf("AllowedTools len = %d, want 1", len(state.Tool.AllowedTools))
+	}
+}
+
+// --- Issue #1177: non-tool messages deferred until all tool results emitted ---
+
+func TestToolStage_Sequential_DefersNonToolMessages(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		ExecuteToolCall: func(_ context.Context, _ *RunState, tc providers.ToolCall) ([]providers.Message, error) {
+			msgs := []providers.Message{
+				{Role: "tool", Content: "result:" + tc.Name, ToolCallID: tc.ID},
+			}
+			// Simulate a warning injected after first tool
+			if tc.Name == "tool_a" {
+				msgs = append(msgs, providers.Message{Role: "user", Content: "loop warning: read-only streak"})
+			}
+			return msgs, nil
+		},
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{
+			{ID: "1", Name: "tool_a"},
+			{ID: "2", Name: "tool_b"},
+			{ID: "3", Name: "tool_c"},
+		},
+	}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+
+	pending := state.Messages.Pending()
+	// Expect: 3 tool results first, then 1 user warning at the end
+	if len(pending) != 4 {
+		t.Fatalf("pending len = %d, want 4", len(pending))
+	}
+	// First 3 must be tool role
+	for i := 0; i < 3; i++ {
+		if pending[i].Role != "tool" {
+			t.Errorf("pending[%d].Role = %q, want tool", i, pending[i].Role)
+		}
+	}
+	// Last must be the deferred user warning
+	if pending[3].Role != "user" {
+		t.Errorf("pending[3].Role = %q, want user", pending[3].Role)
+	}
+	if !strings.Contains(pending[3].Content, "loop warning") {
+		t.Errorf("pending[3].Content = %q, want loop warning", pending[3].Content)
+	}
+}
+
+func TestToolStage_Parallel_DefersNonToolMessages(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		ExecuteToolCall: func(_ context.Context, _ *RunState, _ providers.ToolCall) ([]providers.Message, error) {
+			t.Fatal("ExecuteToolCall must NOT be called when parallel path is active")
+			return nil, nil
+		},
+		ExecuteToolRaw: func(_ context.Context, tc providers.ToolCall) (providers.Message, any, error) {
+			return providers.Message{Role: "tool", Content: "raw:" + tc.Name, ToolCallID: tc.ID}, nil, nil
+		},
+		ProcessToolResult: func(_ context.Context, _ *RunState, tc providers.ToolCall, rawMsg providers.Message, _ any) []providers.Message {
+			msgs := []providers.Message{rawMsg}
+			// Inject a warning after processing tool_b
+			if tc.Name == "tool_b" {
+				msgs = append(msgs, providers.Message{Role: "user", Content: "nudge: consider alternatives"})
+			}
+			return msgs
+		},
+		ParallelEligibleToolCall: func(providers.ToolCall) bool { return true },
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{
+			{ID: "1", Name: "tool_a"},
+			{ID: "2", Name: "tool_b"},
+			{ID: "3", Name: "tool_c"},
+		},
+	}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+
+	pending := state.Messages.Pending()
+	// Expect: 3 tool results first, then 1 user nudge at the end
+	if len(pending) != 4 {
+		t.Fatalf("pending len = %d, want 4", len(pending))
+	}
+	for i := 0; i < 3; i++ {
+		if pending[i].Role != "tool" {
+			t.Errorf("pending[%d].Role = %q, want tool", i, pending[i].Role)
+		}
+	}
+	if pending[3].Role != "user" {
+		t.Errorf("pending[3].Role = %q, want user", pending[3].Role)
+	}
+	if !strings.Contains(pending[3].Content, "nudge") {
+		t.Errorf("pending[3].Content = %q, want nudge", pending[3].Content)
+	}
+}
+
+func TestThinkStage_FinalRequestGuard_CompactsBeforeCallLLM(t *testing.T) {
+	t.Parallel()
+	compacted := false
+	called := false
+
+	deps := &PipelineDeps{
+		TokenCounter: finalRequestBudgetCounter{},
+		Config:       PipelineConfig{ContextWindow: 100, MaxTokens: 10, Compaction: &config.CompactionConfig{MaxRequestShare: 0.85}},
+		BuildFilteredTools: func(_ *RunState) ([]providers.ToolDefinition, error) {
+			return []providers.ToolDefinition{{
+				Type: "function",
+				Function: &providers.ToolFunctionSchema{
+					Name:        "large_tool",
+					Description: strings.Repeat("t", 50),
+					Parameters:  map[string]any{"type": "object"},
+				},
+			}}, nil
+		},
+		CompactMessages: func(_ context.Context, msgs []providers.Message, _ string) ([]providers.Message, error) {
+			compacted = true
+			if len(msgs) != 1 || !strings.Contains(msgs[0].Content, "long-history") {
+				t.Fatalf("CompactMessages got history = %#v", msgs)
+			}
+			return []providers.Message{{Role: "user", Content: "short"}}, nil
+		},
+		CallLLM: func(_ context.Context, _ *RunState, req providers.ChatRequest) (*providers.ChatResponse, error) {
+			called = true
+			if len(req.Messages) == 0 || req.Messages[len(req.Messages)-1].Content != "short" {
+				t.Fatalf("CallLLM received un-compacted request messages = %#v", req.Messages)
+			}
+			return &providers.ChatResponse{Content: "ok", FinishReason: "stop"}, nil
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+	state.Messages.SetHistory([]providers.Message{{Role: "user", Content: strings.Repeat("long-history", 10)}})
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !compacted {
+		t.Fatal("expected final request guard to compact before CallLLM")
+	}
+	if !called {
+		t.Fatal("expected CallLLM after compaction")
+	}
+}
+
+type finalRequestBudgetCounter struct{}
+
+func (finalRequestBudgetCounter) Count(_ string, text string) int { return len(text) }
+func (finalRequestBudgetCounter) CountMessages(_ string, msgs []providers.Message) int {
+	total := 0
+	for _, msg := range msgs {
+		total += len(msg.Content)
+	}
+	return total
+}
+func (finalRequestBudgetCounter) CountToolSchemas(_ string, tools []providers.ToolDefinition) int {
+	total := 0
+	for _, tool := range tools {
+		if tool.Function != nil {
+			total += len(tool.Function.Name) + len(tool.Function.Description)
+		}
+	}
+	return total
+}
+func (finalRequestBudgetCounter) ModelContextWindow(_ string) int { return 100 }
+
+func TestThinkStage_FinalRequestGuard_AllowsRequestUnderLimit(t *testing.T) {
+	t.Parallel()
+	compacted := false
+	called := false
+
+	deps := &PipelineDeps{
+		TokenCounter: finalRequestBudgetCounter{},
+		Config:       PipelineConfig{ContextWindow: 100, MaxTokens: 10, Compaction: &config.CompactionConfig{MaxRequestShare: 0.85}},
+		CompactMessages: func(_ context.Context, _ []providers.Message, _ string) ([]providers.Message, error) {
+			compacted = true
+			return nil, nil
+		},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			called = true
+			return &providers.ChatResponse{Content: "ok", FinishReason: "stop"}, nil
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+	state.Messages.SetHistory([]providers.Message{{Role: "user", Content: "short"}})
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if compacted {
+		t.Fatal("did not expect compaction for request under final context limit")
+	}
+	if !called {
+		t.Fatal("expected CallLLM for request under final context limit")
+	}
+}
+
+func TestThinkStage_FinalRequestGuard_AbortsWhenStillOverLimit(t *testing.T) {
+	t.Parallel()
+	called := false
+	compactCalls := 0
+
+	deps := &PipelineDeps{
+		TokenCounter: finalRequestBudgetCounter{},
+		Config:       PipelineConfig{ContextWindow: 100, MaxTokens: 10, Compaction: &config.CompactionConfig{MaxRequestShare: 0.85}},
+		CompactMessages: func(_ context.Context, _ []providers.Message, _ string) ([]providers.Message, error) {
+			compactCalls++
+			return []providers.Message{{Role: "user", Content: strings.Repeat("still-long", 20)}}, nil
+		},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			called = true
+			return &providers.ChatResponse{Content: "should not call", FinishReason: "stop"}, nil
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+	state.Messages.SetHistory([]providers.Message{{Role: "user", Content: strings.Repeat("long-history", 10)}})
+
+	err := stage.Execute(context.Background(), state)
+	if err == nil {
+		t.Fatal("expected final request context budget error")
+	}
+	if !strings.Contains(err.Error(), "final request context budget exceeded") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if compactCalls != 1 {
+		t.Fatalf("CompactMessages calls = %d, want 1", compactCalls)
+	}
+	if called {
+		t.Fatal("CallLLM must not run while final request remains over limit")
+	}
+}
+
+func TestFinalRequestEstimate_UsesAgentWindowBudgetMath(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		window int
+		hard   int
+		target int
+	}{
+		{name: "200k", window: 200_000, hard: 191_808, target: 161_808},
+		{name: "128k", window: 128_000, hard: 119_808, target: 100_608},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			deps := &PipelineDeps{
+				TokenCounter: finalRequestBudgetCounter{},
+				Config: PipelineConfig{
+					ContextWindow: tt.window,
+					MaxTokens:     8192,
+					Compaction:    &config.CompactionConfig{MaxRequestShare: 0.85},
+				},
+			}
+			stage := NewThinkStage(deps)
+			estimate, err := stage.finalRequestEstimate(defaultState(), providers.ChatRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if estimate.HardInputCapTokens != tt.hard || estimate.CompactTargetTokens != tt.target {
+				t.Fatalf("budget = hard %d target %d, want %d/%d", estimate.HardInputCapTokens, estimate.CompactTargetTokens, tt.hard, tt.target)
+			}
+		})
+	}
+}
+
+func TestThinkStage_FinalRequestGuard_RejectsUnresolvedWindow(t *testing.T) {
+	t.Parallel()
+	called := false
+	stage := NewThinkStage(&PipelineDeps{
+		TokenCounter: finalRequestBudgetCounter{},
+		CallLLM: func(context.Context, *RunState, providers.ChatRequest) (*providers.ChatResponse, error) {
+			called = true
+			return &providers.ChatResponse{}, nil
+		},
+	})
+	err := stage.Execute(context.Background(), defaultState())
+	if err == nil || !strings.Contains(err.Error(), "context_window_unresolved") {
+		t.Fatalf("Execute() error = %v, want context_window_unresolved", err)
+	}
+	if called {
+		t.Fatal("CallLLM must not run without a resolved context window")
+	}
+}
+
+// TestFinalRequestEstimate_OutputReserveIsAgentMaxTokens locks the agent-only
+// output reserve: the reserve equals the configured agent max_tokens exactly and
+// does NOT change with any provider/model reasoning transform. Model/provider
+// thinking bumps must never widen or narrow the pre-transport budget.
+func TestFinalRequestEstimate_OutputReserveIsAgentMaxTokens(t *testing.T) {
+	t.Parallel()
+	stage := NewThinkStage(&PipelineDeps{
+		TokenCounter: finalRequestBudgetCounter{},
+		Config: PipelineConfig{
+			ContextWindow: 200_000,
+			MaxTokens:     8192,
+			Compaction:    &config.CompactionConfig{MaxRequestShare: 0.85},
+		},
+	})
+
+	estimate, err := stage.finalRequestEstimate(defaultState(), stage.buildChatRequest(defaultState(), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reserve == agent max_tokens (8192), independent of any reasoning transform.
+	if estimate.OutputReserveTokens != 8192 {
+		t.Fatalf("output reserve = %d, want 8192 (agent max_tokens)", estimate.OutputReserveTokens)
+	}
+	// Hard cap == window - agent max_tokens, exactly.
+	if estimate.HardInputCapTokens != 200_000-8192 {
+		t.Fatalf("hard cap = %d, want %d", estimate.HardInputCapTokens, 200_000-8192)
+	}
+}
+
+func TestInputContextTokens_CacheSemantics(t *testing.T) {
+	t.Parallel()
+	inclusive := providers.Usage{
+		PromptTokens: 100, CacheReadTokens: 80, CacheCreationTokens: 10,
+		PromptTokensIncludeCachedSegments: true,
+	}
+	if got := InputContextTokens(inclusive); got != 100 {
+		t.Fatalf("inclusive input = %d, want 100", got)
+	}
+	exclusive := inclusive
+	exclusive.PromptTokensIncludeCachedSegments = false
+	if got := InputContextTokens(exclusive); got != 190 {
+		t.Fatalf("exclusive input = %d, want 190", got)
+	}
+}
+
+func TestFinalContextActualLevel(t *testing.T) {
+	t.Parallel()
+	estimate := FinalRequestEstimate{InputTokens: 100, HardInputCapTokens: 120}
+	if level, reason := finalContextActualLevel(estimate, 100); level != slog.LevelDebug || reason != "" {
+		t.Fatalf("exact estimate = %v/%q, want debug/empty", level, reason)
+	}
+	if level, reason := finalContextActualLevel(estimate, 106); level != slog.LevelWarn || reason != "estimate_undercount" {
+		t.Fatalf("undercount = %v/%q, want warn/estimate_undercount", level, reason)
+	}
+	if level, reason := finalContextActualLevel(estimate, 121); level != slog.LevelWarn || reason != "hard_cap_exceeded" {
+		t.Fatalf("hard cap = %v/%q, want warn/hard_cap_exceeded", level, reason)
 	}
 }

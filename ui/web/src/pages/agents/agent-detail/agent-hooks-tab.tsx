@@ -15,48 +15,13 @@ import {
 import { HookListRow } from "@/pages/hooks/components/hook-list-row";
 import { HookFormDialog } from "@/pages/hooks/components/hook-form-dialog";
 import { HookTestPanel } from "@/pages/hooks/components/hook-test-panel";
+import { buildHookConfig } from "@/pages/hooks/hook-form-config";
 import type { HookFormData } from "@/schemas/hooks.schema";
 
 interface AgentHooksTabProps {
   agentId: string;
   initialCreateOpen?: boolean;
   onCreateOpenChange?: (open: boolean) => void;
-}
-
-function parseHeaders(raw: string | undefined): Record<string, unknown> {
-  const trimmed = (raw ?? "").trim();
-  if (!trimmed) return {};
-  try {
-    const parsed = JSON.parse(trimmed);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-    throw new Error("headers must be a JSON object");
-  } catch (err) {
-    // eslint-disable-next-line preserve-caught-error -- JSON.parse error message already captured verbatim in thrown message
-    throw new Error(
-      "Invalid headers JSON: " + (err instanceof Error ? err.message : String(err)),
-    );
-  }
-}
-
-function buildConfig(data: HookFormData): Record<string, unknown> {
-  if (data.handler_type === "http") {
-    return {
-      url: data.url ?? "",
-      method: data.method ?? "POST",
-      headers: parseHeaders(data.headers),
-      body_template: data.body_template ?? "",
-    };
-  }
-  if (data.handler_type === "script") {
-    return { source: data.script_source ?? "" };
-  }
-  return {
-    prompt_template: data.prompt_template ?? "",
-    model: data.model ?? "haiku",
-    max_invocations_per_turn: data.max_invocations_per_turn ?? 5,
-  };
 }
 
 export function AgentHooksTab({ agentId, initialCreateOpen, onCreateOpenChange }: AgentHooksTabProps) {
@@ -89,7 +54,7 @@ export function AgentHooksTab({ agentId, initialCreateOpen, onCreateOpenChange }
   const handleCreate = async (data: HookFormData) => {
     let config: Record<string, unknown>;
     try {
-      config = buildConfig(data);
+      config = buildHookConfig(data);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
       return;
@@ -118,7 +83,7 @@ export function AgentHooksTab({ agentId, initialCreateOpen, onCreateOpenChange }
     if (!editTarget) return;
     let config: Record<string, unknown>;
     try {
-      config = buildConfig(data);
+      config = buildHookConfig(data);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
       return;

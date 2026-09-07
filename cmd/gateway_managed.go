@@ -61,6 +61,8 @@ func wireExtras(
 	redisClient any, // nil when built without -tags redis or when Redis is unconfigured
 	domainBus eventbus.DomainEventBus,
 	usageCapSvc *usagecaps.Service,
+	mcpOAuthProvider mcpbridge.OAuthTokenProvider, // nil = OAuth injection disabled
+	childRunAdmission *orchestration.ChildRunAdmission,
 ) (*tools.ContextFileInterceptor, *mcpbridge.Pool, *media.Store, tools.PostTurnProcessor) {
 	// 1. Build cache instances (in-memory or Redis depending on build tags)
 	agentCtxCache, userCtxCache := makeCaches(redisClient)
@@ -205,6 +207,17 @@ func wireExtras(
 		slog.Info("agent hooks dispatcher wired", "handlers", "command,http,prompt")
 	}
 	timelineRecorder := agent.NewRunTimelineRecorder(stores.RunTimeline)
+	// Reconcile runs left mid-execution by a previous gateway stop. A run whose
+	// process was killed never emits its terminal run.status, so it would show as
+	// perpetually "running" and never be recorded as failed. Mark such runs failed
+	// on startup, mirroring the cron scheduler's stale-'running' reset.
+	if stores.RunTimeline != nil {
+		if n, err := stores.RunTimeline.RecoverInterruptedRuns(context.Background()); err != nil {
+			slog.Warn("run timeline: failed to recover interrupted runs on startup", "error", err)
+		} else if n > 0 {
+			slog.Info("run timeline: marked interrupted runs as failed on startup", "count", n)
+		}
+	}
 
 	resolver := agent.NewManagedResolver(agent.ResolverDeps{
 		AgentStore:             stores.Agents,
@@ -243,6 +256,7 @@ func wireExtras(
 		MCPStore:               stores.MCP,
 		MCPPool:                mcpPool,
 		MCPGrantChecker:        mcpGrantChecker,
+		MCPOAuthTokenProvider:  mcpOAuthProvider,
 		ConfigPermStore:        stores.ConfigPermissions,
 		MediaStore:             mediaStore,
 		ModelPricing:           appCfg.Telemetry.ModelPricing,
@@ -437,25 +451,32 @@ func wireExtras(
 			// Link delegate trace to parent trace
 			delegateCtx := tracing.WithDelegateParentTraceID(ctx, tracing.TraceIDFromContext(ctx))
 
-			runReq := agent.RunRequest{
-				RunID:         uuid.New().String(),
-				SessionKey:    sessionKey,
-				Message:       req.Task,
-				UserID:        req.UserID,
-				Channel:       "delegate",
-				RunKind:       "delegate",
-				DelegationID:  req.DelegationID,
-				ParentAgentID: req.FromAgentKey,
+			runReq := buildAgentLinkRunRequest(req, sessionKey)
+			var delegateTraceID uuid.UUID
+			runReq.OnTraceCreated = func(traceID uuid.UUID) {
+				delegateTraceID = traceID
+				if req.OnTraceCreated != nil {
+					req.OnTraceCreated(traceID)
+				}
 			}
-			result, err := loop.Run(delegateCtx, runReq)
-			if err != nil {
-				return tools.DelegateResult{}, err
+			result, runErr := loop.Run(delegateCtx, runReq)
+			if releaseErr := releaseDelegationSandbox(ctx, sandboxMgr, sessionKey); releaseErr != nil {
+				return tools.DelegateResult{TraceID: delegateTraceID}, releaseErr
 			}
-			cr := orchestration.CaptureFromRunResult(result, 0)
-			return tools.DelegateResult{Content: cr.Content, Media: cr.Media}, nil
+			if runErr != nil {
+				return tools.DelegateResult{TraceID: delegateTraceID}, runErr
+			}
+			return tools.DelegateResult{
+				Content: result.Content,
+				Media:   agentMediaToBusFiles(result.Media),
+				TraceID: delegateTraceID,
+			}, nil
 		}
-		delegateTool := tools.NewDelegateTool(stores.AgentLinks, stores.Agents, domainBus, delegateRunFn)
+		delegateTool := tools.NewDelegateToolWithAdmission(stores.AgentLinks, stores.Agents, domainBus, delegateRunFn, childRunAdmission)
+		delegateTool.SetDataDir(appCfg.DataDir)
+		delegateTool.SetWorkspace(workspace)
 		delegateTool.SetMsgBus(msgBus)
+		delegateTool.SetTaskStore(stores.SubagentTasks)
 		delegateTool.SetHookDispatcher(hookDispatcher)
 		toolsReg.Register(delegateTool)
 		slog.Info("delegate tool wired")
@@ -535,7 +556,9 @@ func wireExtras(
 		agentRouter.InvalidateAll()
 	})
 
-	// MCP cache: invalidate all agent caches when MCP servers/grants change
+	// MCP cache: invalidate all agent caches + per-user pool connections when MCP servers/grants change.
+	// Per-user pool connections hold stale credentials/headers; evicting them forces a fresh
+	// AcquireUser on next request so new OAuth tokens and grant changes take effect immediately.
 	msgBus.Subscribe(bus.TopicCacheMCP, func(event bus.Event) {
 		if event.Name != protocol.EventCacheInvalidate {
 			return
@@ -545,6 +568,9 @@ func wireExtras(
 			return
 		}
 		agentRouter.InvalidateAll()
+		if mcpPool != nil {
+			mcpPool.EvictAllUsers()
+		}
 	})
 
 	// Cron cache: invalidate job cache on cron changes
@@ -621,6 +647,14 @@ func wireExtras(
 	if stores.Teams != nil && stores.Agents != nil {
 		teamMgr := tools.NewTeamToolManager(stores.Teams, stores.Agents, msgBus, workspace)
 		postTurn = teamMgr
+		// Async delegations run detached from the caller's turn, so they need their
+		// own post-turn dispatch. The delegate tool is registered above, before the
+		// team manager exists — wire it now that postTurn is available.
+		if delegateTool, ok := toolsReg.Get("delegate"); ok {
+			if dt, ok := delegateTool.(*tools.DelegateTool); ok {
+				dt.SetPostTurnProcessor(postTurn)
+			}
+		}
 		var teamPolicy tools.TeamActionPolicy = tools.FullTeamPolicy{}
 		if !edition.Current().TeamFullMode {
 			teamPolicy = tools.LiteTeamPolicy{}

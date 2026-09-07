@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -15,6 +14,9 @@ import (
 // resolveDocumentFile finds the document file path from an explicit workspace
 // path or from context MediaRefs.
 func (t *ReadDocumentTool) resolveDocumentFile(ctx context.Context, mediaID, docPath string) (path, mime string, err error) {
+	if strings.TrimSpace(mediaID) != "" && strings.TrimSpace(docPath) != "" {
+		return "", "", fmt.Errorf("specify either media_id or path, not both")
+	}
 	if docPath != "" {
 		p, err := resolveDocumentPathArg(ctx, docPath)
 		if err != nil {
@@ -28,16 +30,11 @@ func (t *ReadDocumentTool) resolveDocumentFile(ctx context.Context, mediaID, doc
 		return "", "", fmt.Errorf("no documents available in this conversation. The user may not have sent a document.")
 	}
 
-	if strings.Contains(mediaID, "<") || strings.Contains(mediaID, "media:") {
-		slog.Debug("read_document: sanitizing tag-like media_id", "raw", mediaID)
-		mediaID = ""
-	}
-
 	// Find specific media_id or use most recent document.
 	var ref *providers.MediaRef
 	if mediaID != "" {
 		for i := range refs {
-			if documentRefMatches(refs[i], mediaID) {
+			if refs[i].ID == mediaID {
 				ref = &refs[i]
 				break
 			}
@@ -52,6 +49,7 @@ func (t *ReadDocumentTool) resolveDocumentFile(ctx context.Context, mediaID, doc
 
 	// Prefer persisted workspace path; fall back to legacy .media/ lookup.
 	p := ref.Path
+	loadedLegacy := false
 	if p == "" {
 		var err error
 		if t.mediaLoader == nil {
@@ -61,6 +59,16 @@ func (t *ReadDocumentTool) resolveDocumentFile(ctx context.Context, mediaID, doc
 		if err != nil {
 			return "", "", fmt.Errorf("document file not found: %v", err)
 		}
+		loadedLegacy = true
+	}
+
+	if loadedLegacy {
+		p, err = resolveLoadedMediaRefPath(ctx, t.mediaLoader, p, "document")
+	} else {
+		p, err = resolveStructuredMediaRefPath(ctx, p, "document")
+	}
+	if err != nil {
+		return "", "", err
 	}
 
 	// Determine MIME type: prefer ref's stored MIME, fall back to extension.
@@ -73,50 +81,7 @@ func (t *ReadDocumentTool) resolveDocumentFile(ctx context.Context, mediaID, doc
 }
 
 func resolveDocumentPathArg(ctx context.Context, path string) (string, error) {
-	workspace := ToolWorkspaceFromCtx(ctx)
-	resolved, err := resolvePathWithAllowed(path, workspace, effectiveRestrict(ctx, true), allowedWithTeamWorkspace(ctx, nil))
-	if err != nil {
-		return "", fmt.Errorf("invalid document path: %w", err)
-	}
-	if err := checkDeniedPath(resolved, workspace, nil); err != nil {
-		return "", err
-	}
-	if info, err := os.Stat(resolved); err != nil {
-		return "", fmt.Errorf("failed to stat document file: %w", err)
-	} else if info.IsDir() {
-		return "", fmt.Errorf("document path is a directory: %s", path)
-	}
-	return resolved, nil
-}
-
-func documentRefMatches(ref providers.MediaRef, mediaID string) bool {
-	if ref.ID == mediaID {
-		return true
-	}
-	if ref.Path == "" {
-		return false
-	}
-	want := strings.ToLower(filepath.Base(mediaID))
-	got := strings.ToLower(filepath.Base(ref.Path))
-	if want == got {
-		return true
-	}
-	return strings.EqualFold(stripUploadShortID(got), want)
-}
-
-func stripUploadShortID(name string) string {
-	ext := filepath.Ext(name)
-	stem := strings.TrimSuffix(name, ext)
-	idx := strings.LastIndexByte(stem, '-')
-	if idx < 0 || len(stem)-idx-1 != 8 {
-		return name
-	}
-	for _, r := range stem[idx+1:] {
-		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
-			return name
-		}
-	}
-	return stem[:idx] + ext
+	return resolveStructuredMediaPath(ctx, path, "document")
 }
 
 func isArchiveDocumentPath(path string) bool {
@@ -160,7 +125,7 @@ func (t *ReadDocumentTool) callProvider(ctx context.Context, cp credentialProvid
 			Model:   model,
 			Options: map[string]any{"max_tokens": 16384},
 		}
-		reservation, reserveErr := reserveToolLLMUsage(ctx, t.usageCaps, t.Name(), providerName, model, chatReq)
+		reservation, reserveErr := reserveToolLLMUsageWithMedia(ctx, t.usageCaps, t.Name(), providerName, model, chatReq, mime, data)
 		if reserveErr != nil {
 			return nil, nil, reserveErr
 		}

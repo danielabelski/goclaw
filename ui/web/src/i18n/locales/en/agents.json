@@ -623,7 +623,12 @@
     "insertContact": "Search contact to insert...",
     "contentPlaceholder": "File content...",
     "systemPromptPreview": "System Prompt",
-    "tokens": "tokens"
+    "tokens": "tokens",
+    "toolsAvailable": "{{count}} tools available",
+    "toolsSection": "Tools",
+    "toolParameters": "Parameters",
+    "noParameters": "No parameters",
+    "noTools": "No tools available"
   },
   "fileEditor": {
     "editWithAi": "Edit with AI",
@@ -745,6 +750,7 @@
       "description": "Controls sub-agent spawning limits and behavior",
       "maxConcurrent": "Max Concurrent",
       "maxSpawnDepth": "Max Spawn Depth",
+      "maxSpawnDepthTip": "Maximum depth of each agent's own sub-agent spawn tree. Agent Link delegation starts a new tree governed by the target agent's settings. At depth 1, an agent can spawn direct sub-agents, but those sub-agents cannot spawn again.",
       "maxChildrenPerAgent": "Max Children Per Agent",
       "archiveAfter": "Archive After (minutes)",
       "maxRetries": "Max Retries",
@@ -807,13 +813,17 @@
     },
     "compaction": {
       "title": "Compaction",
-      "description": "Context window compaction and memory flush settings",
+      "description": "Final request context guard, history compaction, and memory flush settings",
       "maxHistoryShare": "Max History Share (0-1)",
-      "maxHistoryShareTip": "Maximum fraction of context window for conversation history (e.g. 0.85 = 85%). Compaction triggers when exceeded.",
+      "maxHistoryShareTip": "History-only threshold for post-turn history compaction. This is not the final request limit.",
       "keepLastMessages": "Keep Last Messages",
       "keepLastMessagesTip": "Recent messages kept after compaction. Older messages are replaced by a summary.",
+      "timeoutSeconds": "Timeout Seconds",
+      "timeoutSecondsTip": "Maximum time to wait for a compaction summary before keeping the original history.",
       "memoryFlush": "Memory Flush",
-      "memoryFlushTip": "Before compaction, the agent gets a turn to save important context to memory files. Also triggers Knowledge Graph extraction."
+      "memoryFlushTip": "Before compaction, the agent gets a turn to save important context to memory files. Also triggers Knowledge Graph extraction.",
+      "maxRequestShare": "Max Request Share (0-1)",
+      "maxRequestShareTip": "Maximum fraction of the agent context window allowed for the final request sent to the model. If exceeded, the system reduces context before calling the model."
     },
     "inboundDebounce": {
       "title": "Inbound Debounce",

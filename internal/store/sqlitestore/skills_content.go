@@ -4,6 +4,8 @@ package sqlitestore
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -35,6 +37,11 @@ func (s *SQLiteSkillStore) LoadSkill(ctx context.Context, name string) (string, 
 	if err != nil {
 		return "", false
 	}
+	// Resolve {baseDir} placeholder so SKILL.md script-invocation lines hold
+	// absolute paths regardless of agent CWD. Mirrors skills.Loader.LoadSkill
+	// substitution; without it, agents reading SKILL.md via this RPC see the
+	// literal placeholder.
+	content = strings.ReplaceAll(content, "{baseDir}", info.BaseDir)
 	return content, true
 }
 
@@ -124,13 +131,17 @@ func (s *SQLiteSkillStore) GetSkill(ctx context.Context, name string) (*store.Sk
 		return &enriched[0], true
 	}
 
+	// "archived" means a system skill has missing dependencies (see seeder.go); it does not
+	// mean the skill is hidden from lookup. ListSkills() and GetSkillByID() both include
+	// active + archived skills, so name/slug lookup must match to avoid 404s on archived
+	// skills that are otherwise still enabled.
 	if id, err := uuid.Parse(name); err == nil {
 		return scan(baseSelect+"id = ? AND status IN ('active', 'archived')"+scope, append([]any{id}, args...)...)
 	}
-	if info, ok := scan(baseSelect+"slug = ? AND status = 'active'"+scope, append([]any{name}, args...)...); ok {
+	if info, ok := scan(baseSelect+"slug = ? AND status IN ('active', 'archived')"+scope, append([]any{name}, args...)...); ok {
 		return info, true
 	}
-	return scan(baseSelect+"name = ? AND status = 'active'"+scope+" ORDER BY id LIMIT 1", append([]any{name}, args...)...)
+	return scan(baseSelect+"name = ? AND status IN ('active', 'archived')"+scope+" ORDER BY id LIMIT 1", append([]any{name}, args...)...)
 }
 
 func (s *SQLiteSkillStore) FilterSkills(ctx context.Context, allowList []string) []store.SkillInfo {
@@ -236,7 +247,9 @@ func (s *SQLiteSkillStore) UpsertSystemSkill(ctx context.Context, p store.SkillC
 	var existingHash *string
 	var existingFilePath string
 	err := s.db.QueryRowContext(ctx,
-		"SELECT id, file_hash, file_path FROM skills WHERE slug = ?", p.Slug,
+		`SELECT id, file_hash, file_path FROM skills
+		 WHERE slug = ? AND tenant_id = ? AND is_system = 1`,
+		p.Slug, store.MasterTenantID,
 	).Scan(&existingID, &existingHash, &existingFilePath)
 
 	if err == nil {
@@ -264,6 +277,31 @@ func (s *SQLiteSkillStore) UpsertSystemSkill(ctx context.Context, p store.SkillC
 		}
 		s.BumpVersion()
 		return existingID, true, p.FilePath, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return uuid.Nil, false, "", fmt.Errorf("find system skill: %w", err)
+	}
+
+	// The master tenant has a unique slug index. Preserve a custom skill that
+	// already owns the bundled slug instead of replacing it.
+	var customID uuid.UUID
+	var recoveryMarker string
+	err = s.db.QueryRowContext(ctx,
+		`SELECT id, CASE WHEN json_valid(frontmatter)
+		     THEN COALESCE(json_extract(frontmatter, '$._goclaw_recovery'), '')
+		     ELSE '' END
+		 FROM skills
+		 WHERE slug = ? AND tenant_id = ? AND is_system = 0`,
+		p.Slug, store.MasterTenantID,
+	).Scan(&customID, &recoveryMarker)
+	if err == nil {
+		if recoveryMarker == store.SkillRecoveryBundledSlugCollision {
+			return customID, false, "", store.ErrMisclassifiedCustomSkill
+		}
+		return customID, false, "", store.ErrSystemSkillSlugConflict
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return uuid.Nil, false, "", fmt.Errorf("find custom skill conflict: %w", err)
 	}
 
 	id := store.GenNewID()

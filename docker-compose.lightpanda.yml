@@ -1,0 +1,41 @@
+# Lightpanda sidecar overlay — lightweight CDP browser.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.postgres.yml -f docker-compose.lightpanda.yml up -d --build
+#
+# Lightpanda (https://lightpanda.io) is a low-memory headless browser with CDP
+# support. Opt-in alternative to the Chrome sidecar (docker-compose.browser.yml).
+# See docs/browser-backends.md for the compatibility matrix.
+
+services:
+  lightpanda:
+    # Official Lightpanda CDP image: https://hub.docker.com/r/lightpanda/browser
+    image: lightpanda/browser:latest
+    # Invoke the lightpanda binary explicitly — the image's default entrypoint
+    # isn't `lightpanda`. Verify against image docs if upgrading.
+    command: ["lightpanda", "serve", "--host", "0.0.0.0", "--port", "9222"]
+    ports:
+      - "127.0.0.1:${LIGHTPANDA_CDP_PORT:-9222}:9222"
+    healthcheck:
+      # Minimal TCP probe via sh's /dev/tcp. If the image is scratch-based
+      # without a shell, drop healthcheck and change depends_on below to
+      # `condition: service_started`.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9222 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          # Lightpanda is ~10x lighter than Chrome.
+          memory: 512M
+          cpus: '1.0'
+    restart: unless-stopped
+
+  goclaw:
+    environment:
+      - GOCLAW_BROWSER_REMOTE_URL=ws://lightpanda:9222
+      - GOCLAW_BROWSER_BACKEND=lightpanda
+    depends_on:
+      lightpanda:
+        condition: service_healthy

@@ -650,3 +650,369 @@ func TestHandleMessage_Blocked_DoesNotCollectContact(t *testing.T) {
 		t.Errorf("blocked messages must not record contacts, got %d upserts", n)
 	}
 }
+
+// --- Open Channel (MESSAGE_TYPE="L") gating ---------------------------------
+
+func TestIsOpenChannelParams(t *testing.T) {
+	tests := []struct {
+		name   string
+		params *EventParams
+		want   bool
+	}{
+		{name: "nil", params: nil, want: false},
+		{name: "message type L", params: &EventParams{MessageType: "L"}, want: true},
+		{name: "lines entity", params: &EventParams{ChatEntityType: "LINES"}, want: true},
+		{name: "case insensitive", params: &EventParams{ChatEntityType: "lines"}, want: true},
+		{name: "regular group", params: &EventParams{MessageType: "C"}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isOpenChannelParams(tt.params); got != tt.want {
+				t.Errorf("isOpenChannelParams() = %v; want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestHandleMessage_OpenChannel_ConnectorWithoutMentionDropped covers the
+// customer side of the Open Channel gate on a GROUP-style connector
+// (Zalo personal) without an explicit mention: customers chatting amongst
+// themselves in the same Open Channel chat must NOT trigger the agent.
+// The CHAT_ENTITY_ID prefix is what tells us "this connector is
+// group-style and therefore needs the gate" — connectors that don't
+// match the whitelist are handled by sibling tests (no gate, every
+// message forwards).
+func TestHandleMessage_OpenChannel_ConnectorWithoutMentionDropped(t *testing.T) {
+	ch, mb := newHandleTestChannel(t, 1058, false)
+	defer resetWebhookRouterForTest()
+
+	ch.DispatchEvent(context.Background(), &Event{
+		Type: EventMessageAdd,
+		Params: EventParams{
+			FromUserID:      "960",
+			DialogID:        "chat4878",
+			MessageID:       "m-ol-customer",
+			MessageType:     "L",
+			ChatEntityType:  "LINES",
+			ChatEntityID:    "synity_zalo_personal|20|grp|960",
+			Message:         "Em hỏi giá sản phẩm A",
+			FromIsConnector: true,
+		},
+	})
+	if _, ok := drainOne(mb, 100*time.Millisecond); ok {
+		t.Error("Open Channel connector (whitelisted group-style) messages without mention must be dropped")
+	}
+}
+
+// TestHandleMessage_OpenChannel_OneToOneConnectorWithoutMentionForwarded
+// covers the inverse case: a 1-to-1 connector (e.g. Facebook Messenger,
+// Zalo OA) where each customer has their own Open Channel chat. Every
+// customer message is addressed to the bot by construction; gating
+// would silently drop legitimate customer turns. CHAT_ENTITY_ID prefix
+// "facebook" is not in the require-mention whitelist, so the message
+// MUST forward without a mention.
+func TestHandleMessage_OpenChannel_OneToOneConnectorWithoutMentionForwarded(t *testing.T) {
+	ch, mb := newHandleTestChannel(t, 1058, false)
+	defer resetWebhookRouterForTest()
+
+	ch.DispatchEvent(context.Background(), &Event{
+		Type: EventMessageAdd,
+		Params: EventParams{
+			FromUserID:      "1074",
+			DialogID:        "chat5208",
+			MessageID:       "m-fb-customer",
+			MessageType:     "L",
+			ChatEntityType:  "LINES",
+			ChatEntityID:    "facebook|34|36305652112415023|1074",
+			Message:         "hello, do you have product X in stock?",
+			FromIsConnector: true,
+		},
+	})
+	if _, ok := drainOne(mb, 200*time.Millisecond); !ok {
+		t.Error("1-to-1 connector (facebook) customer messages must forward without requiring mention")
+	}
+}
+
+// TestHandleMessage_OpenChannel_ConnectorWithMentionForwarded covers the
+// "customer calls the bot" case: a Zalo/FB customer (IS_CONNECTOR=Y) whose
+// upstream populated MENTIONED_LIST with the bot id must trigger a reply,
+// the same as an internal staff member who @-mentions the bot. Connector
+// status alone is no longer a drop signal — mention is the only gate.
+func TestHandleMessage_OpenChannel_ConnectorWithMentionForwarded(t *testing.T) {
+	const botID = 1058
+	ch, mb := newHandleTestChannel(t, botID, false)
+	defer resetWebhookRouterForTest()
+
+	ch.DispatchEvent(context.Background(), &Event{
+		Type: EventMessageAdd,
+		Params: EventParams{
+			FromUserID:      "960",
+			DialogID:        "chat4878",
+			MessageID:       "m-ol-customer-mention",
+			MessageType:     "L",
+			ChatEntityType:  "LINES",
+			Message:         "alo bot ơi cho hỏi giá",
+			MessageOriginal: "[USER=1058]Tiểu Hà[/USER] alo bot ơi cho hỏi giá",
+			MentionedList:   map[string]string{"1058": "1058"},
+			FromIsConnector: true,
+		},
+	})
+	msg, ok := drainOne(mb, 500*time.Millisecond)
+	if !ok {
+		t.Fatal("Open Channel connector WITH @mention must forward to agent")
+	}
+	if msg.PeerKind != "group" {
+		t.Errorf("PeerKind = %q; want group (OL forced into group routing)", msg.PeerKind)
+	}
+	if !strings.Contains(msg.Content, "alo bot ơi cho hỏi giá") {
+		t.Errorf("content stripped wrong: %q", msg.Content)
+	}
+	if strings.Contains(msg.Content, "[USER=1058]") {
+		t.Errorf("bot mention BBCode not stripped: %q", msg.Content)
+	}
+}
+
+// TestHandleMessage_OpenChannel_InternalStaffWithoutMentionDropped covers the
+// silent-staff case: an internal Bitrix24 user joins the Open Channel session
+// to supervise but does NOT @-mention the bot — bot stays out.
+func TestHandleMessage_OpenChannel_InternalStaffWithoutMentionDropped(t *testing.T) {
+	ch, mb := newHandleTestChannel(t, 1058, false)
+	defer resetWebhookRouterForTest()
+
+	ch.DispatchEvent(context.Background(), &Event{
+		Type: EventMessageAdd,
+		Params: EventParams{
+			FromUserID:      "610",
+			DialogID:        "chat4878",
+			MessageID:       "m-ol-staff-quiet",
+			MessageType:     "L",
+			ChatEntityType:  "LINES",
+			Message:         "haha được rồi",
+			FromIsConnector: false,
+		},
+	})
+	if _, ok := drainOne(mb, 100*time.Millisecond); ok {
+		t.Error("Open Channel internal staff without @mention must be dropped")
+	}
+}
+
+// TestHandleMessage_OpenChannel_InternalStaffMentionForwarded covers the
+// "call the bot" case: internal staff @-mentions the bot — message goes to the
+// agent like a normal group mention.
+func TestHandleMessage_OpenChannel_InternalStaffMentionForwarded(t *testing.T) {
+	const botID = 1058
+	ch, mb := newHandleTestChannel(t, botID, false)
+	defer resetWebhookRouterForTest()
+
+	ch.DispatchEvent(context.Background(), &Event{
+		Type: EventMessageAdd,
+		Params: EventParams{
+			FromUserID:      "610",
+			DialogID:        "chat4878",
+			MessageID:       "m-ol-staff-mention",
+			MessageType:     "L",
+			ChatEntityType:  "LINES",
+			Message:         "tổng hợp khách này giúp",                                 // stripped form (Bitrix strips group mentions)
+			MessageOriginal: "[USER=1058]Tiểu Hà[/USER] tổng hợp khách này giúp",
+			MentionedList:   map[string]string{"1058": "1058"},
+			FromIsConnector: false,
+		},
+	})
+	msg, ok := drainOne(mb, 500*time.Millisecond)
+	if !ok {
+		t.Fatal("Open Channel internal staff WITH @mention must forward to agent")
+	}
+	if msg.PeerKind != "group" {
+		t.Errorf("PeerKind = %q; want group (OL forced into group routing)", msg.PeerKind)
+	}
+	if !strings.Contains(msg.Content, "tổng hợp khách này giúp") {
+		t.Errorf("content stripped wrong: %q", msg.Content)
+	}
+	// The bot's own [USER=1058]…[/USER] mention should be stripped from the
+	// forwarded content.
+	if strings.Contains(msg.Content, "[USER=1058]") {
+		t.Errorf("bot mention BBCode not stripped: %q", msg.Content)
+	}
+}
+
+// TestHandleMessage_OL_ThreeToken_ConnectorCreatesParticipantIdentity verifies a
+// connector message (IS_CONNECTOR=Y) carrying the 3-token "[Name] #uid #msgId"
+// tag mints a per-participant synthetic identity: participant_user_id contains the
+// uid + chat id, the echo prefix is "#msgId" only, and the tag is stripped from the
+// body the agent sees.
+func TestHandleMessage_OL_ThreeToken_ConnectorCreatesParticipantIdentity(t *testing.T) {
+	ch, mb := newHandleTestChannel(t, 1058, false)
+	defer resetWebhookRouterForTest()
+
+	ch.DispatchEvent(context.Background(), &Event{
+		Type: EventMessageAdd,
+		Params: EventParams{
+			FromUserID:      "960",
+			DialogID:        "chat4878",
+			MessageID:       "297178", // Bitrix MESSAGE_ID (distinct from the Zalo msgId)
+			MessageType:     "L",
+			ChatEntityType:  "LINES",
+			Message:         "[Trung Hee] #111222 #777888 alo bot",
+			MessageOriginal: "[USER=1058]bot[/USER] [Trung Hee] #111222 #777888 alo bot",
+			MentionedList:   map[string]string{"1058": "1058"},
+			FromIsConnector: true,
+		},
+	})
+	msg, ok := drainOne(mb, 500*time.Millisecond)
+	if !ok {
+		t.Fatal("connector 3-token message must forward")
+	}
+	pid := msg.Metadata[MetaKeyParticipantUserID]
+	if !strings.Contains(pid, "111222") {
+		t.Errorf("participant_user_id = %q; must contain uid 111222", pid)
+	}
+	if !strings.Contains(pid, "chat4878") {
+		t.Errorf("participant_user_id = %q; must contain chat id chat4878", pid)
+	}
+	// SenderID is the synthetic per-participant id, not the proxy "960".
+	if msg.SenderID != pid {
+		t.Errorf("SenderID = %q; want synthetic participant id %q", msg.SenderID, pid)
+	}
+	if msg.SenderID == "960" {
+		t.Error("SenderID must not stay the connector proxy id 960")
+	}
+	// Echo prefix = "#msgId" only (no name, no uid).
+	if pfx := msg.Metadata[MetaKeySenderPrefix]; pfx != "#777888" {
+		t.Errorf("MetaKeySenderPrefix = %q; want #777888 (msgId only)", pfx)
+	}
+	// Bitrix MESSAGE_ID for the v2 fields.replyId stays the Bitrix id, NOT the
+	// 13-digit Zalo msgId — the echo prefix is the only place the connector msgId
+	// is surfaced.
+	if mid := msg.Metadata[MetaKeyMessageID]; mid != "297178" {
+		t.Errorf("MetaKeyMessageID = %q; want 297178 (Bitrix MESSAGE_ID preserved)", mid)
+	}
+	if strings.Contains(msg.Content, "[Trung Hee]") || strings.Contains(msg.Content, "#111222") {
+		t.Errorf("content must not contain the sender tag: %q", msg.Content)
+	}
+	if !strings.Contains(msg.Content, "alo bot") {
+		t.Errorf("content lost the body: %q", msg.Content)
+	}
+}
+
+// TestHandleMessage_OL_ForgedTag_OperatorNotGettingParticipantIdentity is the
+// security gate: an operator message (IS_CONNECTOR=N) whose text mimics the
+// 3-token connector tag must NOT mint a participant identity. Live logs showed an
+// operator typing "[Trung Hee] ..." — without the gate they'd be misattributed as
+// that customer.
+func TestHandleMessage_OL_ForgedTag_OperatorNotGettingParticipantIdentity(t *testing.T) {
+	ch, mb := newHandleTestChannel(t, 1058, false)
+	defer resetWebhookRouterForTest()
+
+	ch.DispatchEvent(context.Background(), &Event{
+		Type: EventMessageAdd,
+		Params: EventParams{
+			FromUserID:      "1", // operator
+			DialogID:        "chat4878",
+			MessageID:       "297179",
+			MessageType:     "L",
+			ChatEntityType:  "LINES",
+			Message:         "[Trung Hee] #111222 #777888 do nó bị văng",
+			MessageOriginal: "[USER=1058]bot[/USER] [Trung Hee] #111222 #777888 do nó bị văng",
+			MentionedList:   map[string]string{"1058": "1058"},
+			FromIsConnector: false, // IS_CONNECTOR=N
+		},
+	})
+	msg, ok := drainOne(mb, 500*time.Millisecond)
+	if !ok {
+		t.Fatal("operator message with mention must still forward")
+	}
+	if pid := msg.Metadata[MetaKeyParticipantUserID]; pid != "" {
+		t.Errorf("operator forged tag must not mint participant_user_id, got %q", pid)
+	}
+	// SenderID stays the operator's real id (not a synthetic), so memory/contact
+	// scope tracks the operator, not the impersonated customer.
+	if msg.SenderID != "1" {
+		t.Errorf("SenderID = %q; want operator id 1 (no synthetic identity)", msg.SenderID)
+	}
+	// No echo prefix at all should be minted for the operator — senderTag stays
+	// the zero value (TagFormatNone) on the non-connector path.
+	if pfx := msg.Metadata[MetaKeySenderPrefix]; pfx != "" {
+		t.Errorf("operator forged tag must not produce any echo prefix, got %q", pfx)
+	}
+	// Bitrix MESSAGE_ID for replyId is the genuine webhook id.
+	if mid := msg.Metadata[MetaKeyMessageID]; mid != "297179" {
+		t.Errorf("MetaKeyMessageID = %q; want 297179", mid)
+	}
+}
+
+// TestHandleMessage_OL_LegacyOneToken_NoParticipantID verifies a connector
+// message with the legacy single-number "[Name] #msgId" tag degrades safely:
+// no participant identity (uid absent), sender stays the proxy id, and the echo
+// keeps the canonical "[name] #msgId" shape (unchanged from prior behavior).
+func TestHandleMessage_OL_LegacyOneToken_NoParticipantID(t *testing.T) {
+	ch, mb := newHandleTestChannel(t, 1058, false)
+	defer resetWebhookRouterForTest()
+
+	ch.DispatchEvent(context.Background(), &Event{
+		Type: EventMessageAdd,
+		Params: EventParams{
+			FromUserID:      "960",
+			DialogID:        "chat4878",
+			MessageID:       "297180",
+			MessageType:     "L",
+			ChatEntityType:  "LINES",
+			Message:         "[Trung Hee] #7957717404177 alo",
+			MessageOriginal: "[USER=1058]bot[/USER] [Trung Hee] #7957717404177 alo",
+			MentionedList:   map[string]string{"1058": "1058"},
+			FromIsConnector: true,
+		},
+	})
+	msg, ok := drainOne(mb, 500*time.Millisecond)
+	if !ok {
+		t.Fatal("legacy connector message must forward")
+	}
+	if pid := msg.Metadata[MetaKeyParticipantUserID]; pid != "" {
+		t.Errorf("legacy 1-number tag must not mint participant_user_id, got %q", pid)
+	}
+	if msg.SenderID != "960" {
+		t.Errorf("SenderID = %q; want proxy 960 (no synthetic for legacy)", msg.SenderID)
+	}
+	if pfx := msg.Metadata[MetaKeySenderPrefix]; pfx != "[Trung Hee] #7957717404177" {
+		t.Errorf("MetaKeySenderPrefix = %q; want canonical legacy echo", pfx)
+	}
+	if !strings.Contains(msg.Content, "alo") || strings.Contains(msg.Content, "#7957717404177") {
+		t.Errorf("legacy tag not stripped from body: %q", msg.Content)
+	}
+}
+
+// TestHandleMessage_OL_NoTag_DegradesToGroupLevel verifies a connector message
+// with NO sender tag (e.g. a bare media/sticker relay) degrades safely: no
+// participant identity and no echo prefix, so the consumer falls back to the
+// group-level userID.
+func TestHandleMessage_OL_NoTag_DegradesToGroupLevel(t *testing.T) {
+	ch, mb := newHandleTestChannel(t, 1058, false)
+	defer resetWebhookRouterForTest()
+
+	ch.DispatchEvent(context.Background(), &Event{
+		Type: EventMessageAdd,
+		Params: EventParams{
+			FromUserID:      "960",
+			DialogID:        "chat4878",
+			MessageID:       "297181",
+			MessageType:     "L",
+			ChatEntityType:  "LINES",
+			Message:         "chào shop cho hỏi giá",
+			MessageOriginal: "[USER=1058]bot[/USER] chào shop cho hỏi giá",
+			MentionedList:   map[string]string{"1058": "1058"},
+			FromIsConnector: true,
+		},
+	})
+	msg, ok := drainOne(mb, 500*time.Millisecond)
+	if !ok {
+		t.Fatal("untagged connector message must forward")
+	}
+	if pid := msg.Metadata[MetaKeyParticipantUserID]; pid != "" {
+		t.Errorf("untagged message must not mint participant_user_id, got %q", pid)
+	}
+	if msg.SenderID != "960" {
+		t.Errorf("SenderID = %q; want proxy 960", msg.SenderID)
+	}
+	if pfx := msg.Metadata[MetaKeySenderPrefix]; pfx != "" {
+		t.Errorf("untagged message must not set an echo prefix, got %q", pfx)
+	}
+}

@@ -45,13 +45,14 @@ type MediaRef struct {
 
 // HistoryEntry represents a single tracked group message.
 type HistoryEntry struct {
-	Sender    string
-	SenderID  string
-	Body      string
-	Media     []string   // temp file paths for images/attachments (RAM-only, not persisted to DB)
-	MediaRefs []MediaRef // deferred media refs for lazy download (RAM-only, not persisted)
-	Timestamp time.Time
-	MessageID string
+	Sender           string
+	SenderID         string
+	Body             string
+	ParentHistoryKey string
+	Media            []string   // temp file paths for images/attachments (RAM-only, not persisted to DB)
+	MediaRefs        []MediaRef // deferred media refs for lazy download (RAM-only, not persisted)
+	Timestamp        time.Time
+	MessageID        string
 }
 
 // PendingHistory tracks group messages across multiple groups.
@@ -101,6 +102,47 @@ func NewPersistentHistory(channelName string, s store.PendingMessageStore, tenan
 
 // IsPersistent returns true if this history is backed by a DB store.
 func (ph *PendingHistory) IsPersistent() bool { return ph.store != nil }
+
+// PersistedGroupIDs returns the current channel's stored group and parent
+// history keys. It lets platform metadata refreshes backfill titles for groups
+// that have pending history but no channel-contact record.
+func (ph *PendingHistory) PersistedGroupIDs(ctx context.Context) ([]string, error) {
+	if ph == nil || ph.store == nil || ph.channelName == "" {
+		return nil, nil
+	}
+	groups, err := ph.store.ListGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{})
+	var ids []string
+	for _, group := range groups {
+		if group.ChannelName != ph.channelName {
+			continue
+		}
+		for _, id := range []string{group.HistoryKey, group.ParentHistoryKey} {
+			if id == "" {
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
+}
+
+// SetChannelName updates the channel identity used for DB persistence.
+// DB-backed channel instances are constructed with a platform type first and
+// renamed to the instance name before start.
+func (ph *PendingHistory) SetChannelName(name string) {
+	if name == "" {
+		return
+	}
+	ph.channelName = name
+}
 
 // SetCompactionConfig sets the LLM compaction config. Call after creation.
 func (ph *PendingHistory) SetCompactionConfig(cfg *CompactionConfig) {
@@ -171,13 +213,14 @@ func (ph *PendingHistory) Record(historyKey string, entry HistoryEntry, limit in
 	// Queue for DB persistence (batched flush)
 	if ph.store != nil {
 		ph.enqueueFlush(store.PendingMessage{
-			ChannelName:   ph.channelName,
-			HistoryKey:    historyKey,
-			Sender:        entry.Sender,
-			SenderID:      entry.SenderID,
-			Body:          entry.Body,
-			PlatformMsgID: entry.MessageID,
-			CreatedAt:     entry.Timestamp,
+			ChannelName:      ph.channelName,
+			HistoryKey:       historyKey,
+			ParentHistoryKey: entry.ParentHistoryKey,
+			Sender:           entry.Sender,
+			SenderID:         entry.SenderID,
+			Body:             entry.Body,
+			PlatformMsgID:    entry.MessageID,
+			CreatedAt:        entry.Timestamp,
 		})
 	}
 
@@ -205,11 +248,12 @@ func (ph *PendingHistory) loadFromDB(historyKey string) []HistoryEntry {
 	entries := make([]HistoryEntry, 0, len(msgs))
 	for _, m := range msgs {
 		entries = append(entries, HistoryEntry{
-			Sender:    m.Sender,
-			SenderID:  m.SenderID,
-			Body:      m.Body,
-			Timestamp: m.CreatedAt,
-			MessageID: m.PlatformMsgID,
+			Sender:           m.Sender,
+			SenderID:         m.SenderID,
+			Body:             m.Body,
+			ParentHistoryKey: m.ParentHistoryKey,
+			Timestamp:        m.CreatedAt,
+			MessageID:        m.PlatformMsgID,
 		})
 	}
 

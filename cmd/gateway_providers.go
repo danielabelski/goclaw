@@ -43,6 +43,17 @@ func registerProviders(registry *providers.Registry, cfg *config.Config, modelRe
 		slog.Info("registered provider", "name", "openai")
 	}
 
+	if cfg.Providers.AtlasCloud.APIKey != "" {
+		base := cfg.Providers.AtlasCloud.APIBase
+		if base == "" {
+			base = store.AtlasCloudDefaultAPIBase
+		}
+		prov := providers.NewOpenAIProvider("atlascloud", cfg.Providers.AtlasCloud.APIKey, base, store.AtlasCloudDefaultModel)
+		prov.WithProviderType(store.ProviderAtlasCloud)
+		registry.Register(prov)
+		slog.Info("registered provider", "name", "atlascloud")
+	}
+
 	if cfg.Providers.APIRoute.APIKey != "" {
 		base := cfg.Providers.APIRoute.APIBase
 		if base == "" {
@@ -87,8 +98,11 @@ func registerProviders(registry *providers.Registry, cfg *config.Config, modelRe
 	}
 
 	if cfg.Providers.MiniMax.APIKey != "" {
-		registry.Register(providers.NewOpenAIProvider("minimax", cfg.Providers.MiniMax.APIKey, "https://api.minimax.io/v1", "MiniMax-M2.5").
-			WithChatPath("/text/chatcompletion_v2"))
+		base := cfg.Providers.MiniMax.APIBase
+		if base == "" {
+			base = store.MiniMaxDefaultAPIBase
+		}
+		registry.Register(providers.NewOpenAIProvider("minimax", cfg.Providers.MiniMax.APIKey, base, store.MiniMaxDefaultModel))
 		slog.Info("registered provider", "name", "minimax")
 	}
 
@@ -112,43 +126,59 @@ func registerProviders(registry *providers.Registry, cfg *config.Config, modelRe
 		if base == "" {
 			base = "https://coding-intl.dashscope.aliyuncs.com/v1"
 		}
-		registry.Register(providers.NewOpenAIProvider("bailian", cfg.Providers.Bailian.APIKey, base, "qwen3.5-plus"))
+		registry.Register(providers.NewOpenAIProvider("bailian", cfg.Providers.Bailian.APIKey, base, "qwen3.5-plus").
+			WithProviderType(store.ProviderBailian))
 		slog.Info("registered provider", "name", "bailian")
 	}
 
 	if cfg.Providers.Zai.APIKey != "" {
 		base := cfg.Providers.Zai.APIBase
 		if base == "" {
-			base = "https://api.z.ai/api/paas/v4"
+			base = store.ZaiDefaultAPIBase
 		}
-		registry.Register(providers.NewOpenAIProvider("zai", cfg.Providers.Zai.APIKey, base, "glm-5"))
+		registry.Register(providers.NewOpenAIProvider("zai", cfg.Providers.Zai.APIKey, base, store.ZaiDefaultModel))
 		slog.Info("registered provider", "name", "zai")
 	}
 
 	if cfg.Providers.ZaiCoding.APIKey != "" {
 		base := cfg.Providers.ZaiCoding.APIBase
 		if base == "" {
-			base = "https://api.z.ai/api/coding/paas/v4"
+			base = store.ZaiCodingDefaultAPIBase
 		}
-		registry.Register(providers.NewOpenAIProvider("zai-coding", cfg.Providers.ZaiCoding.APIKey, base, "glm-5"))
+		registry.Register(providers.NewOpenAIProvider("zai-coding", cfg.Providers.ZaiCoding.APIKey, base, store.ZaiDefaultModel))
 		slog.Info("registered provider", "name", "zai-coding")
 	}
 
 	// Local / self-hosted Ollama — gated on Host, no API key required.
-	// Ollama's OpenAI-compat endpoint accepts any non-empty Bearer value.
+	// Uses the native Ollama Go client for proper options.num_ctx support.
 	if cfg.Providers.Ollama.Host != "" {
 		host := cfg.Providers.Ollama.Host
-		registry.Register(providers.NewOpenAIProvider("ollama", "ollama", host+"/v1", "llama3.3"))
+		ctx5s, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		numCtx := providers.FetchOllamaModelContext(ctx5s, config.DockerLocalhost(host), "llama3.3", "")
+		cancel()
+		var numCtxPtr *int
+		if numCtx != providers.OllamaDefaultNumCtx {
+			numCtxPtr = &numCtx
+		}
+		registry.Register(providers.NewOllamaProvider("ollama", host, "llama3.3", numCtxPtr, nil))
 		slog.Info("registered provider", "name", "ollama")
 	}
 
 	// Ollama Cloud — API key required (generate at ollama.com/settings/keys).
+	// Uses the native Ollama Go client; the cloud endpoint is Ollama-native, not OpenAI-compat.
 	if cfg.Providers.OllamaCloud.APIKey != "" {
 		base := cfg.Providers.OllamaCloud.APIBase
 		if base == "" {
-			base = "https://ollama.com/v1"
+			base = "https://ollama.com"
 		}
-		registry.Register(providers.NewOpenAIProvider("ollama-cloud", cfg.Providers.OllamaCloud.APIKey, base, "llama3.3"))
+		ctx5s, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		numCtx := providers.FetchOllamaModelContext(ctx5s, config.DockerLocalhost(base), "llama3.3", "")
+		cancel()
+		var numCtxPtr *int
+		if numCtx != providers.OllamaDefaultNumCtx {
+			numCtxPtr = &numCtx
+		}
+		registry.Register(providers.NewOllamaProvider("ollama-cloud", base, "llama3.3", numCtxPtr, nil))
 		slog.Info("registered provider", "name", "ollama-cloud")
 	}
 
@@ -306,9 +336,12 @@ func registerProvidersFromDB(registry *providers.Registry, provStore store.Provi
 		if p.ProviderType == store.ProviderOllama {
 			host := p.APIBase
 			if host == "" {
-				host = "http://localhost:11434/v1"
+				host = "http://localhost:11434"
 			}
-			registry.RegisterForTenant(p.TenantID, providers.NewOpenAIProvider(p.Name, "ollama", config.DockerLocalhost(host), "llama3.3"))
+			numCtx := resolveOllamaNumCtx(&p)
+			prov := providers.NewOllamaProvider(p.Name, config.DockerLocalhost(host), "llama3.3", numCtx, nil).
+				WithThinkingEnabled(store.ParseThinkingEnabled(p.Settings))
+			registry.RegisterForTenant(p.TenantID, prov)
 			slog.Info("registered provider from DB", "name", p.Name)
 			continue
 		}
@@ -367,25 +400,29 @@ func registerProvidersFromDB(registry *providers.Registry, provStore store.Provi
 			if base == "" {
 				base = "https://coding-intl.dashscope.aliyuncs.com/v1"
 			}
-			registry.RegisterForTenant(p.TenantID, providers.NewOpenAIProvider(p.Name, p.APIKey, base, "qwen3.5-plus"))
+			registry.RegisterForTenant(p.TenantID, providers.NewOpenAIProvider(p.Name, p.APIKey, base, "qwen3.5-plus").
+				WithProviderType(p.ProviderType))
 		case store.ProviderZai:
 			base := p.APIBase
 			if base == "" {
-				base = "https://api.z.ai/api/paas/v4"
+				base = store.ZaiDefaultAPIBase
 			}
-			registry.RegisterForTenant(p.TenantID, providers.NewOpenAIProvider(p.Name, p.APIKey, base, "glm-5"))
+			registry.RegisterForTenant(p.TenantID, providers.NewOpenAIProvider(p.Name, p.APIKey, base, store.ZaiDefaultModel))
 		case store.ProviderZaiCoding:
 			base := p.APIBase
 			if base == "" {
-				base = "https://api.z.ai/api/coding/paas/v4"
+				base = store.ZaiCodingDefaultAPIBase
 			}
-			registry.RegisterForTenant(p.TenantID, providers.NewOpenAIProvider(p.Name, p.APIKey, base, "glm-5"))
+			registry.RegisterForTenant(p.TenantID, providers.NewOpenAIProvider(p.Name, p.APIKey, base, store.ZaiDefaultModel))
 		case store.ProviderOllamaCloud:
 			base := p.APIBase
 			if base == "" {
-				base = "https://ollama.com/v1"
+				base = "https://ollama.com"
 			}
-			registry.RegisterForTenant(p.TenantID, providers.NewOpenAIProvider(p.Name, p.APIKey, base, "llama3.3"))
+			numCtx := resolveOllamaNumCtx(&p)
+			prov := providers.NewOllamaProvider(p.Name, base, "llama3.3", numCtx, nil).
+				WithThinkingEnabled(store.ParseThinkingEnabled(p.Settings))
+			registry.RegisterForTenant(p.TenantID, prov)
 		case store.ProviderNovita:
 			base := p.APIBase
 			if base == "" {
@@ -421,6 +458,10 @@ func registerProvidersFromDB(registry *providers.Registry, provStore store.Provi
 				"User-Agent": store.KimiCodingRequiredUserAgent,
 			})
 			registry.RegisterForTenant(p.TenantID, prov)
+		case store.ProviderAIMLAPI:
+			prov := providers.NewAIMLAPIProvider(p.Name, p.APIKey, p.APIBase)
+			prov.WithProviderType(p.ProviderType)
+			registry.RegisterForTenant(p.TenantID, prov)
 		case store.ProviderAPIRoute:
 			base := p.APIBase
 			if base == "" {
@@ -430,11 +471,10 @@ func registerProvidersFromDB(registry *providers.Registry, provStore store.Provi
 			prov.WithProviderType(p.ProviderType)
 			registry.RegisterForTenant(p.TenantID, prov)
 		default:
-			prov := providers.NewOpenAIProvider(p.Name, p.APIKey, p.APIBase, "")
+			base, model := openAIProviderDefaults(p.ProviderType, p.APIBase)
+			prov := providers.NewOpenAIProvider(p.Name, p.APIKey, base, model)
 			prov.WithProviderType(p.ProviderType)
-			if p.ProviderType == store.ProviderMiniMax {
-				prov.WithChatPath("/text/chatcompletion_v2")
-			}
+			prov.WithThinkingEnabled(store.ParseThinkingEnabled(p.Settings))
 			if p.ProviderType == store.ProviderOpenRouter {
 				prov.WithSiteInfo("https://goclaw.sh", "GoClaw")
 			}
@@ -442,6 +482,38 @@ func registerProvidersFromDB(registry *providers.Registry, provStore store.Provi
 		}
 		slog.Info("registered provider from DB", "name", p.Name)
 	}
+}
+
+func openAIProviderDefaults(providerType, apiBase string) (string, string) {
+	switch providerType {
+	case store.ProviderMiniMax:
+		if apiBase == "" {
+			apiBase = store.MiniMaxDefaultAPIBase
+		}
+		return apiBase, store.MiniMaxDefaultModel
+	case store.ProviderAtlasCloud:
+		if apiBase == "" {
+			apiBase = store.AtlasCloudDefaultAPIBase
+		}
+		return apiBase, store.AtlasCloudDefaultModel
+	default:
+		return apiBase, ""
+	}
+}
+
+// resolveOllamaNumCtx returns the operator-configured num_ctx for an Ollama
+// provider, or nil to let the provider resolve it per model at request time.
+//
+// Only the explicit settings JSONB override is honoured here. Probing /api/show
+// at startup cannot work: the model an agent will use is not known until it
+// sends a request, so the probe had to guess a model name, and a wrong guess
+// resolved to nothing. OllamaProvider.resolveNumCtx does the lookup against the
+// real model instead, and caches it.
+func resolveOllamaNumCtx(p *store.LLMProviderData) *int {
+	if s := store.ParseOllamaSettings(p.Settings); s != nil {
+		return s.NumCtx
+	}
+	return nil
 }
 
 func registerClaudeCLIFromConfig(registry *providers.Registry, cfg *config.Config) {

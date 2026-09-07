@@ -168,11 +168,34 @@ Every channel must implement the base interface:
 | `StreamingChannel` | Real-time streaming updates | Telegram, Slack |
 | `WebhookChannel` | Webhook HTTP handler mounting | Facebook, Feishu/Lark, Pancake |
 | `ReactionChannel` | Status reactions on messages | Telegram, Slack, Feishu |
+| `ActivityIndicatorChannel` | Ephemeral "agent is working" indicator | Bitrix24 |
 | `BlockReplyChannel` | Override gateway block_reply setting | Discord, Feishu/Lark, Pancake, Slack, Zalo OA, Zalo Personal |
 | `ChatBehaviorChannel` | Override gateway chat_behavior setting | Bitrix24, Discord, Feishu/Lark, Pancake, Slack, Telegram, WhatsApp, Zalo OA, Zalo Personal |
 | `ReasoningDeliveryChannel` | Override channel-visible reasoning delivery | Telegram |
 
 `BaseChannel` provides a shared implementation that all channels embed: allowlist matching, `HandleMessage()`, `CheckPolicy()`, and user ID extraction.
+
+### Activity Indicator (`ActivityIndicatorChannel`)
+
+Shows a native, ephemeral "agent is working" indicator while the agent thinks or runs tools,
+so users on non-streaming channels aren't left staring at silence until the final reply. It is
+**not** a chat message — nothing is persisted, no extra LLM call is made.
+
+Driven by the existing agent event stream in `Manager.HandleAgentEvent`:
+
+- `run.started` → `THINKING`, and a conditional heartbeat ticker starts.
+- `tool.call` → status mapped from the tool name (`SEARCHING`, `READING_DOCS`, `GENERATING`,
+  `CONNECTING`, `PROCESSING`) via `resolveToolActivityStatus`.
+- `tool.result` → `ANALYZING`.
+- terminal events → ticker stops.
+
+Because non-streaming turns emit no events during LLM inference, a **conditional heartbeat
+ticker** re-sends the current status only when the run has been idle beyond a threshold — filling
+the gap without spamming. Calls are **best-effort and dropped on rate limit** (they never retry
+into the portal's leaky bucket, so real message sends are never starved).
+
+**Bitrix24** implements it via `imbot.v2.Chat.InputAction.notify` (status codes
+`IMBOT_AGENT_ACTION_*`). Toggle per channel with `activity_indicator` (default on).
 
 ### Webhook Mount
 
@@ -234,22 +257,22 @@ flowchart TD
 
 ## 4. Channel Comparison
 
-| Feature | Telegram | Feishu/Lark | Discord | Slack | WhatsApp | Zalo OA | Zalo Personal |
-|---------|----------|-------------|---------|-------|----------|---------|---------------|
-| Connection | Long polling | WS (default) / Webhook | Gateway events | Socket Mode | Direct protocol (in-process) | Long polling | Internal protocol |
-| DM support | Yes | Yes | Yes | Yes | Yes | Yes (DM only) | Yes |
-| Group support | Yes (mention gating) | Yes | Yes | Yes (mention gating + thread cache) | Yes | No | Yes |
-| Forum/Topics | Yes (per-topic config) | Yes (topic session mode) | -- | -- | -- | -- | -- |
-| Message limit | 4,096 chars | Configurable (default 4,000) | 2,000 chars | 4,000 chars | WhatsApp native limit | 2,000 chars | 2,000 chars |
-| Streaming | Typing indicator | Streaming message cards | Edit "Thinking..." | Edit "Thinking..." (throttled 1s) | No | No | No |
-| Media | Photos, voice, files | Images, files (30 MB) | Files, embeds | Files (download w/ SSRF protection) | Images, audio, video, documents | Images (5 MB) | -- |
-| Speech-to-text | Yes (STT proxy) | -- | -- | -- | -- | -- | -- |
-| Voice routing | Yes (VoiceAgentID) | -- | -- | -- | -- | -- | -- |
-| Rich formatting | Markdown → HTML | Card messages | Markdown | Markdown → mrkdwn | Plain text | Plain text | Plain text |
-| Bot commands | 10+ commands | -- | -- | -- | -- | -- | -- |
-| Tool allow list | Per-topic | -- | -- | -- | -- | -- | -- |
-| Pairing support | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Status reactions | Yes | Yes | -- | Yes | -- | -- | -- |
+| Feature | Telegram | Feishu/Lark | Discord | Slack | WhatsApp | Zalo OA | Zalo Personal | Bitrix24 |
+|---------|----------|-------------|---------|-------|----------|---------|---------------|----------|
+| Connection | Long polling | WS (default) / Webhook | Gateway events | Socket Mode | Direct protocol (in-process) | Long polling | Internal protocol | Long polling (REST) |
+| DM support | Yes | Yes | Yes | Yes | Yes | Yes (DM only) | Yes | Yes |
+| Group support | Yes (mention gating) | Yes | Yes | Yes (mention gating + thread cache) | Yes | No | Yes | Yes |
+| Forum/Topics | Yes (per-topic config) | Yes (topic session mode) | -- | -- | -- | -- | -- | -- |
+| Message limit | 4,096 chars | Configurable (default 4,000) | 2,000 chars | 4,000 chars | WhatsApp native limit | 2,000 chars | 2,000 chars | 4,096 chars |
+| Streaming | Typing indicator | Streaming message cards | Edit "Thinking..." | Edit "Thinking..." (throttled 1s) | No | No | No | No |
+| Media | Photos, voice, files | Images, files (30 MB) | Files, embeds | Files (download w/ SSRF protection) | Images, audio, video, documents | Images (5 MB) | -- | Files (20 MB default) |
+| Speech-to-text | Yes (STT proxy) | -- | -- | -- | -- | -- | -- | -- |
+| Voice routing | Yes (VoiceAgentID) | -- | -- | -- | -- | -- | -- | -- |
+| Rich formatting | Markdown → HTML | Card messages | Markdown | Markdown → mrkdwn | Plain text | Plain text | Plain text | Plain text |
+| Bot commands | 10+ commands | -- | -- | -- | -- | -- | -- | -- |
+| Tool allow list | Per-topic | -- | -- | -- | -- | -- | -- | -- |
+| Pairing support | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Status reactions | Yes | Yes | -- | Yes | -- | -- | -- | -- |
 
 ---
 
@@ -574,6 +597,8 @@ The Discord channel uses the `discordgo` library to connect via the Discord Gate
 - **Typing indicator**: 9-second keepalive while agent processes
 - **Group history**: Pending message buffer for context when mentioned
 - **Thread backfill**: When the bot is mentioned inside a Discord thread, the channel fetches up to 25 prior thread messages before the triggering message through Discord REST, prepends their text as context, and downloads up to 15 prior attachments for the same inbound media pipeline. This is thread-only, bounded to 5 MB per backfilled file with a 30-second timeout, and gracefully falls back to the current message when Discord lacks `READ_MESSAGE_HISTORY` or the REST request fails.
+- **Thread presentation titles**: Where a Discord thread is presented as the current chat, a session, a contact, or a delivery target, its label may be qualified as `thread / parent channel`. This is display-only; routing and selection continue to use stable IDs.
+- **Metadata refresh**: Refreshing the contact cache unions the Discord group IDs stored in contacts with group and parent IDs retained by pending-message history. It directly looks up targets not already resolved from the live guild/channel state, so titles and parent metadata can be backfilled for inactive or archived threads when Discord returns them. The API response includes per-source coverage and individual failures; the gateway emits an INFO summary for every refresh and WARN entries for individual lookup failures. If any target cannot be fetched (for example, it was deleted or the bot lacks permission), the refresh reports failure rather than false success.
 
 ---
 
@@ -716,12 +741,31 @@ Default behavior is privacy-first:
 - Runs by manual trigger, message cap, or interval.
 - New extraction tables store metadata, summaries, topics/entities, confidence,
   status, and redaction counts, but not raw message bodies.
+- Tenant admins may append non-secret extraction instructions globally from
+  `/config` with `system_configs["channel_memory.extraction.custom_prompt"]`,
+  per channel with `channel_instances.config.passive_memory.custom_prompt`, and
+  per Discord group/history key with
+  `channel_instances.config.passive_memory.group_custom_prompts`. These prompts
+  append after the built-in extraction instructions in global, channel, then
+  group order; they do not replace redaction or strict JSON requirements.
+- Discord extraction input includes best-effort channel context when available:
+  channel/thread ID, channel name, parent channel, category, and history key.
+  Lookup failures fall back to IDs and do not fail extraction.
+- Discord passive-memory metadata retains raw `group_title` and
+  `parent_group_title` as separate fields. A qualified thread label such as
+  `thread / parent channel` is presentation-only and is not written back into
+  either raw field.
+- New Discord pending history rows include display name, handle when available,
+  and stable Discord user ID in sender/reply labels to make extracted facts less
+  ambiguous when display names change.
 
 Approved items write an `episodic_summaries` row with `source_type='channel'`
 and a deterministic `source_id`; existing consolidation workers then handle KG
-promotion. Reject/delete prevents later writes. Delete also removes the linked
-episodic row when one exists; already-promoted KG nodes are not synchronously
-deleted in v1.
+promotion. Candidate `topics` and `entities` are forwarded to KG extraction as
+disambiguation hints only; they do not create graph nodes or relations unless
+the approved summary supports the fact. Reject/delete prevents later writes.
+Delete also removes the linked episodic row when one exists; already-promoted KG
+nodes are not synchronously deleted in v1.
 
 ---
 
@@ -781,12 +825,53 @@ flowchart TD
 
 ---
 
+## 16. Bitrix24
+
+The Bitrix24 channel connects to a Bitrix24 portal via the `imbot.v2.*` REST API. Authentication uses an app token with `imbot` scope.
+
+### Key Behaviors
+
+- **Text limit**: 4,096 characters per message with automatic splitting at newlines
+- **Media support**: Both inbound and outbound file transfers with MIME preservation
+- **Default DM policy**: `"pairing"` (requires pairing code)
+- **Pairing debounce**: 60-second debounce on pairing instructions
+- **Media max size**: Configurable `media_max_mb` (default 20 MB) applies symmetrically to inbound downloads and outbound uploads
+
+### Inbound Media
+
+When a user sends a file to the bot:
+1. Resolve file metadata via `imbot.v2.File.download` → obtain one-time authenticated download URL
+2. Stream file to temp directory, preserving MIME type
+3. Forward to agent via `bus.MediaFile` with original filename
+4. Agent pipeline routes to appropriate reader (`read_image`, `read_document`, `read_audio`, `read_video`)
+
+**Configuration**: Size cap via `media_max_mb` (per `channel_instance` or config default). Oversized files are silently skipped (best-effort).
+
+### Outbound Media
+
+Agent-produced media files are uploaded to the chat via `imbot.v2.File.upload`:
+1. Read file from workspace
+2. Encode as base64
+3. POST to `imbot.v2.File.upload` with bot ID and chat ID
+4. Upload succeeds atomically: file is stored in portal Drive, attached to chat, and posted in a single REST call
+
+**Configuration**: Size cap via same `media_max_mb` knob (symmetric with inbound).
+
+### OAuth Scope
+
+The bot app must have the `imbot` scope granted. The `disk` scope is **not** required — all file operations are scoped to the message thread context.
+
+**Implementation**: `internal/channels/bitrix24/download.go` (inbound), `send_media.go` (outbound). New `BaseChannel.HandleMessageMedia()` method (in `internal/channels/channel.go`) centralizes media-aware message handling across all channels.
+
+---
+
 ## File Reference
 
 | Module | Path | Purpose |
 |---|---|---|
-| Channel core | `internal/channels/` | `Channel` interface, `BaseChannel`, `Manager` (StartAll/StopAll), outbound dispatcher, DB instance loader |
-| Platform adapters | `internal/channels/{telegram,feishu,discord,slack,whatsapp,zalo}/` | Per-platform: message handling, formatting, streaming, reactions, media, pairing |
+| Channel core | `internal/channels/` | `Channel` interface, `BaseChannel` (incl. `HandleMessageMedia()` method), `Manager` (StartAll/StopAll), outbound dispatcher, DB instance loader |
+| Platform adapters | `internal/channels/{telegram,feishu,discord,slack,whatsapp,zalo,bitrix24}/` | Per-platform: message handling, formatting, streaming, reactions, media, pairing |
+| Bitrix24 media | `internal/channels/bitrix24/download.go`, `send_media.go` | Inbound file download via `imbot.v2.File.download`, outbound upload via `imbot.v2.File.upload` |
 | Audio / STT | `internal/audio/` | Audio manager, STT chain resolution, legacy STT bridge |
 | Pairing & routing | `internal/store/pg/pairing.go`, `cmd/gateway_consumer.go` | Pairing code persistence, inbound message routing and cancel interception |
 

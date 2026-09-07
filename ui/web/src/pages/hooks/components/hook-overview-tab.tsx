@@ -163,6 +163,7 @@ function HttpConfigCard({ cfg, t }: { cfg: Record<string, unknown>; t: TFn }) {
 
 function PromptConfigCard({ cfg, t }: { cfg: Record<string, unknown>; t: TFn }) {
   const promptTemplate = typeof cfg.prompt_template === "string" ? cfg.prompt_template : "";
+  const provider = typeof cfg.provider === "string" ? cfg.provider : "";
   const model = typeof cfg.model === "string" ? cfg.model : "";
   return (
     <div className="rounded-lg border bg-card p-4 space-y-3">
@@ -173,10 +174,17 @@ function PromptConfigCard({ cfg, t }: { cfg: Record<string, unknown>; t: TFn }) 
           <pre className="overflow-x-auto rounded bg-muted px-2 py-1 text-xs whitespace-pre-wrap">{promptTemplate}</pre>
         </div>
       )}
-      {model && (
+      {(provider || model) && (
         <div className="space-y-1">
-          <p className="text-2xs uppercase tracking-wide text-muted-foreground">{t("form.model")}</p>
-          <Badge variant="outline">{model}</Badge>
+          <p className="text-2xs uppercase tracking-wide text-muted-foreground">
+            {provider && model
+              ? `${t("form.provider")} / ${t("form.model")}`
+              : t(provider ? "form.provider" : "form.model")}
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {provider && <Badge variant="outline">{provider}</Badge>}
+            {model && <Badge variant="outline">{model}</Badge>}
+          </div>
         </div>
       )}
     </div>

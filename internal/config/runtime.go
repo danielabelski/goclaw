@@ -4,16 +4,33 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 var (
 	dockerOnce   sync.Once
 	dockerCached bool
+
+	// inDockerForTest overrides Docker detection. Production code MUST never
+	// set this; use SetInDockerForTest exclusively from *_test.go.
+	inDockerForTest atomic.Pointer[bool]
 )
+
+// SetInDockerForTest forces InDocker to return v, bypassing the /.dockerenv
+// probe. Returns a restore func that reinstates the previous override (or real
+// detection when none was active). Test-only.
+func SetInDockerForTest(v bool) func() {
+	prev := inDockerForTest.Load()
+	inDockerForTest.Store(&v)
+	return func() { inDockerForTest.Store(prev) }
+}
 
 // InDocker returns true when running inside a Docker container.
 // Result is cached after the first call.
 func InDocker() bool {
+	if override := inDockerForTest.Load(); override != nil {
+		return *override
+	}
 	dockerOnce.Do(func() {
 		_, err := os.Stat("/.dockerenv")
 		dockerCached = err == nil

@@ -52,6 +52,13 @@ type PendingCompactionConfig struct {
 	Model      string `json:"model,omitempty"`       // model for summarization; empty = use agent's model
 }
 
+// TelegramManagerConfig controls the hidden Telegram management tool for this channel.
+// It is intentionally channel-scoped instead of part of the global builtin tool profiles.
+type TelegramManagerConfig struct {
+	Enabled        bool     `json:"enabled,omitempty"`
+	AllowedActions []string `json:"allowed_actions,omitempty"`
+}
+
 // ChannelsConfig contains per-channel configuration.
 type ChannelsConfig struct {
 	Telegram          TelegramConfig           `json:"telegram"`
@@ -65,27 +72,28 @@ type ChannelsConfig struct {
 }
 
 type TelegramConfig struct {
-	Enabled           bool                `json:"enabled"`
-	Token             string              `json:"token"`
-	Proxy             string              `json:"proxy,omitempty"`
-	APIServer         string              `json:"api_server,omitempty"` // custom Telegram Bot API server URL (e.g. "http://localhost:8081")
-	AllowFrom         FlexibleStringSlice `json:"allow_from"`
-	DMPolicy          string              `json:"dm_policy,omitempty"`          // "pairing" (default), "allowlist", "open", "disabled"
-	GroupPolicy       string              `json:"group_policy,omitempty"`       // "open" (default), "allowlist", "disabled"
-	RequireMention    *bool               `json:"require_mention,omitempty"`    // require @bot mention in groups (default true)
-	MentionMode       string              `json:"mention_mode,omitempty"`       // "strict" (default) = only respond when mentioned; "yield" = respond unless another bot is mentioned
-	HistoryLimit      int                 `json:"history_limit,omitempty"`      // max pending group messages for context (default 50, 0=disabled)
-	DMStream          *bool               `json:"dm_stream,omitempty"`          // enable streaming for DMs (default false) — edits placeholder progressively
-	GroupStream       *bool               `json:"group_stream,omitempty"`       // enable streaming for groups (default false) — sends new message, edits progressively
-	DraftTransport    *bool               `json:"draft_transport,omitempty"`    // use sendMessageDraft for DM streaming (default true) — stealth preview, no notifications per edit
-	ReasoningDelivery string              `json:"reasoning_delivery,omitempty"` // off, streaming_only, always_bubbles
-	ReasoningStream   *bool               `json:"reasoning_stream,omitempty"`   // show reasoning as separate message when provider emits thinking events (default true)
-	ReactionLevel     string              `json:"reaction_level,omitempty"`     // "off" (default), "minimal", "full" — status emoji reactions
-	MediaMaxBytes     int64               `json:"media_max_bytes,omitempty"`    // max media download size in bytes (default 20MB)
-	LinkPreview       *bool               `json:"link_preview,omitempty"`       // enable URL previews in messages (default true)
-	BlockReply        *bool               `json:"block_reply,omitempty"`        // override gateway block_reply (nil = inherit)
-	ChatBehavior      *ChatBehaviorConfig `json:"chat_behavior,omitempty"`      // override gateway chat behavior (nil = inherit)
-	ForceIPv4         bool                `json:"force_ipv4,omitempty"`         // force IPv4 for all Telegram API requests (use when IPv6 routing is broken)
+	Enabled           bool                   `json:"enabled"`
+	Token             string                 `json:"token"`
+	Proxy             string                 `json:"proxy,omitempty"`
+	APIServer         string                 `json:"api_server,omitempty"` // custom Telegram Bot API server URL (e.g. "http://localhost:8081")
+	AllowFrom         FlexibleStringSlice    `json:"allow_from"`
+	DMPolicy          string                 `json:"dm_policy,omitempty"`          // "pairing" (default), "allowlist", "open", "disabled"
+	GroupPolicy       string                 `json:"group_policy,omitempty"`       // "open" (default), "allowlist", "disabled"
+	RequireMention    *bool                  `json:"require_mention,omitempty"`    // require @bot mention in groups (default true)
+	MentionMode       string                 `json:"mention_mode,omitempty"`       // "strict" (default) = only respond when mentioned; "yield" = respond unless another bot is mentioned
+	HistoryLimit      int                    `json:"history_limit,omitempty"`      // max pending group messages for context (default 50, 0=disabled)
+	DMStream          *bool                  `json:"dm_stream,omitempty"`          // enable streaming for DMs (default false) — edits placeholder progressively
+	GroupStream       *bool                  `json:"group_stream,omitempty"`       // enable streaming for groups (default false) — sends new message, edits progressively
+	DraftTransport    *bool                  `json:"draft_transport,omitempty"`    // use sendMessageDraft for DM streaming (default true) — stealth preview, no notifications per edit
+	ReasoningDelivery string                 `json:"reasoning_delivery,omitempty"` // off, streaming_only, always_bubbles
+	ReasoningStream   *bool                  `json:"reasoning_stream,omitempty"`   // show reasoning as separate message when provider emits thinking events (default true)
+	ReactionLevel     string                 `json:"reaction_level,omitempty"`     // "off" (default), "minimal", "full" — status emoji reactions
+	MediaMaxBytes     int64                  `json:"media_max_bytes,omitempty"`    // max media download size in bytes (default 20MB)
+	LinkPreview       *bool                  `json:"link_preview,omitempty"`       // enable URL previews in messages (default true)
+	BlockReply        *bool                  `json:"block_reply,omitempty"`        // override gateway block_reply (nil = inherit)
+	ChatBehavior      *ChatBehaviorConfig    `json:"chat_behavior,omitempty"`      // override gateway chat behavior (nil = inherit)
+	ForceIPv4         bool                   `json:"force_ipv4,omitempty"`         // force IPv4 for all Telegram API requests (use when IPv6 routing is broken)
+	TelegramManager   *TelegramManagerConfig `json:"telegram_manager,omitempty"`   // hidden Telegram-only management tool permissions
 
 	// Optional STT (Speech-to-Text) pipeline for voice/audio inbound messages.
 	// When stt_proxy_url is set, audio/voice messages are transcribed before being forwarded to the agent.
@@ -144,7 +152,7 @@ type DiscordConfig struct {
 	DMPolicy          string              `json:"dm_policy,omitempty"`       // "open" (default), "allowlist", "disabled"
 	GroupPolicy       string              `json:"group_policy,omitempty"`    // "open" (default), "allowlist", "disabled"
 	RequireMention    *bool               `json:"require_mention,omitempty"` // require @bot mention in groups (default true)
-	HistoryLimit      int                 `json:"history_limit,omitempty"`   // max pending group messages for context (default 50, 0=disabled)
+	HistoryLimit      int                 `json:"history_limit,omitempty"`   // max pending group messages for context (default 200, 0=disabled)
 	BlockReply        *bool               `json:"block_reply,omitempty"`     // override gateway block_reply (nil = inherit)
 	ChatBehavior      *ChatBehaviorConfig `json:"chat_behavior,omitempty"`   // override gateway chat behavior (nil = inherit)
 	MediaMaxBytes     int64               `json:"media_max_bytes,omitempty"` // max media download size (default 25MB)
@@ -247,6 +255,7 @@ type FeishuConfig struct {
 type ProvidersConfig struct {
 	Anthropic      ProviderConfig  `json:"anthropic"`
 	OpenAI         ProviderConfig  `json:"openai"`
+	AtlasCloud     ProviderConfig  `json:"atlascloud"` // Atlas Cloud (OpenAI-compatible endpoint)
 	APIRoute       ProviderConfig  `json:"api_route"`  // API Route (OpenAI-compatible endpoint)
 	OpenRouter     ProviderConfig  `json:"openrouter"`
 	Groq           ProviderConfig  `json:"groq"`
@@ -269,6 +278,10 @@ type ProvidersConfig struct {
 	BytePlus       ProviderConfig  `json:"byteplus"`        // BytePlus ModelArk (Seed 2.0)
 	BytePlusCoding ProviderConfig  `json:"byteplus_coding"` // BytePlus ModelArk Coding Plan
 	Vertex         VertexConfig    `json:"vertex"`          // Google Cloud Vertex AI (OAuth2 service account + ADC)
+
+	// RequestTimeoutSec bounds provider verify and models-list HTTP calls.
+	// Tenant-scoped, overridable via the "providers.request_timeout_sec" system config.
+	RequestTimeoutSec int `json:"request_timeout_sec,omitempty"`
 }
 
 // VertexConfig configures Google Cloud Vertex AI.
@@ -320,6 +333,8 @@ func (p *ProvidersConfig) APIBaseForType(providerType string) string {
 		return p.Anthropic.APIBase
 	case "openai", "openai_compat":
 		return p.OpenAI.APIBase
+	case "atlascloud":
+		return p.AtlasCloud.APIBase
 	case "api_route":
 		return p.APIRoute.APIBase
 	case "openrouter":
@@ -369,6 +384,7 @@ func (c *Config) HasAnyProvider() bool {
 	p := c.Providers
 	return p.Anthropic.APIKey != "" ||
 		p.OpenAI.APIKey != "" ||
+		p.AtlasCloud.APIKey != "" ||
 		p.APIRoute.APIKey != "" ||
 		p.OpenRouter.APIKey != "" ||
 		p.Groq.APIKey != "" ||
@@ -418,8 +434,10 @@ type GatewayConfig struct {
 	Host                    string              `json:"host"`
 	Port                    int                 `json:"port"`
 	Token                   string              `json:"token,omitempty"`                      // bearer token for WS/HTTP auth
+	MCPServerToken          string              `json:"mcp_server_token,omitempty"`           // bearer token gating the CRUD MCP server mounted at /api/mcp/; callers may pass an optional "X-GoClaw-Tenant-Id" header (UUID or slug) to scope a request to a tenant, defaulting to the master tenant when absent (see internal/mcp/crud_server.go)
 	OwnerIDs                []string            `json:"owner_ids,omitempty"`                  // sender IDs considered "owner"
 	AllowedOrigins          []string            `json:"allowed_origins,omitempty"`            // WebSocket CORS whitelist (empty = allow all)
+	MCPAllowedHosts         []string            `json:"mcp_allowed_hosts,omitempty"`          // trusted MCP server hostnames exempt from the private-IP SSRF block during config validation (empty = none)
 	MaxMessageChars         int                 `json:"max_message_chars,omitempty"`          // max user message characters (default 32000)
 	RateLimitRPM            int                 `json:"rate_limit_rpm,omitempty"`             // rate limit: requests per minute per user (default 20, 0 = disabled)
 	InjectionAction         string              `json:"injection_action,omitempty"`           // prompt injection action: "log", "warn" (default), "block", "off"
@@ -428,9 +446,14 @@ type GatewayConfig struct {
 	BlockReply              *bool               `json:"block_reply,omitempty"`                // deliver intermediate text during tool iterations (default false)
 	ChatBehavior            *ChatBehaviorConfig `json:"chat_behavior,omitempty"`              // human-like channel delivery behavior (default disabled)
 	ToolStatus              *bool               `json:"tool_status,omitempty"`                // show tool name in streaming preview during tool execution (default true)
+	TeamWorkClassify        *bool               `json:"team_work_classify,omitempty"`         // classify new requests as direct handling or team workflow (default false)
 	TaskRecoveryIntervalSec int                 `json:"task_recovery_interval_sec,omitempty"` // team task recovery ticker interval in seconds (default 300 = 5min)
+	WebhookAsyncTimeoutSec  int                 `json:"webhook_async_timeout_sec,omitempty"`  // async webhook worker agent-run deadline in seconds (default 600, cap 3600)
+	WebhookSyncTimeoutSec   int                 `json:"webhook_sync_timeout_sec,omitempty"`   // sync + test webhook handler agent-run deadline in seconds (default 600, cap 3600). NOTE: sync holds the HTTP connection open for this duration — a value above an upstream proxy/LB read timeout may be cut.
+	WebhookStream           *bool               `json:"webhook_stream,omitempty"`             // stream provider responses for server-side webhook agent runs (sync/async/test) so the upstream can populate/serve its prompt cache (default true). Response to the caller is unchanged (still assembled JSON).
 	BackgroundProvider      string              `json:"background_provider,omitempty"`        // LLM provider for background workers (vault enrichment, consolidation)
 	BackgroundModel         string              `json:"background_model,omitempty"`           // LLM model for background workers
+	PublicURL               string              `json:"public_url,omitempty"`                 // public base URL for OAuth callbacks (e.g. "https://goclaw.example.com")
 }
 
 // ToolsConfig controls tool availability, policy, and web search.
@@ -522,6 +545,7 @@ type WebFetchPolicyConfig struct {
 // BrowserToolConfig controls the browser automation tool.
 type BrowserToolConfig struct {
 	Enabled           bool   `json:"enabled"`                     // enable the browser tool (default false)
+	Backend           string `json:"backend,omitempty"`           // "chrome" (default) or "lightpanda"; auto-detected from /json/version if empty
 	Headless          bool   `json:"headless,omitempty"`          // run Chrome in headless mode (ignored when RemoteURL is set)
 	RemoteURL         string `json:"remote_url,omitempty"`        // CDP endpoint for remote Chrome sidecar, e.g. "ws://chrome:9222"
 	ActionTimeoutMs   int    `json:"action_timeout_ms,omitempty"` // per-action timeout in ms (default 30000)
@@ -539,6 +563,9 @@ type ToolPolicySpec struct {
 	ByProvider     map[string]*ToolPolicySpec `json:"byProvider,omitempty"`
 	Wait           *WaitToolPolicy            `json:"wait,omitempty"`
 	ToolCallPrefix string                     `json:"toolCallPrefix,omitempty"` // prefix to strip from model's tool call names before registry lookup
+	// RateLimitPerHour overrides the global tools.rate_limit_per_hour for this
+	// agent (applied per session key). 0 = inherit the global limit.
+	RateLimitPerHour int `json:"rate_limit_per_hour,omitempty"`
 }
 
 // WaitToolPolicy configures per-agent safety bounds for the wait tool.
@@ -558,16 +585,33 @@ type SessionsConfig struct {
 // TtsConfig configures text-to-speech.
 // Matching TS src/config/types.tts.ts.
 type TtsConfig struct {
-	Provider   string              `json:"provider,omitempty"`   // "openai", "elevenlabs", "edge", "minimax", "gemini"
-	Auto       string              `json:"auto,omitempty"`       // "off" (default), "always", "inbound", "tagged"
-	Mode       string              `json:"mode,omitempty"`       // "final" (default), "all"
-	MaxLength  int                 `json:"max_length,omitempty"` // max text length before truncation (default 1500)
-	TimeoutMs  int                 `json:"timeout_ms,omitempty"` // API timeout in ms (default 30000)
-	OpenAI     TtsOpenAIConfig     `json:"openai"`
-	ElevenLabs TtsElevenLabsConfig `json:"elevenlabs"`
-	Edge       TtsEdgeConfig       `json:"edge"`
-	MiniMax    TtsMiniMaxConfig    `json:"minimax"`
-	Gemini     TtsGeminiConfig     `json:"gemini"`
+	Provider     string                `json:"provider,omitempty"`   // "openai", "openai_compat", "elevenlabs", "edge", "minimax", "gemini"
+	Auto         string                `json:"auto,omitempty"`       // "off" (default), "always", "inbound", "tagged"
+	Mode         string                `json:"mode,omitempty"`       // "final" (default), "all"
+	MaxLength    int                   `json:"max_length,omitempty"` // max text length before truncation (default 1500)
+	TimeoutMs    int                   `json:"timeout_ms,omitempty"` // API timeout in ms (default 30000)
+	OpenAI       TtsOpenAIConfig       `json:"openai"`
+	OpenAICompat TtsOpenAICompatConfig `json:"openai_compat"`
+	ElevenLabs   TtsElevenLabsConfig   `json:"elevenlabs"`
+	Edge         TtsEdgeConfig         `json:"edge"`
+	MiniMax      TtsMiniMaxConfig      `json:"minimax"`
+	Gemini       TtsGeminiConfig       `json:"gemini"`
+}
+
+// TtsOpenAICompatConfig configures a self-hosted OpenAI-compatible audio
+// endpoint (gpu-manager, Speaches, vLLM, LocalAI, llama.cpp, Ollama) for both
+// TTS and STT. Kept separate from TtsOpenAIConfig because the voice namespace
+// is the engine's own — see internal/audio/openaicompat for why the provider
+// name must not be "openai".
+//
+// Setting api_base is what enables the provider; there is no vendor default.
+type TtsOpenAICompatConfig struct {
+	APIBase  string `json:"api_base,omitempty"`  // required to enable, e.g. "http://gpu-manager:8080/v1"
+	APIKey   string `json:"api_key,omitempty"`   // optional; omitted entirely when empty
+	Model    string `json:"model,omitempty"`     // TTS model; optional when the engine picks it from the voice
+	Voice    string `json:"voice,omitempty"`     // engine-specific voice ID, e.g. "fr_FR-gilles-low"
+	Format   string `json:"format,omitempty"`    // response_format; default "mp3", use "wav" for engines without an encoder
+	STTModel string `json:"stt_model,omitempty"` // transcription model; optional
 }
 
 // TtsGeminiConfig configures the Google Gemini TTS provider.

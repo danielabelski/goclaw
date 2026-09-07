@@ -79,7 +79,7 @@ func (p *CodexProvider) Capabilities() ProviderCapabilities {
 		StreamWithTools:  true,
 		Thinking:         true,
 		Vision:           true,
-		CacheControl:     false,
+		CacheControl:     true,
 		ImageGeneration:  true, // Codex (OpenAI Responses API) supports native image_generation tool
 		MaxContextWindow: 1_050_000,
 		TokenizerID:      "o200k_base",
@@ -364,15 +364,7 @@ func (p *CodexProvider) processSSEEvent(event *codexSSEEvent, result *ChatRespon
 				}
 			}
 			if event.Response.Usage != nil {
-				u := event.Response.Usage
-				result.Usage = &Usage{
-					PromptTokens:     u.InputTokens,
-					CompletionTokens: u.OutputTokens,
-					TotalTokens:      u.TotalTokens,
-				}
-				if u.OutputTokensDetails != nil {
-					result.Usage.ThinkingTokens = u.OutputTokensDetails.ReasoningTokens
-				}
+				result.Usage = usageFromCodexUsage(event.Response.Usage)
 			}
 			if event.Response.Status == "incomplete" {
 				result.FinishReason = "length"

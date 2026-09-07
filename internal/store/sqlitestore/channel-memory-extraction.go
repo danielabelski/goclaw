@@ -136,7 +136,7 @@ func (s *SQLiteChannelMemoryExtractionStore) CreateItem(ctx context.Context, ite
 	return s.db.QueryRowContext(ctx, `INSERT INTO channel_memory_extraction_items
 		(`+sqliteChannelMemoryItemCols+`)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-		ON CONFLICT (tenant_id, run_id, item_hash) DO UPDATE SET updated_at = excluded.updated_at
+		ON CONFLICT (tenant_id, channel_instance_id, item_hash) DO UPDATE SET updated_at = excluded.updated_at
 		RETURNING id`,
 		item.ID, item.TenantID, item.RunID, item.ChannelInstanceID, item.AgentID, item.UserID,
 		item.ItemHash, item.ItemType, item.Summary, string(item.Topics), string(item.Entities),
@@ -156,9 +156,54 @@ func (s *SQLiteChannelMemoryExtractionStore) GetItem(ctx context.Context, id uui
 }
 
 func (s *SQLiteChannelMemoryExtractionStore) ListItems(ctx context.Context, opts store.ChannelMemoryItemListOptions) ([]store.ChannelMemoryExtractionItem, error) {
-	tClause, args, err := scopeClause(ctx)
+	conds, args, err := s.itemListConds(ctx, opts)
 	if err != nil {
 		return nil, err
+	}
+	limit := opts.Limit
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	offset := opts.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	args = append(args, limit, offset)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+sqliteChannelMemoryItemCols+`
+		FROM channel_memory_extraction_items WHERE `+strings.Join(conds, " AND ")+`
+		ORDER BY created_at DESC LIMIT ? OFFSET ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []store.ChannelMemoryExtractionItem
+	for rows.Next() {
+		item, err := scanSQLiteChannelMemoryItem(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *item)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteChannelMemoryExtractionStore) CountItems(ctx context.Context, opts store.ChannelMemoryItemListOptions) (int, error) {
+	conds, args, err := s.itemListConds(ctx, opts)
+	if err != nil {
+		return 0, err
+	}
+	var count int
+	err = s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM channel_memory_extraction_items WHERE `+strings.Join(conds, " AND "),
+		args...,
+	).Scan(&count)
+	return count, err
+}
+
+func (s *SQLiteChannelMemoryExtractionStore) itemListConds(ctx context.Context, opts store.ChannelMemoryItemListOptions) ([]string, []any, error) {
+	tClause, args, err := scopeClause(ctx)
+	if err != nil {
+		return nil, nil, err
 	}
 	conds := []string{"1=1" + tClause}
 	if opts.ChannelInstanceID != uuid.Nil {
@@ -173,27 +218,7 @@ func (s *SQLiteChannelMemoryExtractionStore) ListItems(ctx context.Context, opts
 		conds = append(conds, "status = ?")
 		args = append(args, opts.Status)
 	}
-	limit := opts.Limit
-	if limit <= 0 || limit > 200 {
-		limit = 50
-	}
-	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx, `SELECT `+sqliteChannelMemoryItemCols+`
-		FROM channel_memory_extraction_items WHERE `+strings.Join(conds, " AND ")+`
-		ORDER BY created_at DESC LIMIT ?`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []store.ChannelMemoryExtractionItem
-	for rows.Next() {
-		item, err := scanSQLiteChannelMemoryItem(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *item)
-	}
-	return out, rows.Err()
+	return conds, args, nil
 }
 
 func (s *SQLiteChannelMemoryExtractionStore) UpdateItem(ctx context.Context, id uuid.UUID, updates map[string]any) error {

@@ -27,6 +27,32 @@ type contextSetupResult struct {
 // values needed by the agent loop and tool execution. Also runs input guard and message
 // truncation. Returns error only if input guard blocks the message.
 func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetupResult, error) {
+	isArtifactDelegation := req.RunKind == "delegate"
+
+	// A nested run must not inherit filesystem, Team, media, or delegation
+	// authority from its caller. Install explicit empty values before resolving
+	// this run's own scope.
+	ctx = store.WithRunContext(ctx, nil)
+	ctx = tools.WithToolWorkspace(ctx, "")
+	ctx = tools.WithToolTeamWorkspace(ctx, "")
+	ctx = tools.WithToolTeamRoot(ctx, "")
+	ctx = tools.WithToolTeamID(ctx, "")
+	ctx = tools.WithTeamTaskID(ctx, "")
+	ctx = tools.WithLeaderAgentID(ctx, "")
+	ctx = tools.WithTenantAllowedPaths(ctx, nil)
+	ctx = tools.WithWorkspaceChannel(ctx, "")
+	ctx = tools.WithWorkspaceChatID(ctx, "")
+	ctx = tools.WithDelegationID(ctx, "")
+	ctx = tools.WithDelegationArtifactInputs(ctx, "")
+	ctx = tools.WithRunKind(ctx, "")
+	ctx = tools.WithRunMediaPaths(ctx, nil)
+	ctx = tools.WithRunMediaNames(ctx, nil)
+	ctx = tools.WithMediaImages(ctx, nil)
+	ctx = tools.WithMediaImageRefs(ctx, nil)
+	ctx = tools.WithMediaDocRefs(ctx, nil)
+	ctx = tools.WithMediaAudioRefs(ctx, nil)
+	ctx = tools.WithMediaVideoRefs(ctx, nil)
+
 	// Inject agent UUID + key into context for tool routing
 	if l.agentUUID != uuid.Nil {
 		ctx = store.WithAgentID(ctx, l.agentUUID)
@@ -38,6 +64,9 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 	if l.tenantID != uuid.Nil {
 		ctx = store.WithTenantID(ctx, l.tenantID)
 	}
+	// Propagate the configured agent budget to every nested model call.
+	ctx = store.WithAgentContextWindow(ctx, l.contextWindow)
+	ctx = store.WithAgentMaxTokens(ctx, l.effectiveMaxTokens())
 	// Inject user ID into context for per-user scoping (memory, context files, etc.)
 	if req.UserID != "" {
 		ctx = store.WithUserID(ctx, req.UserID)
@@ -84,12 +113,15 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 		ctx = tools.WithTenantToolSettings(ctx, l.tenantToolSettings)
 	}
 	// Inject tenant-specific allowed paths for filesystem tools.
-	if len(l.tenantAllowedPaths) > 0 {
+	if !isArtifactDelegation && len(l.tenantAllowedPaths) > 0 {
 		ctx = tools.WithTenantAllowedPaths(ctx, l.tenantAllowedPaths)
 	}
 	// Inject channel type into context for tools (e.g. message tool needs it for Zalo group routing)
 	if req.ChannelType != "" {
 		ctx = tools.WithToolChannelType(ctx, req.ChannelType)
+	}
+	if len(req.TelegramManagerPermissions) > 0 {
+		ctx = tools.WithTelegramManagerPermissions(ctx, req.TelegramManagerPermissions)
 	}
 	// Inject per-agent overrides from DB so tools honor per-agent settings.
 	if l.restrictToWs != nil {
@@ -112,6 +144,9 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 	if l.agentToolPolicy != nil && l.agentToolPolicy.Wait != nil {
 		waitToolCfg = l.agentToolPolicy.Wait
 		ctx = tools.WithWaitToolConfig(ctx, waitToolCfg)
+	}
+	if l.agentToolPolicy != nil && l.agentToolPolicy.RateLimitPerHour > 0 {
+		ctx = tools.WithToolRateLimitOverride(ctx, l.agentToolPolicy.RateLimitPerHour)
 	}
 	if l.sandboxCfg != nil {
 		ctx = tools.WithSandboxConfig(ctx, l.sandboxCfg)
@@ -141,6 +176,9 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 	if req.DelegationID != "" {
 		ctx = tools.WithDelegationID(ctx, req.DelegationID)
 	}
+	if req.RunKind != "" {
+		ctx = tools.WithRunKind(ctx, req.RunKind)
+	}
 
 	// --- Per-user setup: file seeding + workspace resolution ---
 	// Uses userSetups sync.Map to track both concerns atomically per user.
@@ -154,7 +192,7 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 	// Layer order: tenant → team → project (future) → user/chat
 	// Two entry modes: solo agent (base = l.workspace) or team context (base = l.dataDir).
 	// Result is always a single folder set via WithToolWorkspace.
-	if l.workspace != "" && req.UserID != "" {
+	if !isArtifactDelegation && l.workspace != "" && req.UserID != "" {
 		ws := setup.workspace
 		if ws == "" {
 			ws = l.workspace
@@ -188,12 +226,21 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 			effectiveWorkspace = l.workspace
 		}
 		ctx = tools.WithToolWorkspace(ctx, effectiveWorkspace)
-	} else if l.workspace != "" {
+	} else if !isArtifactDelegation && l.workspace != "" {
 		ctx = tools.WithToolWorkspace(ctx, l.workspace)
 	}
 
+	if isArtifactDelegation {
+		if req.TeamWorkspace != "" ||
+			!validateDelegationArtifactWorkspace(req.DelegationID, req.DelegateInputsPath, req.DelegateOutputsPath) {
+			return contextSetupResult{}, fmt.Errorf("invalid delegation artifact workspace")
+		}
+		ctx = tools.WithDelegationArtifactInputs(ctx, req.DelegateInputsPath)
+		ctx = tools.WithToolWorkspace(ctx, req.DelegateOutputsPath)
+	}
+
 	// Team workspace: dispatched task overrides default workspace.
-	if req.TeamWorkspace != "" {
+	if !isArtifactDelegation && req.TeamWorkspace != "" {
 		if err := os.MkdirAll(req.TeamWorkspace, 0755); err != nil {
 			// See note above on loop_context user workspace fallback. A broken
 			// req.TeamWorkspace would otherwise become cmd.Dir and surface as
@@ -205,19 +252,21 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 			ctx = tools.WithToolWorkspace(ctx, req.TeamWorkspace)
 		}
 	}
-	if req.TeamID != "" {
+	if !isArtifactDelegation && req.TeamID != "" {
 		ctx = tools.WithToolTeamID(ctx, req.TeamID)
 		// Team root for dispatched tasks: resolve the UserChatLayer-stripped root
 		// so the dispatched agent can still read peer-scoped files in the same team.
+		// l.dataDir is already tenant-scoped (see resolver.go: config.TenantDataDir),
+		// so TenantLayer must NOT be reapplied here — doing so double-joins the
+		// tenant segment (tenants/<slug>/tenants/<slug>/teams/<id>).
 		if teamUUID, err := uuid.Parse(req.TeamID); err == nil && l.dataDir != "" {
 			teamRoot := tools.ResolveWorkspace(l.dataDir,
-				tools.TenantLayer(store.TenantIDFromContext(ctx), store.TenantSlugFromContext(ctx)),
 				tools.TeamLayer(teamUUID),
 			)
 			ctx = tools.WithToolTeamRoot(ctx, teamRoot)
 		}
 	}
-	if req.LeaderAgentID != "" {
+	if !isArtifactDelegation && req.LeaderAgentID != "" {
 		ctx = tools.WithLeaderAgentID(ctx, req.LeaderAgentID)
 	}
 
@@ -226,14 +275,14 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 	var resolvedTeamSettings json.RawMessage
 	// Dispatched tasks already have TeamWorkspace set but still need team settings
 	// for TeamIsolated flag. Fetch by explicit TeamID in that branch.
-	if req.TeamWorkspace != "" && req.TeamID != "" && l.teamStore != nil {
+	if !isArtifactDelegation && req.TeamWorkspace != "" && req.TeamID != "" && l.teamStore != nil {
 		if teamUUID, err := uuid.Parse(req.TeamID); err == nil {
 			if team, _ := l.teamStore.GetTeam(ctx, teamUUID); team != nil {
 				resolvedTeamSettings = team.Settings
 			}
 		}
 	}
-	if req.TeamWorkspace == "" && l.teamStore != nil && l.agentUUID != uuid.Nil {
+	if !isArtifactDelegation && req.TeamWorkspace == "" && l.teamStore != nil && l.agentUUID != uuid.Nil {
 		if team, _ := l.teamStore.GetTeamForAgent(ctx, l.agentUUID); team != nil {
 			resolvedTeamSettings = team.Settings
 			wsChat := req.ChatID
@@ -241,9 +290,10 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 				wsChat = req.UserID
 			}
 			shared := tools.IsSharedWorkspace(team.Settings)
-			// Resolve team workspace via layered pipeline: tenant → team → user/chat.
+			// Resolve team workspace via layered pipeline: team → user/chat.
+			// l.dataDir is already tenant-scoped (see resolver.go: config.TenantDataDir) —
+			// do NOT reapply TenantLayer here, it would double-join the tenant segment.
 			wsDir := tools.ResolveWorkspace(l.dataDir,
-				tools.TenantLayer(store.TenantIDFromContext(ctx), store.TenantSlugFromContext(ctx)),
 				tools.TeamLayer(team.ID),
 				tools.UserChatLayer(wsChat, shared),
 			)
@@ -261,7 +311,6 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 			// the same team. Writes still default to wsDir above; team root only
 			// widens the allowed-prefix set for path boundary checks.
 			teamRoot := tools.ResolveWorkspace(l.dataDir,
-				tools.TenantLayer(store.TenantIDFromContext(ctx), store.TenantSlugFromContext(ctx)),
 				tools.TeamLayer(team.ID),
 			)
 			ctx = tools.WithToolTeamRoot(ctx, teamRoot)
@@ -274,7 +323,16 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 	}
 
 	// V3 workspace: resolve once, set immutable context.
-	{
+	if isArtifactDelegation {
+		ctx = workspace.WithContext(ctx, &workspace.WorkspaceContext{
+			ActivePath:       req.DelegateOutputsPath,
+			Scope:            workspace.ScopeDelegate,
+			MemoryScope:      "user",
+			KGScope:          "user",
+			OwnerID:          req.UserID,
+			EnforcementLabel: workspace.DefaultEnforcementLabel(workspace.ScopeDelegate, false),
+		})
+	} else {
 		var teamIDPtr *string
 		if req.TeamID != "" {
 			teamIDPtr = &req.TeamID
@@ -291,12 +349,14 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 			// Filesystem path segment must use agent_key, not UUID — matches
 			// the v2 path in loop_pipeline_callbacks.go and the session_key
 			// anchor. See docs/agent-identity-conventions.md.
-			AgentID:    l.id,
-			AgentType:  l.agentType,
-			UserID:     req.UserID,
-			ChatID:     req.ChatID,
-			TenantID:   store.TenantIDFromContext(ctx).String(),
-			TenantSlug: store.TenantSlugFromContext(ctx),
+			AgentID:   l.id,
+			AgentType: l.agentType,
+			UserID:    req.UserID,
+			ChatID:    req.ChatID,
+			// TenantID/TenantSlug intentionally left empty: l.dataDir (BaseDir below)
+			// is already tenant-scoped (see resolver.go: config.TenantDataDir). Setting
+			// TenantID here would make resolveTeam/resolvePersonal reapply tenantPath()
+			// and double-join the tenant segment (tenants/<slug>/tenants/<slug>/...).
 			PeerKind:   req.PeerKind,
 			TeamID:     teamIDPtr,
 			TeamConfig: teamWSConfig,
@@ -343,8 +403,8 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 	// Inject agent key into context for tool-level resolution (multiple agents share tool registry)
 	ctx = tools.WithToolAgentKey(ctx, l.id)
 
-	// Inject delivered media tracker so write_file and message tool can coordinate:
-	// write_file(deliver=true) marks paths, message self-send guard checks before allowing.
+	// Inject delivered media tracker so automatic output collection and direct
+	// media sends can coordinate within this run.
 	ctx = tools.WithDeliveredMedia(ctx, tools.NewDeliveredMedia())
 
 	// Security: truncate oversized user messages gracefully (feed truncation notice into LLM)
@@ -373,6 +433,10 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 	}
 	// Extract resolved credential user ID (set earlier via WithCredentialUserID, empty if not resolved).
 	credUserID := store.ExplicitCredentialUserIDFromContext(ctx)
+	tenantAllowedPaths := l.tenantAllowedPaths
+	if isArtifactDelegation {
+		tenantAllowedPaths = nil
+	}
 	rc := &store.RunContext{
 		AgentID:             l.agentUUID,
 		AgentKey:            l.id,
@@ -406,9 +470,10 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 		WorkspaceChatID:     effectiveWorkspaceChatID,
 		TeamIsolated:        resolvedTeamSettings != nil && !tools.IsSharedWorkspace(resolvedTeamSettings),
 		TeamTaskID:          req.TeamTaskID,
+		DelegationID:        req.DelegationID,
 		LeaderAgentID:       tools.LeaderAgentIDFromCtx(ctx),
 		AgentToolKey:        l.id,
-		TenantAllowedPaths:  l.tenantAllowedPaths,
+		TenantAllowedPaths:  tenantAllowedPaths,
 	}
 	ctx = store.WithRunContext(ctx, rc)
 

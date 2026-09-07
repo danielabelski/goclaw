@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/edition"
 	mcpbridge "github.com/nextlevelbuilder/goclaw/internal/mcp"
+	"github.com/nextlevelbuilder/goclaw/internal/memory"
 	"github.com/nextlevelbuilder/goclaw/internal/permissions"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/sandbox"
@@ -94,9 +96,12 @@ func setupToolRegistry(
 	// Browser automation tool
 	if cfg.Tools.Browser.Enabled {
 		var opts []browser.Option
+		if cfg.Tools.Browser.Backend != "" {
+			opts = append(opts, browser.WithBackend(browser.Backend(cfg.Tools.Browser.Backend)))
+		}
 		if cfg.Tools.Browser.RemoteURL != "" {
 			opts = append(opts, browser.WithRemoteURL(cfg.Tools.Browser.RemoteURL))
-			slog.Info("browser tool enabled", "remote", cfg.Tools.Browser.RemoteURL)
+			slog.Info("browser tool enabled", "remote", cfg.Tools.Browser.RemoteURL, "backend", cfg.Tools.Browser.Backend)
 		} else {
 			opts = append(opts, browser.WithHeadless(cfg.Tools.Browser.Headless))
 			slog.Info("browser tool enabled", "headless", cfg.Tools.Browser.Headless)
@@ -161,14 +166,11 @@ func setupToolRegistry(
 		slog.Info("credential scrubbing disabled")
 	}
 
-	// MCP servers (config-based: shared across all agents)
-	if len(cfg.Tools.McpServers) > 0 {
-		mcpMgr = mcpbridge.NewManager(toolsReg, mcpbridge.WithConfigs(cfg.Tools.McpServers))
-		if err := mcpMgr.Start(context.Background()); err != nil {
-			slog.Warn("mcp.startup_errors", "error", err)
-		}
-		slog.Info("MCP servers initialized", "configured", len(cfg.Tools.McpServers), "tools", len(mcpMgr.ToolNames()))
-	}
+	// MCP servers are loaded from the database in gateway.go after the store is
+	// initialised. The manager is created here so that the return value is always
+	// non-nil and downstream wiring (pool, grant-checker, etc.) can be applied
+	// unconditionally in gateway.go.
+	mcpMgr = mcpbridge.NewManager(toolsReg)
 
 	// Exec approval system — always active (deny patterns + safe bins + configurable ask mode)
 	{
@@ -304,7 +306,7 @@ func wireTracingAndCron(
 ) (*tracing.Collector, *tracing.SnapshotWorker) {
 	var traceCollector *tracing.Collector
 	if stores.Tracing != nil {
-		traceCollector = tracing.NewCollector(stores.Tracing)
+		traceCollector = tracing.NewCollector(stores.Tracing, stores.UsageEvents)
 		traceCollector.OnFlush = func(traceIDs []uuid.UUID) {
 			ids := make([]string, len(traceIDs))
 			for i, id := range traceIDs {
@@ -372,9 +374,11 @@ func wireTracingAndCron(
 func setupMemoryEmbeddings(
 	pgStores *store.Stores,
 	providerRegistry *providers.Registry,
-) {
+) memory.EmbeddingProvider {
+	var resolved memory.EmbeddingProvider
 	if pgStores.Memory != nil {
 		if embProvider := resolveEmbeddingProvider(pgStores.Providers, providerRegistry, pgStores.SystemConfigs); embProvider != nil {
+			resolved = embProvider
 			pgStores.Memory.SetEmbeddingProvider(embProvider)
 			slog.Info("memory embeddings enabled", "provider", embProvider.Name(), "model", embProvider.Model())
 
@@ -419,20 +423,66 @@ func setupMemoryEmbeddings(
 			}
 
 			// Wire embedding provider into vault store for semantic document search.
+			var vaultStore *pg.PGVaultStore
 			if pgStores.Vault != nil {
 				pgStores.Vault.SetEmbeddingProvider(embProvider)
 				slog.Info("vault embeddings enabled", "provider", embProvider.Name())
+				vaultStore, _ = pgStores.Vault.(*pg.PGVaultStore)
 			}
 
 			// V3: Wire embedding provider into episodic store for semantic search.
+			var episodicStore *pg.PGEpisodicStore
 			if pgStores.Episodic != nil {
 				pgStores.Episodic.SetEmbeddingProvider(embProvider)
 				slog.Info("episodic embeddings enabled", "provider", embProvider.Name())
+				episodicStore, _ = pgStores.Episodic.(*pg.PGEpisodicStore)
 			}
+
+			// Agent create/update embedding hooks require the provider to be wired.
+			var agentStore *pg.PGAgentStore
+			if pgAgentStore, ok := pgStores.Agents.(*pg.PGAgentStore); ok {
+				agentStore = pgAgentStore
+				agentStore.SetEmbeddingProvider(embProvider)
+				slog.Info("agent embeddings enabled", "provider", embProvider.Name())
+			}
+
+			// Recover the remaining semantic indexes sequentially to avoid a burst
+			// of concurrent batch requests during gateway startup. Each surface gets
+			// its own deadline so a large agent backlog cannot starve later stores.
+			go func() {
+				if agentStore != nil {
+					bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+					if count, err := agentStore.BackfillAgentEmbeddings(bgCtx); err != nil {
+						slog.Warn("agent embeddings backfill failed", "error", err)
+					} else if count > 0 {
+						slog.Info("agent embeddings recovery complete", "agents_updated", count)
+					}
+					cancel()
+				}
+				if episodicStore != nil {
+					bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+					if count, err := episodicStore.BackfillEpisodicEmbeddings(bgCtx); err != nil {
+						slog.Warn("episodic embeddings backfill failed", "error", err)
+					} else if count > 0 {
+						slog.Info("episodic embeddings backfill complete", "summaries_updated", count)
+					}
+					cancel()
+				}
+				if vaultStore != nil {
+					bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+					if count, err := vaultStore.BackfillVaultEmbeddings(bgCtx); err != nil {
+						slog.Warn("vault embeddings backfill failed", "error", err)
+					} else if count > 0 {
+						slog.Info("vault embeddings backfill complete", "documents_updated", count)
+					}
+					cancel()
+				}
+			}()
 		} else {
 			slog.Warn("memory embeddings disabled (no API key), chunks stored without vectors")
 		}
 	}
+	return resolved
 }
 
 // seedSystemConfigs ensures system_configs has all expected keys for all tenants.
@@ -529,7 +579,7 @@ func setupSkillsSystem(
 	skillsLoader := skills.NewLoader(workspace, globalSkillsDir, builtinSkillsDir)
 	skillSearchTool := tools.NewSkillSearchTool(skillsLoader)
 	toolsReg.Register(skillSearchTool)
-	toolsReg.Register(tools.NewUseSkillTool())
+	toolsReg.Register(tools.NewUseSkillTool(skillsLoader))
 	slog.Info("skill_search tool registered", "skills", len(skillsLoader.ListSkills(context.Background())))
 
 	// Wire skills-store directory into filesystem loader so agents
@@ -537,8 +587,11 @@ func setupSkillsSystem(
 	if pgStores.Skills != nil {
 		storeDirs := pgStores.Skills.Dirs()
 		if len(storeDirs) > 0 {
-			skillsLoader.SetManagedDir(storeDirs[0])
-			slog.Info("skills-store directory wired into loader", "dir", storeDirs[0])
+			// Pass the root data dir, not storeDirs[0] (which is the master
+			// tenant's pre-resolved skills-store path) — the loader resolves
+			// each tenant's own skills-store directory per request from this root.
+			skillsLoader.SetManagedDir(dataDir)
+			slog.Info("skills-store directory wired into loader", "dataDir", dataDir)
 
 			// Seed system/bundled skills into DB
 			bundledSkillsDir = os.Getenv("GOCLAW_BUNDLED_SKILLS_DIR")
@@ -557,16 +610,33 @@ func setupSkillsSystem(
 					seeded, skipped, seededSkills, err := seeder.Seed(context.Background())
 					if err != nil {
 						slog.Warn("system skills seed failed", "error", err)
-					} else {
-						if seeded > 0 {
-							slog.Info("system skills seeded", "seeded", seeded, "skipped", skipped)
-						}
-						// Check dependencies asynchronously — does not block startup.
-						// Emits WS events per-skill so UI updates in realtime.
-						if len(seededSkills) > 0 {
-							seeder.CheckDepsAsync(seededSkills, msgBus)
-						}
 					}
+					if seeded > 0 {
+						slog.Info("system skills seeded", "seeded", seeded, "skipped", skipped)
+					}
+					// Check dependencies for successful partial results even when another
+					// bundled skill needs manual recovery.
+					if len(seededSkills) > 0 {
+						seeder.CheckDepsAsync(seededSkills, msgBus)
+					}
+				}
+			}
+
+			// Register on-disk managed skills (skills-store) that are missing from
+			// the database. A skill placed directly into the tenant's skills-store
+			// without a skills row is invisible to agents (skill visibility is
+			// DB-driven), which manifests as goclaw not detecting a skill the user
+			// typed triggers for. Reconcile closes that gap idempotently.
+			if reconcileStore, ok := pgStores.Skills.(skills.ManagedSkillStore); ok {
+				reconciler := skills.NewReconciler(reconcileStore)
+				if n, err := reconciler.Reconcile(
+					context.Background(),
+					store.MasterTenantID,
+					storeDirs[0],
+				); err != nil {
+					slog.Warn("skills-store reconcile failed", "error", err)
+				} else if n > 0 {
+					slog.Info("skills-store reconcile complete", "registered", n)
 				}
 			}
 		}
@@ -611,4 +681,86 @@ func setupSkillsSystem(
 	}
 
 	return skillsLoader, skillSearchTool, globalSkillsDir, bundledSkillsDir, builtinSkillsDir
+}
+
+// initMCPFromDB loads all enabled MCP servers from the database and connects them
+// into the shared manager. This replaces the former config-file-based initialisation.
+// Non-fatal: individual server connection failures are logged as warnings.
+func initMCPFromDB(ctx context.Context, mgr *mcpbridge.Manager, mcpStore store.MCPServerStore) error {
+	slog.Debug("initMCPFromDB starting")
+	slog.Debug("querying mcp_servers from database")
+	servers, err := mcpStore.ListServers(ctx)
+	if err != nil {
+		slog.Error("initMCPFromDB: failed to query mcp_servers", "error", err)
+		return fmt.Errorf("list mcp servers from db: %w", err)
+	}
+	slog.Debug("found mcp_servers from database", "count", len(servers))
+
+	cfgs := make(map[string]*config.MCPServerConfig, len(servers))
+	for i := range servers {
+		srv := &servers[i]
+		slog.Debug("initMCPFromDB: processing server", "name", srv.Name, "transport", srv.Transport, "enabled", srv.Enabled)
+		if !srv.Enabled {
+			slog.Debug("initMCPFromDB: skipping disabled server", "name", srv.Name)
+			continue
+		}
+
+		var args []string
+		if len(srv.Args) > 0 {
+			if jsonErr := json.Unmarshal(srv.Args, &args); jsonErr != nil {
+				slog.Warn("mcp.db.invalid_args", "server", srv.Name, "error", jsonErr)
+			}
+		}
+
+		var headers map[string]string
+		if len(srv.Headers) > 0 {
+			if jsonErr := json.Unmarshal(srv.Headers, &headers); jsonErr != nil {
+				slog.Warn("mcp.db.invalid_headers", "server", srv.Name, "error", jsonErr)
+			}
+		}
+
+		var env map[string]string
+		if len(srv.Env) > 0 {
+			if jsonErr := json.Unmarshal(srv.Env, &env); jsonErr != nil {
+				slog.Warn("mcp.db.invalid_env", "server", srv.Name, "error", jsonErr)
+			}
+		}
+
+		// Inject decrypted APIKey as Authorization header when not already set.
+		if srv.APIKey != "" && headers["Authorization"] == "" {
+			if headers == nil {
+				headers = make(map[string]string)
+			}
+			headers["Authorization"] = "Bearer " + srv.APIKey
+		}
+
+		enabled := true
+		cfgs[srv.Name] = &config.MCPServerConfig{
+			Transport:  srv.Transport,
+			Command:    srv.Command,
+			Args:       args,
+			Env:        env,
+			URL:        srv.URL,
+			Headers:    headers,
+			Enabled:    &enabled,
+			ToolPrefix: srv.ToolPrefix,
+			TimeoutSec: srv.TimeoutSec,
+		}
+	}
+
+	if len(cfgs) == 0 {
+		slog.Debug("mcp.db: no enabled servers found")
+		return nil
+	}
+
+	slog.Debug("initMCPFromDB: building config map", "servers", len(cfgs))
+	slog.Debug("initMCPFromDB: calling mgr.SetConfigs()")
+	mgr.SetConfigs(cfgs)
+	slog.Debug("initMCPFromDB: calling mgr.Start()")
+	if startErr := mgr.Start(ctx); startErr != nil {
+		slog.Warn("mcp.db.startup_errors", "error", startErr)
+	}
+	toolCount := len(mgr.ToolNames())
+	slog.Debug("initMCPFromDB: MCP init complete", "tools_registered", toolCount)
+	return nil
 }

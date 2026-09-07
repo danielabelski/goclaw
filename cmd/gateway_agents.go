@@ -7,9 +7,11 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/audio/elevenlabs"
 	geminiaudio "github.com/nextlevelbuilder/goclaw/internal/audio/gemini"
 	minimaxaudio "github.com/nextlevelbuilder/goclaw/internal/audio/minimax"
+	"github.com/nextlevelbuilder/goclaw/internal/audio/openaicompat"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/memory"
+	"github.com/nextlevelbuilder/goclaw/internal/orchestration"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/sandbox"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
@@ -51,8 +53,10 @@ func resolveEmbeddingProvider(
 		}
 	}
 
-	// 2. Auto-detect: scan DB providers for first with settings.embedding.enabled
-	allProviders, err := providerStore.ListAllProviders(context.Background())
+	// 2. Auto-detect only from the master tenant. The selected provider receives
+	// cross-tenant semantic content during startup maintenance, so a tenant-owned
+	// endpoint must never be selected for this process-wide responsibility.
+	allProviders, err := providerStore.ListProviders(masterCtx)
 	if err != nil {
 		slog.Warn("failed to list providers for embedding auto-detect", "error", err)
 		return nil
@@ -160,7 +164,7 @@ func buildEmbeddingProvider(
 	return nil
 }
 
-func setupSubagents(providerReg *providers.Registry, cfg *config.Config, msgBus *bus.MessageBus, toolsReg *tools.Registry, workspace string, sandboxMgr sandbox.Manager, secureCLIStore store.SecureCLIStore, usageCapSvc *usagecaps.Service) *tools.SubagentManager {
+func setupSubagents(providerReg *providers.Registry, cfg *config.Config, msgBus *bus.MessageBus, toolsReg *tools.Registry, workspace string, sandboxMgr sandbox.Manager, secureCLIStore store.SecureCLIStore, usageCapSvc *usagecaps.Service, admission *orchestration.ChildRunAdmission) *tools.SubagentManager {
 	names := providerReg.List(context.Background())
 	if len(names) == 0 {
 		return nil
@@ -208,8 +212,9 @@ func setupSubagents(providerReg *providers.Registry, cfg *config.Config, msgBus 
 		return reg
 	}
 
-	manager := tools.NewSubagentManager(provider, providerReg, agentCfg.Model, msgBus, toolsFactory, subCfg)
+	manager := tools.NewSubagentManagerWithAdmission(provider, providerReg, agentCfg.Model, msgBus, toolsFactory, subCfg, admission)
 	manager.SetUsageCapService(usageCapSvc)
+	manager.SetAgentBudget(agentCfg.ContextWindow, agentCfg.MaxTokens)
 	return manager
 }
 
@@ -226,19 +231,34 @@ func buildSubagentToolsRegistry(
 ) (*tools.Registry, *tools.ExecTool) {
 	reg := parentReg.Clone()
 	var execTool *tools.ExecTool
+	var readTool *tools.ReadFileTool
+	var writeTool *tools.WriteFileTool
+	var listTool *tools.ListFilesTool
 	if sandboxMgr != nil {
-		reg.Register(tools.NewSandboxedReadFileTool(workspace, restrict, sandboxMgr))
-		reg.Register(tools.NewSandboxedWriteFileTool(workspace, restrict, sandboxMgr))
-		reg.Register(tools.NewSandboxedListFilesTool(workspace, restrict, sandboxMgr))
+		readTool = tools.NewSandboxedReadFileTool(workspace, restrict, sandboxMgr)
+		writeTool = tools.NewSandboxedWriteFileTool(workspace, restrict, sandboxMgr)
+		listTool = tools.NewSandboxedListFilesTool(workspace, restrict, sandboxMgr)
 		execTool = tools.NewSandboxedExecTool(workspace, restrict, sandboxMgr)
-		reg.Register(execTool)
 	} else {
-		reg.Register(tools.NewReadFileTool(workspace, restrict))
-		reg.Register(tools.NewWriteFileTool(workspace, restrict))
-		reg.Register(tools.NewListFilesTool(workspace, restrict))
+		readTool = tools.NewReadFileTool(workspace, restrict)
+		writeTool = tools.NewWriteFileTool(workspace, restrict)
+		listTool = tools.NewListFilesTool(workspace, restrict)
 		execTool = tools.NewExecTool(workspace, restrict)
-		reg.Register(execTool)
 	}
+
+	// These four tools are built fresh, so they start with none of the hardening the
+	// gateway applied to the parent's instances at startup: exec path denials and their
+	// exemptions, shell deny-group toggles, the command keyword allowlist, and the
+	// read/write/list deny prefixes covering config.json, the databases, and delegate/.
+	// Without this, spawning a subagent widened reach — the parent could not touch the
+	// data dir, the subagent could. Inherit from the live parent instances so there is
+	// one source of truth and a later config reload cannot leave subagents behind.
+	inheritParentPathPolicy(parentReg, readTool, writeTool, listTool, execTool)
+
+	reg.Register(readTool)
+	reg.Register(writeTool)
+	reg.Register(listTool)
+	reg.Register(execTool)
 	// Red Team F3: subagent ExecTool must enforce the secure-CLI gate
 	// (and env scrub on fall-through) — without this, a parent agent
 	// can spawn a subagent to bypass the gate via host-inherited env.
@@ -246,6 +266,42 @@ func buildSubagentToolsRegistry(
 		execTool.SetSecureCLIStore(secureCLIStore)
 	}
 	return reg, execTool
+}
+
+// inheritParentPathPolicy copies the parent registry's tool hardening onto the freshly
+// built subagent tools. A tool missing from the parent registry, or registered there
+// under an unexpected concrete type, is skipped: the subagent then has no policy to
+// inherit for it, which matches the parent having none to give.
+func inheritParentPathPolicy(
+	parentReg *tools.Registry,
+	readTool *tools.ReadFileTool,
+	writeTool *tools.WriteFileTool,
+	listTool *tools.ListFilesTool,
+	execTool *tools.ExecTool,
+) {
+	if parentReg == nil {
+		return
+	}
+	if pt, ok := parentReg.Get("read_file"); ok {
+		if parent, ok := pt.(*tools.ReadFileTool); ok {
+			readTool.InheritPathPolicy(parent)
+		}
+	}
+	if pt, ok := parentReg.Get("write_file"); ok {
+		if parent, ok := pt.(*tools.WriteFileTool); ok {
+			writeTool.InheritPathPolicy(parent)
+		}
+	}
+	if pt, ok := parentReg.Get("list_files"); ok {
+		if parent, ok := pt.(*tools.ListFilesTool); ok {
+			listTool.InheritPathPolicy(parent)
+		}
+	}
+	if pt, ok := parentReg.Get("exec"); ok {
+		if parent, ok := pt.(*tools.ExecTool); ok {
+			execTool.InheritSecurityPolicy(parent)
+		}
+	}
 }
 
 // setupTTS creates the TTS manager from config and registers providers.
@@ -271,6 +327,26 @@ func setupTTS(cfg *config.Config) *tts.Manager {
 			Voice:     ttsCfg.OpenAI.Voice,
 			TimeoutMs: ttsCfg.TimeoutMs,
 		}))
+	}
+
+	// OpenAI-compatible self-hosted endpoint. api_base is the enable switch —
+	// unlike the vendor providers there is no API key to gate on, since these
+	// endpoints commonly have no auth.
+	if base := ttsCfg.OpenAICompat.APIBase; base != "" {
+		provider, err := openaicompat.NewTTSProvider(openaicompat.Config{
+			APIBase:   base,
+			APIKey:    ttsCfg.OpenAICompat.APIKey,
+			TTSModel:  ttsCfg.OpenAICompat.Model,
+			TTSVoice:  ttsCfg.OpenAICompat.Voice,
+			TTSFormat: ttsCfg.OpenAICompat.Format,
+			TimeoutMs: ttsCfg.TimeoutMs,
+		})
+		if err != nil {
+			slog.Warn("audio.tts: openai_compat not registered", "error", err)
+		} else {
+			mgr.RegisterProvider(provider)
+			slog.Info("audio.tts: openai_compat registered", "api_base", base)
+		}
 	}
 
 	if key := ttsCfg.ElevenLabs.APIKey; key != "" {
@@ -357,6 +433,29 @@ func setupAudioExtras(cfg *config.Config, mgr *tts.Manager) {
 		}
 	}
 
+	// STT chain. Built from what actually registered, so Transcribe never walks
+	// a name it will only skip with a warning. "proxy" is always appended: it is
+	// registered later, per channel, by BridgeLegacySTT.
+	var sttChain []string
+
+	// OpenAI-compatible self-hosted endpoint, first when present: it is an
+	// explicit operator choice, and it keeps audio on the local network.
+	if base := cfg.Tts.OpenAICompat.APIBase; base != "" {
+		provider, err := openaicompat.NewSTTProvider(openaicompat.Config{
+			APIBase:   base,
+			APIKey:    cfg.Tts.OpenAICompat.APIKey,
+			STTModel:  cfg.Tts.OpenAICompat.STTModel,
+			TimeoutMs: cfg.Tts.TimeoutMs,
+		})
+		if err != nil {
+			slog.Warn("audio.stt: openai_compat not registered", "error", err)
+		} else {
+			mgr.RegisterSTT(provider)
+			sttChain = append(sttChain, provider.Name())
+			slog.Info("audio.stt: openai_compat registered", "api_base", base)
+		}
+	}
+
 	// ElevenLabs STT (Scribe v2) — reuse TTS credentials. Registered as tenant-scope
 	// default; per-request tenant override lands via builtin_tools[stt] in Phase 5
 	// channel migration. Legacy per-channel STTProxyURL is bridged separately.
@@ -365,7 +464,13 @@ func setupAudioExtras(cfg *config.Config, mgr *tts.Manager) {
 			APIKey:  ellKey,
 			BaseURL: ellBase,
 		}))
-		mgr.SetSTTChain([]string{"elevenlabs", "proxy"})
+		sttChain = append(sttChain, "elevenlabs")
 		slog.Info("audio.stt: elevenlabs registered")
+	}
+
+	if len(sttChain) > 0 {
+		sttChain = append(sttChain, "proxy")
+		mgr.SetSTTChain(sttChain)
+		slog.Info("audio.stt: chain configured", "chain", sttChain)
 	}
 }

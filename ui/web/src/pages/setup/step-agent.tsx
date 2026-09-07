@@ -1,6 +1,7 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
@@ -12,7 +13,7 @@ import { useAgents } from "@/pages/agents/hooks/use-agents";
 import { SummoningModal } from "@/pages/agents/summoning-modal";
 import { useAgentPresets } from "@/pages/agents/agent-presets";
 import { useWsEvent } from "@/hooks/use-ws-event";
-import { slugify } from "@/lib/slug";
+import { slugify, isValidSlug } from "@/lib/slug";
 import { toast } from "@/stores/use-toast-store";
 import type { ProviderData } from "@/types/provider";
 import type { AgentData } from "@/types/agent";
@@ -27,6 +28,7 @@ interface StepAgentProps {
 
 export function StepAgent({ provider, model, onComplete, onBack, existingAgent }: StepAgentProps) {
   const { t } = useTranslation("setup");
+  const { t: tAgents } = useTranslation("agents");
   const { createAgent, updateAgent, deleteAgent, resummonAgent, cancelSummonAgent } = useAgents();
   const agentPresets = useAgentPresets();
 
@@ -39,6 +41,19 @@ export function StepAgent({ provider, model, onComplete, onBack, existingAgent }
   );
   const [selectedPresetIdx, setSelectedPresetIdx] = useState<number | null>(
     existingAgent ? null : 0,
+  );
+  // Identity is editable state, only *prefilled* from the selected preset. It must
+  // survive description edits — deselecting a preset never rewrites the name/key.
+  const [displayName, setDisplayName] = useState(
+    existingAgent?.display_name ?? defaultPreset?.name ?? "",
+  );
+  const [agentKey, setAgentKey] = useState(
+    existingAgent?.agent_key ?? defaultPreset?.agentKey ?? "",
+  );
+  const [displayNameEdited, setDisplayNameEdited] = useState(false);
+  const [agentKeyEdited, setAgentKeyEdited] = useState(false);
+  const [emoji, setEmoji] = useState(
+    existingAgent?.emoji ?? defaultPreset?.emoji ?? "",
   );
   const [selfEvolve, setSelfEvolve] = useState(
     Boolean(existingAgent?.self_evolve),
@@ -57,26 +72,25 @@ export function StepAgent({ provider, model, onComplete, onBack, existingAgent }
   const [createdAgent, setCreatedAgent] = useState<{ id: string; name: string } | null>(null);
   const [agentResult, setAgentResult] = useState<AgentData | null>(null);
 
-  // Derive agent key and display name from selected preset or description
-  const displayName = useMemo(() => {
-    if (existingAgent) return existingAgent.display_name ?? "";
-    if (selectedPresetIdx !== null && agentPresets[selectedPresetIdx]) {
-      return agentPresets[selectedPresetIdx].label;
-    }
-    return "Fox Spirit";
-  }, [existingAgent, selectedPresetIdx, agentPresets]);
+  const activePreset = selectedPresetIdx !== null ? agentPresets[selectedPresetIdx] : undefined;
+  const presetPrompt = activePreset?.prompt;
+  const presetName = activePreset?.name;
 
-  const agentKey = useMemo(() => {
-    const slug = slugify(displayName);
-    return slug || "fox-spirit";
-  }, [displayName]);
+  // Deps are plain strings, so this only fires when the translated preset text
+  // actually changes (locale switch) — not on every render.
+  useEffect(() => {
+    if (presetPrompt === undefined) return;
+    setDescription(presetPrompt);
+  }, [presetPrompt]);
 
-  const selectedEmoji = useMemo(() => {
-    if (selectedPresetIdx !== null && agentPresets[selectedPresetIdx]) {
-      return agentPresets[selectedPresetIdx].emoji;
-    }
-    return "🦊";
-  }, [selectedPresetIdx, agentPresets]);
+  useEffect(() => {
+    if (presetName === undefined || displayNameEdited || isEditing) return;
+    setDisplayName(presetName);
+  }, [presetName, displayNameEdited, isEditing]);
+
+  const trimmedName = displayName.trim();
+  const keyValid = isValidSlug(agentKey);
+  const canSubmit = !!trimmedName && (isEditing || keyValid) && !!description.trim();
 
   const providerLabel = useMemo(() => {
     if (!provider) return "—";
@@ -95,13 +109,6 @@ export function StepAgent({ provider, model, onComplete, onBack, existingAgent }
   );
   useWsEvent("agent.summoning", handleSummoningEvent);
 
-  // Sync description when preset changes on initial load
-  useEffect(() => {
-    if (selectedPresetIdx !== null && agentPresets[selectedPresetIdx]) {
-      setDescription(agentPresets[selectedPresetIdx].prompt);
-    }
-  }, [selectedPresetIdx, agentPresets]);
-
   const handleContinue = () => {
     if (agentResult) onComplete(agentResult);
   };
@@ -111,19 +118,35 @@ export function StepAgent({ provider, model, onComplete, onBack, existingAgent }
     if (!preset) return;
     setSelectedPresetIdx(idx);
     setDescription(preset.prompt);
+    setDisplayName(preset.name);
+    setDisplayNameEdited(false);
+    setEmoji(preset.emoji);
+    if (!isEditing) {
+      setAgentKey(preset.agentKey);
+      setAgentKeyEdited(false);
+    }
   };
 
   const handleDescriptionChange = (value: string) => {
     setDescription(value);
-    // If user edits text, deselect preset (unless it still matches)
-    if (selectedPresetIdx !== null) {
-      const presetPrompt = agentPresets[selectedPresetIdx]?.prompt;
-      if (value !== presetPrompt) setSelectedPresetIdx(null);
-    }
+    // Editing the prompt only clears the preset highlight — identity stays as typed.
+    if (selectedPresetIdx !== null && value !== presetPrompt) setSelectedPresetIdx(null);
+  };
+
+  const handleDisplayNameChange = (value: string) => {
+    setDisplayNameEdited(true);
+    setDisplayName(value);
+    if (!agentKeyEdited && !isEditing) setAgentKey(slugify(value));
+  };
+
+  const handleAgentKeyChange = (value: string) => {
+    setAgentKeyEdited(true);
+    setAgentKey(value);
   };
 
   const handleSubmit = async () => {
     if (!provider) { setError(t("agent.errors.noProvider")); return; }
+    if (!canSubmit) return;
 
     setLoading(true);
     setError("");
@@ -132,20 +155,20 @@ export function StepAgent({ provider, model, onComplete, onBack, existingAgent }
     try {
       if (isEditing) {
         const patch: Partial<AgentData> = {
-          display_name: displayName.trim() || undefined,
+          display_name: trimmedName,
           provider: provider.name,
           model: model || "",
           // Promoted fields at top level
           agent_description: description.trim() || null,
           self_evolve: selfEvolve,
-          emoji: selectedEmoji || null,
+          emoji: emoji.trim() || null,
         };
         await updateAgent(existingAgent!.id, patch);
         onComplete({ ...existingAgent!, ...patch } as AgentData);
       } else {
         const data: Partial<AgentData> = {
           agent_key: agentKey,
-          display_name: displayName.trim() || undefined,
+          display_name: trimmedName,
           provider: provider.name,
           model: model || "",
           agent_type: "predefined",
@@ -153,7 +176,7 @@ export function StepAgent({ provider, model, onComplete, onBack, existingAgent }
           // Promoted fields at top level
           agent_description: description.trim() || null,
           self_evolve: selfEvolve,
-          emoji: selectedEmoji || null,
+          emoji: emoji.trim() || null,
           grant_gateway_operator_access: gatewayOperatorAccess || undefined,
         };
 
@@ -169,7 +192,7 @@ export function StepAgent({ provider, model, onComplete, onBack, existingAgent }
         }
         setAgentResult(result);
         setSummoningOutcome("pending");
-        setCreatedAgent({ id: result.id, name: displayName.trim() || agentKey });
+        setCreatedAgent({ id: result.id, name: trimmedName || agentKey });
         setSummoningOpen(true);
       }
     } catch (err) {
@@ -178,7 +201,6 @@ export function StepAgent({ provider, model, onComplete, onBack, existingAgent }
       setLoading(false);
     }
   };
-
   const handleSummoningComplete = () => {};
 
   const handleModalClose = async () => {
@@ -219,6 +241,49 @@ export function StepAgent({ provider, model, onComplete, onBack, existingAgent }
                   <Badge variant="outline">{model}</Badge>
                 </div>
               )}
+            </div>
+
+            {/* Agent identity — editable name + key, prefilled from the preset */}
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor="setup-display-name">{tAgents("create.displayName")}</Label>
+                <div className="flex gap-2">
+                  <Input
+                    id="setup-emoji"
+                    value={emoji}
+                    onChange={(e) => setEmoji(e.target.value)}
+                    placeholder="🤖"
+                    className="w-14 shrink-0 text-center text-base md:text-lg"
+                    maxLength={2}
+                    title={tAgents("create.emojiHint")}
+                  />
+                  <Input
+                    id="setup-display-name"
+                    value={displayName}
+                    onChange={(e) => handleDisplayNameChange(e.target.value)}
+                    placeholder={tAgents("create.displayNamePlaceholder")}
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="setup-agent-key">{tAgents("create.agentKey")}</Label>
+                <Input
+                  id="setup-agent-key"
+                  value={agentKey}
+                  onChange={(e) => handleAgentKeyChange(e.target.value)}
+                  onBlur={(e) => setAgentKey(slugify(e.target.value))}
+                  placeholder={tAgents("create.agentKeyPlaceholder")}
+                  disabled={isEditing}
+                />
+                <p
+                  className={`text-xs ${
+                    !isEditing && agentKey && !keyValid ? "text-destructive" : "text-muted-foreground"
+                  }`}
+                >
+                  {tAgents("create.agentKeyHint")}
+                </p>
+              </div>
             </div>
 
             {/* Prompt / description with preset selection */}
@@ -297,7 +362,7 @@ export function StepAgent({ provider, model, onComplete, onBack, existingAgent }
               )}
               <Button
                 onClick={handleSubmit}
-                disabled={loading || !description.trim()}
+                disabled={loading || !canSubmit}
               >
                 {loading
                   ? isEditing ? t("agent.updating", "Updating...") : t("agent.creating")

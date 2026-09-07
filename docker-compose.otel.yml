@@ -9,9 +9,9 @@ services:
   jaeger:
     image: jaegertracing/all-in-one:1.68.0
     ports:
-      - "${JAEGER_UI_PORT:-16686}:16686"   # Jaeger UI
-      - "${OTLP_GRPC_PORT:-4317}:4317"     # OTLP gRPC
-      - "${OTLP_HTTP_PORT:-4318}:4318"     # OTLP HTTP
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
     environment:
       - COLLECTOR_OTLP_ENABLED=true
     restart: unless-stopped

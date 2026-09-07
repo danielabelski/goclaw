@@ -16,7 +16,7 @@ var schemaSQL string
 
 // SchemaVersion is the current SQLite schema version.
 // Bump this when adding new migration steps below.
-const SchemaVersion = 49
+const SchemaVersion = 60
 
 // migrations maps version → SQL to apply when upgrading FROM that version.
 // schema.sql always represents the LATEST full schema (for fresh DBs).
@@ -29,7 +29,121 @@ const SchemaVersion = 49
 //	}
 //
 // Then bump SchemaVersion to 2.
+const sqliteSubagentRootAgentScopeMigrationBody = `UPDATE subagent_tasks
+SET root_agent_id = json_extract(metadata, '$.root_agent_id')
+WHERE root_agent_id IS NULL
+  AND json_valid(metadata)
+  AND typeof(json_extract(metadata, '$.root_agent_id')) = 'text'
+  AND EXISTS (
+      SELECT 1
+      FROM agents
+      WHERE agents.tenant_id = subagent_tasks.tenant_id
+        AND agents.id = json_extract(subagent_tasks.metadata, '$.root_agent_id')
+  );
+UPDATE subagent_tasks
+SET root_agent_id = (
+    SELECT MIN(agents.id)
+    FROM agents
+    WHERE agents.tenant_id = subagent_tasks.tenant_id
+      AND agents.agent_key = subagent_tasks.parent_agent_key
+      AND agents.created_at < subagent_tasks.created_at
+)
+WHERE root_agent_id IS NULL
+  AND CASE
+      WHEN json_valid(metadata) THEN json_type(metadata, '$.root_agent_id') IS NULL
+      ELSE 1
+  END
+  AND (
+      SELECT COUNT(*)
+      FROM agents
+      WHERE agents.tenant_id = subagent_tasks.tenant_id
+        AND agents.agent_key = subagent_tasks.parent_agent_key
+        AND agents.created_at < subagent_tasks.created_at
+  ) = 1;
+CREATE INDEX IF NOT EXISTS idx_subagent_tasks_root_status
+  ON subagent_tasks(tenant_id, root_agent_id, status, created_at DESC)
+  WHERE root_agent_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_subagent_tasks_root_session
+  ON subagent_tasks(tenant_id, root_agent_id, session_key, created_at DESC)
+  WHERE root_agent_id IS NOT NULL AND session_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_subagent_tasks_root_archive
+  ON subagent_tasks(tenant_id, root_agent_id, completed_at, id)
+  WHERE root_agent_id IS NOT NULL
+    AND status IN ('completed', 'failed', 'cancelled')
+    AND archived_at IS NULL;
+CREATE TRIGGER IF NOT EXISTS trg_subagent_tasks_root_tenant_insert
+BEFORE INSERT ON subagent_tasks
+WHEN NEW.root_agent_id IS NOT NULL
+ AND NOT EXISTS (
+     SELECT 1 FROM agents
+     WHERE agents.id = NEW.root_agent_id
+       AND agents.tenant_id = NEW.tenant_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'subagent root agent belongs to another tenant');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_subagent_tasks_root_tenant_update
+BEFORE UPDATE OF root_agent_id, tenant_id ON subagent_tasks
+WHEN NEW.root_agent_id IS NOT NULL
+ AND NOT EXISTS (
+     SELECT 1 FROM agents
+     WHERE agents.id = NEW.root_agent_id
+       AND agents.tenant_id = NEW.tenant_id
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'subagent root agent belongs to another tenant');
+END;`
+
 var migrations = map[int]string{
+	// Version 59 → 60: keep an append-only copy of group capture. Pending rows are
+	// deleted when the buffer is handed to the agent and when compaction replaces
+	// them with a summary; before this table those deletes destroyed the only copy.
+	59: `CREATE TABLE IF NOT EXISTS channel_message_archive (
+    id                 TEXT NOT NULL PRIMARY KEY,
+    channel_name       VARCHAR(100) NOT NULL,
+    history_key        VARCHAR(200) NOT NULL,
+    parent_history_key VARCHAR(200) NOT NULL DEFAULT '',
+    sender             VARCHAR(255) NOT NULL,
+    sender_id          VARCHAR(255) NOT NULL DEFAULT '',
+    body               TEXT NOT NULL,
+    platform_msg_id    VARCHAR(100) NOT NULL DEFAULT '',
+    is_summary         BOOLEAN NOT NULL DEFAULT 0,
+    tenant_id          TEXT NOT NULL REFERENCES tenants(id),
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL,
+    archived_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    archive_reason     VARCHAR(20) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_channel_message_archive_lookup ON channel_message_archive(tenant_id, channel_name, history_key, created_at);
+CREATE INDEX IF NOT EXISTS idx_channel_message_archive_archived_at ON channel_message_archive(tenant_id, archived_at);`,
+	// Version 58 → 59: scope persisted subagent tasks by immutable root-agent UUID.
+	// Metadata is authoritative; key fallback is allowed only for one matching
+	// agent that predates the task. Unmatched rows remain inaccessible.
+	58: `ALTER TABLE subagent_tasks
+	ADD COLUMN root_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL;
+` + sqliteSubagentRootAgentScopeMigrationBody,
+	// Version 57 → 58: restore custom skills previously converted by the bundled skill seeder.
+	57: `UPDATE skills
+SET is_system = 0,
+    visibility = 'private',
+    status = 'archived',
+    frontmatter = json_set(
+        CASE WHEN json_valid(frontmatter) THEN frontmatter ELSE '{}' END,
+        '$._goclaw_recovery',
+        'bundled_slug_collision'
+    ),
+    version = CASE WHEN version > 1 THEN version - 1 ELSE 1 END,
+    file_path = CASE
+        WHEN file_path LIKE '%/' || version THEN
+            substr(file_path, 1, length(file_path) - length(CAST(version AS TEXT))) ||
+            CAST(CASE WHEN version > 1 THEN version - 1 ELSE 1 END AS TEXT)
+        ELSE file_path
+    END,
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE is_system = 1 AND owner_id <> 'system';`,
+	// Version 49 → 50: per-cron-job LLM provider/model override (mirrors agent_heartbeats).
+	49: `ALTER TABLE cron_jobs ADD COLUMN provider_id TEXT REFERENCES llm_providers(id) ON DELETE SET NULL;
+ALTER TABLE cron_jobs ADD COLUMN model VARCHAR(200);`,
 	// Version 1 → 2: add contact_type column to channel_contacts.
 	1: `ALTER TABLE channel_contacts ADD COLUMN contact_type VARCHAR(20) NOT NULL DEFAULT 'user';`,
 	// Version 2 → 3: promote cron payload fields to dedicated columns + add stateless flag.
@@ -852,6 +966,88 @@ CREATE INDEX IF NOT EXISTS idx_skill_user_grants_tenant ON skill_user_grants(ten
 	47: addSkillSelfEvolutionTables,
 	// Version 48 → 49: append-only usage event analytics.
 	48: addUsageEventAnalyticsTables,
+	// Version 50 → 51: mcp_oauth_tokens table for MCP OAuth client support.
+	// Partial unique indexes instead of UNIQUE constraint — SQLite treats NULLs as
+	// distinct in UNIQUE constraints, so global tokens (user_id IS NULL) would not
+	// conflict and re-auth would insert duplicates instead of updating.
+	50: `CREATE TABLE IF NOT EXISTS mcp_oauth_tokens (
+    id                TEXT NOT NULL PRIMARY KEY,
+    server_id         TEXT NOT NULL REFERENCES mcp_servers(id) ON DELETE CASCADE,
+    tenant_id         TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    user_id           TEXT,
+    access_token      TEXT NOT NULL,
+    refresh_token     TEXT,
+    token_type        TEXT NOT NULL DEFAULT 'Bearer',
+    scopes            TEXT,
+    expires_at        TEXT,
+    issued_at         TEXT,
+    dcr_client_id     TEXT NOT NULL DEFAULT '',
+    dcr_client_secret TEXT,
+    dcr_issuer        TEXT NOT NULL DEFAULT '',
+    token_endpoint    TEXT NOT NULL DEFAULT '',
+    resource_uri      TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS mcp_oauth_tokens_global_uq ON mcp_oauth_tokens (server_id, tenant_id) WHERE user_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS mcp_oauth_tokens_user_uq ON mcp_oauth_tokens (server_id, tenant_id, user_id) WHERE user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_mcp_oauth_tokens_server_tenant ON mcp_oauth_tokens (server_id, tenant_id);`,
+	// Version 51 → 52: add last_heartbeat_at to webhook_calls for lease heartbeat.
+	// Mirrors PG migration 000085. Idempotent-guarded via idempotentColumnMigration(51).
+	51: `ALTER TABLE webhook_calls ADD COLUMN last_heartbeat_at TEXT;`,
+	// Version 52 → 53: preserve provider cache/thinking token dimensions in usage event analytics.
+	52: `ALTER TABLE usage_events ADD COLUMN cache_read_tokens BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE usage_events ADD COLUMN cache_create_tokens BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE usage_events ADD COLUMN thinking_tokens BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE usage_event_rollups ADD COLUMN cache_read_tokens BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE usage_event_rollups ADD COLUMN cache_create_tokens BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE usage_event_rollups ADD COLUMN thinking_tokens BIGINT NOT NULL DEFAULT 0;`,
+	// Version 53 → 54: dedupe passive memory extraction items across runs for the same channel instance.
+	53: addChannelMemoryItemChannelHashUnique,
+	// Version 54 → 55: preserve Discord thread parent channel for passive-memory excludes.
+	54: `ALTER TABLE channel_pending_messages ADD COLUMN parent_history_key VARCHAR(200) NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_channel_pending_messages_parent
+  ON channel_pending_messages(channel_name, parent_history_key)
+  WHERE parent_history_key <> '';`,
+	// Version 55 → 56: promote require_user_credentials from settings JSONB
+	// to a top-level column so channel factories can filter directly.
+	// Backfill reads the legacy JSONB via json_extract so no admin needs to
+	// re-tick after upgrading. Mirrors PG migration 000092. Idempotent-guarded
+	// via idempotentColumnMigration(55).
+	55: `ALTER TABLE mcp_servers ADD COLUMN require_user_credentials BOOLEAN NOT NULL DEFAULT 0;
+UPDATE mcp_servers
+   SET require_user_credentials = COALESCE(CAST(json_extract(settings, '$.require_user_credentials') AS INTEGER), 0)
+ WHERE settings IS NOT NULL
+   AND json_extract(settings, '$.require_user_credentials') IS NOT NULL;`,
+	// Version 56 → 57: backfill Bitrix24 channel_instances.config with
+	// mcp_server_id by resolving the legacy mcp_server_name against
+	// mcp_servers (matched on the channel's agent tenant_id since
+	// channel_instances doesn't carry tenant_id directly). Mirrors PG
+	// migration 000093. Idempotent — only touches rows without an
+	// existing mcp_server_id key.
+	56: `UPDATE channel_instances
+        SET config = json_set(
+                COALESCE(config, '{}'),
+                '$.mcp_server_id',
+                (SELECT srv.id
+                   FROM mcp_servers srv
+                  WHERE srv.name = json_extract(channel_instances.config, '$.mcp_server_name')
+                    AND srv.tenant_id = (
+                        SELECT a.tenant_id FROM agents a WHERE a.id = channel_instances.agent_id
+                    )
+                  LIMIT 1)
+        ),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      WHERE channel_type = 'bitrix24'
+        AND json_extract(config, '$.mcp_server_name') IS NOT NULL
+        AND json_extract(config, '$.mcp_server_id') IS NULL
+        AND EXISTS (
+            SELECT 1 FROM mcp_servers srv
+             WHERE srv.name = json_extract(channel_instances.config, '$.mcp_server_name')
+               AND srv.tenant_id = (
+                   SELECT a.tenant_id FROM agents a WHERE a.id = channel_instances.agent_id
+               )
+        );`,
 }
 
 const addUsageEventAnalyticsTables = `
@@ -878,6 +1074,9 @@ CREATE TABLE IF NOT EXISTS usage_events (
     input_tokens  BIGINT NOT NULL DEFAULT 0,
     output_tokens BIGINT NOT NULL DEFAULT 0,
     total_tokens  BIGINT NOT NULL DEFAULT 0,
+    cache_read_tokens   BIGINT NOT NULL DEFAULT 0,
+    cache_create_tokens BIGINT NOT NULL DEFAULT 0,
+    thinking_tokens     BIGINT NOT NULL DEFAULT 0,
     cost_usd      NUMERIC(12,6) NOT NULL DEFAULT 0,
     duration_ms   INTEGER NOT NULL DEFAULT 0,
     call_count    INTEGER NOT NULL DEFAULT 1,
@@ -914,6 +1113,9 @@ CREATE TABLE IF NOT EXISTS usage_event_rollups (
     input_tokens  BIGINT NOT NULL DEFAULT 0,
     output_tokens BIGINT NOT NULL DEFAULT 0,
     total_tokens  BIGINT NOT NULL DEFAULT 0,
+    cache_read_tokens   BIGINT NOT NULL DEFAULT 0,
+    cache_create_tokens BIGINT NOT NULL DEFAULT 0,
+    thinking_tokens     BIGINT NOT NULL DEFAULT 0,
     cost_usd      NUMERIC(12,6) NOT NULL DEFAULT 0,
     duration_ms   INTEGER NOT NULL DEFAULT 0,
     call_count    INTEGER NOT NULL DEFAULT 0,
@@ -1083,12 +1285,39 @@ CREATE TABLE IF NOT EXISTS channel_memory_extraction_items (
     episodic_id         VARCHAR(64) NOT NULL DEFAULT '',
     created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE (tenant_id, run_id, item_hash)
+    UNIQUE (tenant_id, channel_instance_id, item_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_channel_memory_items_channel_status
   ON channel_memory_extraction_items(tenant_id, channel_instance_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_channel_memory_items_run
   ON channel_memory_extraction_items(tenant_id, run_id);`
+
+const addChannelMemoryItemChannelHashUnique = `
+DELETE FROM channel_memory_extraction_items
+WHERE id NOT IN (
+    SELECT id
+    FROM (
+        SELECT id,
+               ROW_NUMBER() OVER (
+                   PARTITION BY tenant_id, channel_instance_id, item_hash
+                   ORDER BY
+                       CASE status
+                           WHEN 'written' THEN 5
+                           WHEN 'approved' THEN 4
+                           WHEN 'pending_review' THEN 3
+                           WHEN 'rejected' THEN 2
+                           WHEN 'deleted' THEN 1
+                           ELSE 0
+                       END DESC,
+                       created_at DESC,
+                       id DESC
+               ) AS rn
+        FROM channel_memory_extraction_items
+    )
+    WHERE rn = 1
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_memory_items_tenant_channel_hash_unique
+    ON channel_memory_extraction_items(tenant_id, channel_instance_id, item_hash);`
 
 const addChannelContextCapabilityTables = `
 CREATE TABLE IF NOT EXISTS mcp_context_grants (
@@ -1366,6 +1595,30 @@ func EnsureSchema(db *sql.DB) error {
 					patch = `SELECT 1;`
 				}
 			}
+			if v == 49 {
+				patch, err = sqliteCronProviderMigrationPatch(db)
+				if err != nil {
+					return fmt.Errorf("inspect cron_jobs provider override columns: %w", err)
+				}
+			}
+			if v == 52 {
+				patch, err = sqliteUsageEventTokenMigrationPatch(db)
+				if err != nil {
+					return fmt.Errorf("inspect usage event token columns: %w", err)
+				}
+			}
+			if v == 54 {
+				patch, err = sqlitePendingMessageParentMigrationPatch(db)
+				if err != nil {
+					return fmt.Errorf("inspect channel pending message parent column: %w", err)
+				}
+			}
+			if v == 58 {
+				patch, err = sqliteSubagentRootAgentMigrationPatch(db)
+				if err != nil {
+					return fmt.Errorf("inspect subagent task root-agent column: %w", err)
+				}
+			}
 			// Migrations that rebuild a table referenced by another table's FK
 			// require foreign_keys=OFF per SQLite altertable §7. The pragma is
 			// a no-op inside a transaction, so toggle it around BEGIN/COMMIT.
@@ -1450,9 +1703,93 @@ func idempotentColumnMigration(version int) (string, string, bool) {
 		return "secure_cli_user_credentials", "host_scope", true
 	case 41:
 		return "secure_cli_binaries", "adapter_name", true
+	case 51:
+		return "webhook_calls", "last_heartbeat_at", true
+	case 55:
+		return "mcp_servers", "require_user_credentials", true
 	default:
 		return "", "", false
 	}
+}
+
+func sqliteCronProviderMigrationPatch(db *sql.DB) (string, error) {
+	hasProviderID, err := sqliteColumnExists(db, "cron_jobs", "provider_id")
+	if err != nil {
+		return "", err
+	}
+	hasModel, err := sqliteColumnExists(db, "cron_jobs", "model")
+	if err != nil {
+		return "", err
+	}
+
+	patch := ""
+	if !hasProviderID {
+		patch += "ALTER TABLE cron_jobs ADD COLUMN provider_id TEXT REFERENCES llm_providers(id) ON DELETE SET NULL;\n"
+	}
+	if !hasModel {
+		patch += "ALTER TABLE cron_jobs ADD COLUMN model VARCHAR(200);\n"
+	}
+	if patch == "" {
+		patch = "SELECT 1;"
+	}
+	return patch, nil
+}
+
+func sqliteUsageEventTokenMigrationPatch(db *sql.DB) (string, error) {
+	columns := []struct {
+		table string
+		name  string
+	}{
+		{table: "usage_events", name: "cache_read_tokens"},
+		{table: "usage_events", name: "cache_create_tokens"},
+		{table: "usage_events", name: "thinking_tokens"},
+		{table: "usage_event_rollups", name: "cache_read_tokens"},
+		{table: "usage_event_rollups", name: "cache_create_tokens"},
+		{table: "usage_event_rollups", name: "thinking_tokens"},
+	}
+
+	patch := ""
+	for _, col := range columns {
+		hasColumn, err := sqliteColumnExists(db, col.table, col.name)
+		if err != nil {
+			return "", err
+		}
+		if !hasColumn {
+			patch += fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s BIGINT NOT NULL DEFAULT 0;\n", col.table, col.name)
+		}
+	}
+	if patch == "" {
+		patch = "SELECT 1;"
+	}
+	return patch, nil
+}
+
+func sqlitePendingMessageParentMigrationPatch(db *sql.DB) (string, error) {
+	hasColumn, err := sqliteColumnExists(db, "channel_pending_messages", "parent_history_key")
+	if err != nil {
+		return "", err
+	}
+	patch := ""
+	if !hasColumn {
+		patch += "ALTER TABLE channel_pending_messages ADD COLUMN parent_history_key VARCHAR(200) NOT NULL DEFAULT '';\n"
+	}
+	patch += `CREATE INDEX IF NOT EXISTS idx_channel_pending_messages_parent
+  ON channel_pending_messages(channel_name, parent_history_key)
+  WHERE parent_history_key <> '';`
+	return patch, nil
+}
+
+func sqliteSubagentRootAgentMigrationPatch(db *sql.DB) (string, error) {
+	hasColumn, err := sqliteColumnExists(db, "subagent_tasks", "root_agent_id")
+	if err != nil {
+		return "", err
+	}
+	patch := ""
+	if !hasColumn {
+		patch += "ALTER TABLE subagent_tasks ADD COLUMN root_agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL;\n"
+	}
+	patch += sqliteSubagentRootAgentScopeMigrationBody
+	return patch, nil
 }
 
 func sqliteColumnExists(db *sql.DB, tableName, columnName string) (bool, error) {

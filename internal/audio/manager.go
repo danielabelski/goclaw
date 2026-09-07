@@ -41,9 +41,9 @@ type Manager struct {
 	musicProviders map[string]MusicProvider
 	sfxProviders   map[string]SFXProvider
 
-	primary             string            // primary TTS provider
-	sttChain            []string          // STT fallback order (Phase 4)
-	musicChain          []string          // Music fallback order (Phase 3)
+	primary             string              // primary TTS provider
+	sttChain            []string            // STT fallback order (Phase 4)
+	musicChain          []string            // Music fallback order (Phase 3)
 	channelSTTOverrides map[string][]string // channel → provider key list (Phase 4)
 
 	auto      AutoMode
@@ -298,33 +298,59 @@ func (m *Manager) SynthesizeWithFallback(ctx context.Context, text string, opts 
 
 // SynthesizeWithFallbackAdapted is like SynthesizeWithFallback but applies
 // AdaptAgentParams(genericAgentParams, providerName) per-attempt before
-// synthesizing. This is the Finding #1 fix: each fallback attempt receives
-// provider-native params rather than the primary's adapted keys.
+// synthesizing, so each fallback attempt receives provider-native params
+// rather than the primary's adapted keys.
 //
 // genericAgentParams must use the generic allow-list keys (speed, emotion, style).
 // Passing nil is safe and produces the same behaviour as SynthesizeWithFallback.
 func (m *Manager) SynthesizeWithFallbackAdapted(ctx context.Context, text string, opts TTSOptions, genericAgentParams map[string]any) (*SynthResult, error) {
-	var providerErrs []error
-	if p, ok := m.ttsProviders[m.primary]; ok {
-		attemptOpts := m.withAdaptedParams(opts, m.primary, genericAgentParams)
-		if result, err := p.Synthesize(ctx, text, attemptOpts); err == nil {
-			return result, nil
-		} else {
-			slog.Warn("tts primary provider failed, trying fallback", "provider", m.primary, "error", err)
-			providerErrs = append(providerErrs, fmt.Errorf("%s: %w", m.primary, err))
+	return m.SynthesizeWithFallbackResolved(ctx, text, m.primary, func(string) TTSOptions {
+		return opts
+	}, genericAgentParams)
+}
+
+// SynthesizeWithFallbackResolved tries preferredProvider first, then the
+// manager primary and remaining registered providers. resolveOpts runs for
+// every actual attempt so provider-specific voice, model, and format defaults
+// never leak into another provider's request.
+func (m *Manager) SynthesizeWithFallbackResolved(
+	ctx context.Context,
+	text string,
+	preferredProvider string,
+	resolveOpts func(providerName string) TTSOptions,
+	genericAgentParams map[string]any,
+) (*SynthResult, error) {
+	if preferredProvider == "" {
+		preferredProvider = m.primary
+	}
+	providerNames := make([]string, 0, len(m.ttsProviders))
+	if _, ok := m.ttsProviders[preferredProvider]; ok {
+		providerNames = append(providerNames, preferredProvider)
+	}
+	if m.primary != preferredProvider {
+		if _, ok := m.ttsProviders[m.primary]; ok {
+			providerNames = append(providerNames, m.primary)
 		}
 	}
-	for name, p := range m.ttsProviders {
-		if name == m.primary {
-			continue
+	for name := range m.ttsProviders {
+		if name != preferredProvider && name != m.primary {
+			providerNames = append(providerNames, name)
+		}
+	}
+
+	var providerErrs []error
+	for _, name := range providerNames {
+		opts := TTSOptions{}
+		if resolveOpts != nil {
+			opts = resolveOpts(name)
 		}
 		attemptOpts := m.withAdaptedParams(opts, name, genericAgentParams)
+		p := m.ttsProviders[name]
 		result, err := p.Synthesize(ctx, text, attemptOpts)
 		if err == nil {
-			slog.Info("tts fallback succeeded", "provider", name)
 			return result, nil
 		}
-		slog.Warn("tts fallback provider failed", "provider", name, "error", err)
+		slog.Warn("tts provider failed, trying fallback", "provider", name, "error", err)
 		providerErrs = append(providerErrs, fmt.Errorf("%s: %w", name, err))
 	}
 	if len(providerErrs) == 0 {

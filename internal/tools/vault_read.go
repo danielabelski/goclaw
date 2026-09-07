@@ -22,6 +22,7 @@ type VaultReadTool struct {
 	vaultStore    store.VaultStore
 	kgStore       store.KnowledgeGraphStore
 	episodicStore store.EpisodicStore
+	tenantStore   store.TenantStore
 	workspace     string
 }
 
@@ -74,8 +75,14 @@ func (t *VaultReadTool) SetKGStore(kg store.KnowledgeGraphStore) { t.kgStore = k
 // lookup when vault lookup misses. nil is safe.
 func (t *VaultReadTool) SetEpisodicStore(es store.EpisodicStore) { t.episodicStore = es }
 
-// SetWorkspace injects the tenant workspace root (wired at boot).
+// SetWorkspace injects the global workspace root (wired at boot). This is the
+// base for every tenant — the tenant-scoped root is resolved per request in
+// tenantWorkspace, since one tool instance serves all tenants.
 func (t *VaultReadTool) SetWorkspace(ws string) { t.workspace = ws }
+
+// SetTenantStore injects an optional TenantStore used to resolve the tenant
+// slug when the request context does not carry one. nil is safe.
+func (t *VaultReadTool) SetTenantStore(ts store.TenantStore) { t.tenantStore = ts }
 
 func (t *VaultReadTool) Name() string { return "vault_read" }
 
@@ -145,8 +152,8 @@ func (t *VaultReadTool) Execute(ctx context.Context, args map[string]any) *Resul
 		return ErrorResult(fmt.Sprintf("vault_read does not support %s files — use read_image/read_audio/read_video/read_document", ext))
 	}
 
-	// Resolve path under tenant workspace root.
-	fullPath, err := t.resolvePath(doc.Path)
+	// Resolve path under the tenant workspace root.
+	fullPath, err := t.resolvePath(t.tenantWorkspace(ctx, tenantID), doc.Path)
 	if err != nil {
 		return ErrorResult(err.Error())
 	}
@@ -169,8 +176,14 @@ func (t *VaultReadTool) Execute(ctx context.Context, args map[string]any) *Resul
 	}
 
 	// Text-only gate, layer 3: UTF-8 sniff on first N bytes of content.
-	sniffLen := min(len(content), vaultReadUTF8SniffBytes)
-	if !utf8.Valid(content[:sniffLen]) {
+	sniff := content[:min(len(content), vaultReadUTF8SniffBytes)]
+	if len(sniff) < len(content) {
+		// The sniff window ends mid-content, so its last bytes may be the
+		// dangling prefix of a rune the cut split in half. Repair that before
+		// judging, otherwise valid non-ASCII text is reported as binary.
+		sniff = trimPartialTrailingRune(sniff)
+	}
+	if !utf8.Valid(sniff) {
 		return ErrorResult("file content is not valid UTF-8 text — use read_image/read_audio/read_video/read_document for binary files")
 	}
 
@@ -344,13 +357,33 @@ func (t *VaultReadTool) allowed(ctx context.Context, doc *store.VaultDocument) b
 	}
 }
 
-// resolvePath joins the tenant workspace with the doc's relative path and
-// enforces that the fully-resolved path remains strictly under the workspace.
+// tenantWorkspace resolves the tenant-scoped workspace root for this request.
+// Vault paths are stored relative to that root (e.g. "agents/<key>/note.md"),
+// so joining them onto the global root silently misses every non-master tenant
+// whose files live under <root>/tenants/<slug>/. Master tenant is a no-op
+// inside TenantLayer and keeps using the base root.
+func (t *VaultReadTool) tenantWorkspace(ctx context.Context, tenantID uuid.UUID) string {
+	slug := store.TenantSlugFromContext(ctx)
+	// Channel- and cron-originated runs may not carry the slug in context.
+	// Without it TenantLayer falls back to a UUID-named directory, which does
+	// not match the slug-named directory the write path creates on disk.
+	if slug == "" && tenantID != store.MasterTenantID && t.tenantStore != nil {
+		if tenant, err := t.tenantStore.GetTenant(ctx, tenantID); err == nil && tenant != nil {
+			slug = tenant.Slug
+		}
+	}
+	return ResolveWorkspace(t.workspace, TenantLayer(tenantID, slug))
+}
+
+// resolvePath joins the given workspace root with the doc's relative path and
+// enforces that the fully-resolved path remains strictly under that root.
+// Passing the tenant root (not the global one) also makes the boundary check
+// double as cross-tenant isolation.
 // Symlinks are resolved via EvalSymlinks for defence-in-depth; if the file is
 // missing EvalSymlinks will fail and we fall back to the cleaned join (the
 // subsequent os.Open will surface the not-found error naturally).
-func (t *VaultReadTool) resolvePath(relPath string) (string, error) {
-	wsClean := filepath.Clean(t.workspace)
+func (t *VaultReadTool) resolvePath(root, relPath string) (string, error) {
+	wsClean := filepath.Clean(root)
 	joined := filepath.Join(wsClean, filepath.FromSlash(relPath))
 
 	// Resolve symlinks where possible; on error (e.g. file missing) keep the
@@ -407,7 +440,25 @@ func readCapped(path string, maxBytes int) ([]byte, bool, error) {
 		return nil, false, err
 	}
 	if len(buf) > maxBytes {
-		return buf[:maxBytes], true, nil
+		// The cap is a byte offset, so it can land inside a multi-byte rune;
+		// drop the dangling prefix instead of emitting a broken character.
+		return trimPartialTrailingRune(buf[:maxBytes]), true, nil
 	}
 	return buf, false, nil
+}
+
+// trimPartialTrailingRune removes up to utf8.UTFMax-1 trailing bytes from b so
+// that a cut made at a byte offset does not leave the prefix of a multi-byte
+// rune dangling. Accented Vietnamese characters take 2-3 bytes, so a plain byte
+// cut breaks the encoding of otherwise valid text; ASCII never does.
+//
+// Only call this on data known to be truncated. On complete content the
+// trailing bytes belong to the file itself and must stay as they are, so that
+// genuinely broken bytes are still detected. Stopping after 3 trims keeps the
+// repair confined to the cut: a longer run of invalid bytes is real corruption.
+func trimPartialTrailingRune(b []byte) []byte {
+	for trimmed := 0; trimmed < utf8.UTFMax-1 && len(b) > 0 && !utf8.Valid(b); trimmed++ {
+		b = b[:len(b)-1]
+	}
+	return b
 }

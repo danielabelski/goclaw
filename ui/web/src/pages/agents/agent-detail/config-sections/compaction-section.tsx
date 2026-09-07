@@ -21,6 +21,16 @@ export function CompactionSection({ value, onChange }: CompactionSectionProps) {
       <div className="rounded-lg border p-3 space-y-4 sm:p-4">
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <div className="space-y-2">
+          <InfoLabel tip={t(`${s}.maxRequestShareTip`)}>{t(`${s}.maxRequestShare`)}</InfoLabel>
+          <Input
+            type="number"
+            step="0.05"
+            placeholder="0.85"
+            value={value.maxRequestShare ?? ""}
+            onChange={(e) => onChange({ ...value, maxRequestShare: numOrUndef(e.target.value) })}
+          />
+        </div>
+        <div className="space-y-2">
           <InfoLabel tip={t(`${s}.maxHistoryShareTip`)}>{t(`${s}.maxHistoryShare`)}</InfoLabel>
           <Input
             type="number"
@@ -37,6 +47,15 @@ export function CompactionSection({ value, onChange }: CompactionSectionProps) {
             placeholder="4"
             value={value.keepLastMessages ?? ""}
             onChange={(e) => onChange({ ...value, keepLastMessages: numOrUndef(e.target.value) })}
+          />
+        </div>
+        <div className="space-y-2">
+          <InfoLabel tip={t(`${s}.timeoutSecondsTip`)}>{t(`${s}.timeoutSeconds`)}</InfoLabel>
+          <Input
+            type="number"
+            placeholder="120"
+            value={value.timeoutSeconds ?? ""}
+            onChange={(e) => onChange({ ...value, timeoutSeconds: numOrUndef(e.target.value) })}
           />
         </div>
       </div>

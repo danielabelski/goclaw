@@ -77,6 +77,8 @@ flowchart TD
     S3 --> ALLOW["Allow request"]
 ```
 
+**MCP stdio validation** -- Admin-created, imported, tested, and on-demand-discovered MCP server configs pass `internal/mcp.ValidateServerConfig()` before any temporary or persistent client process is created. `stdio` configs are restricted to bare allowlisted runtime names resolved from `PATH`; path-bearing commands such as `./node`, `tools/node`, `/tmp/node`, or `.\\node.exe` are rejected to prevent wrapper substitution. Arguments reject shell metacharacters and eval/import flags, and block remote loader/script/package execution modes such as `node --loader`, `python -m`, `deno`/`bun` remote refs, `npx`/`uvx`/`pipx` package targets, `uv --with`, `npm exec`, `go run`, `cargo install`, and `dotnet tool install`. SSE and streamable-HTTP transports use the SSRF validator above.
+
 **Path traversal**: `resolvePath()` applies `filepath.Clean()` then `HasPrefix()` to ensure all paths stay within the workspace. With `restrict = true`, any path outside the workspace is blocked.
 
 **PathDenyable** -- An interface that lets filesystem tools reject specific path prefixes:
@@ -459,13 +461,19 @@ Browser pairing allows web UI clients to authenticate without full admin credent
 
 ## 12. Delegation Security
 
-Agent delegation is protected through delegation history tracking and concurrency controls.
+Agent delegation is protected through isolated artifact exchange, directional
+link permission checks, and bounded child-run admission.
 
 | Control | Scope | Description |
 |---------|-------|-------------|
-| Per-agent load cap | B (all sources) | `other_config.max_delegation_load` limits total concurrent delegations targeting B |
+| Artifact boundary | One Agent Link run | Staged inputs are read-only; the delegatee writes only to ephemeral outputs that are validated before atomic publish |
+| Per-root limit | One root agent's self-spawn tree | Agent `subagents.maxConcurrent`, default 20 |
+| Process safety cap | All self-spawn and Agent Link callbacks | Standard 32 / Lite 2, with at most 128 independent pending chains |
+| Nested lifetime | Agent Link artifact run | Async descendants are rejected; sync descendants complete before publication |
+| Durable async result | Source/root agent UUID within one tenant | Terminal text and logical media paths use deadline-bounded persistence retries before announcement; single-process startup retries pre-traffic recovery that marks previous-process non-terminal rows failed, and successful terminal writes remain explicitly retrievable by completion UUID |
 
-When concurrency limits are hit, the error message is written for LLM reasoning: *"Agent at capacity (5/5). Try a different agent or handle it yourself."*
+`agent_links.max_concurrent` is retained as compatibility metadata and is not
+currently enforced by runtime admission.
 
 ---
 

@@ -579,10 +579,17 @@ Each delegation link (lead→member) has its own settings:
 
 | Layer | Scope | Default |
 |-------|-------|---------|
-| Per-link | Simultaneous delegations from lead to a specific member | 3 |
-| Per-agent | Total concurrent delegations targeting any single member | 5 |
+| Per-root agent | Executing self-spawn descendants across the full tree | 20 |
+| Process safety cap | Executing self-spawn and Agent Link callbacks | Standard 32 / Lite 2 |
+| Pending admission | Independent child-run chains waiting for capacity | 128 |
 
-When limits are hit, the error message is written for LLM reasoning: "Agent at capacity (5/5). Try a different agent or handle it yourself."
+Each Agent Link delegation begins a new target-owned spawn tree. The source
+agent's `maxSpawnDepth` does not limit the target agent; any subagents created by
+the target use the target's own subagent settings.
+
+`agent_links.max_concurrent` remains serialized compatibility metadata and is
+not currently an admission limit. Agent Team task scheduling keeps its existing
+lane/workspace contract.
 
 ---
 
@@ -593,7 +600,7 @@ Agent links define directed delegation relationships between agents, separate fr
 - **Target agent** (can receive delegations from)
 - **Direction** (outbound from source, inbound to target)
 - **Team context** (optional `team_id` if created by team setup)
-- **Concurrency limit** (max simultaneous delegations for this link)
+- **Reserved concurrency metadata** (`max_concurrent`; retained for compatibility, not currently enforced)
 
 **Team-created links** are automatically created when a team is set up (lead → each member). Links remain even if the team is deleted or members are removed, allowing manual cleanup.
 
@@ -601,9 +608,48 @@ Agent links define directed delegation relationships between agents, separate fr
 
 ## 12. Delegation Context
 
-### SenderID Clearing
+### Authorization and artifact scope
 
-In sync delegations, the delegate agent's context has the `senderID` cleared. This is critical because delegations are system-initiated — the delegate should not inherit the caller's group writer permissions, which would incorrectly deny file writes. Each delegate agent has its own writer list.
+Agent Link dispatch preserves the caller's authorization scope for policy
+checks but attenuates filesystem authority. The delegatee receives staged
+read-only copies through `inputs/` and writes only to `outputs/`. After the run,
+regular-file, path, symlink, count, and size validation completes before an
+atomic publication to the caller's `.delegations/<delegation-id>/` directory.
+Agent Team shared-workspace behavior is unchanged.
+
+Successful publications persist with `manifest.json` and logical `outputs/...`
+entries. Failed/cancelled exchanges are retained for 60 minutes for diagnostics
+and removed by a restart-safe janitor whose per-sweep item and filesystem-entry
+work are both bounded. Traces correlate by
+`delegation_id` and record only logical paths, sizes, hashes, status, and
+timestamps—never physical exchange or caller host paths.
+
+Async Agent Link dispatch also creates a durable completion row before the
+child-run ticket is activated. The full terminal result and logical published
+artifact paths are persisted before the automatic parent announcement. If
+bounded announcement retries cannot enter the inbound queue, the source agent
+can retrieve the result after the run—or after a gateway restart—with:
+
+```text
+delegate(action="get", delegation_id="<uuid>")
+```
+
+Retrieval is scoped by tenant and the immutable UUID of the source agent. It
+does not grant the target agent, another linked source, or a later same-key
+agent access to the result. Delegation completion rows are excluded from
+`/subagents` and self-clone roster queries.
+
+Terminal database writes use per-attempt deadlines plus an extended bounded
+retry window. If the database remains unavailable for that whole window, the
+live announcement is still attempted but is not recorded as durably delivered;
+a crash during the same outage may prevent the terminal result from being
+recorded. On the next startup that can reach the database, every non-terminal
+completion row from the previous process is marked `failed` with an interruption
+reason instead of remaining `queued` or `running` forever. The gateway retries
+that reconciliation before accepting traffic if the database is temporarily
+unavailable. The current runtime assumes one active gateway process. Graceful
+shutdown waits for accepted completion persistence before tearing down runtime
+dependencies.
 
 ### Trace Linking
 

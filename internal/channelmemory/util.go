@@ -32,11 +32,21 @@ func (s *Service) itemFromExtracted(run *store.ChannelMemoryExtractionRun, extra
 }
 
 func eligibleHistoryKey(key string, cfg Config) bool {
+	if slices.Contains(cfg.ExcludeHistoryKeys, key) {
+		return false
+	}
 	if !cfg.GroupOnly {
 		return key != ""
 	}
 	k := strings.ToLower(key)
 	return key != "" && !strings.Contains(k, "dm") && !strings.Contains(k, "private")
+}
+
+func eligibleHistoryGroup(group store.PendingMessageGroup, cfg Config) bool {
+	if group.ParentHistoryKey != "" && slices.Contains(cfg.ExcludeHistoryKeys, group.ParentHistoryKey) {
+		return false
+	}
+	return eligibleHistoryKey(group.HistoryKey, cfg)
 }
 
 func messageSourceID(msg store.PendingMessage) string {
@@ -52,8 +62,35 @@ func decodeStrings(raw json.RawMessage) []string {
 	return out
 }
 
+func memoryKeyTopics(item *store.ChannelMemoryExtractionItem) []string {
+	if item == nil {
+		return nil
+	}
+	return mergeTopicLabels(decodeStrings(item.Topics), decodeStrings(item.Entities))
+}
+
+func mergeTopicLabels(groups ...[]string) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	for _, group := range groups {
+		for _, value := range group {
+			label := strings.TrimSpace(value)
+			if label == "" {
+				continue
+			}
+			key := strings.ToLower(label)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, label)
+		}
+	}
+	return out
+}
+
 //go:fix inline
-func timePtr(t time.Time) *time.Time { return new(t) }
+func timePtr(t time.Time) *time.Time { return &t }
 
 func contains(values []string, v string) bool {
 	return slices.Contains(values, v)

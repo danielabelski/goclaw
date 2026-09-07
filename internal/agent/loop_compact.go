@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -37,6 +38,21 @@ Conversation to summarize:
 
 `
 
+const defaultCompactionTimeout = 120 * time.Second
+
+const (
+	maxCompactionChunks      = 16
+	maxCompactionMergeLevels = 3
+	defaultCompactionShare   = 0.85
+)
+
+func (l *Loop) compactionTimeout() time.Duration {
+	if l.compactionCfg != nil && l.compactionCfg.TimeoutSeconds > 0 {
+		return time.Duration(l.compactionCfg.TimeoutSeconds) * time.Second
+	}
+	return defaultCompactionTimeout
+}
+
 // compactMessagesInPlace summarizes the first ~70% of messages into a condensed
 // summary, keeping the last ~30% intact. Operates purely on the local messages
 // slice — no session state touched, no locks needed.
@@ -56,41 +72,46 @@ func (l *Loop) compactMessagesInPlace(ctx context.Context, messages []providers.
 		keepCount = minKeep
 	}
 
-	splitIdx := toolChainSplitIndex(messages, len(messages)-keepCount)
+	splitIdx := len(messages) - keepCount
+
+	// Walk backward from splitIdx to find a clean boundary —
+	// avoid splitting tool_use → tool_result pairs.
+	for splitIdx > 0 {
+		m := messages[splitIdx]
+		if m.Role == "tool" || (m.Role == "assistant" && len(m.ToolCalls) > 0) {
+			splitIdx--
+			continue
+		}
+		break
+	}
 	if splitIdx <= 1 {
 		return nil
 	}
 
-	// Build summary input (same pattern as maybeSummarize in loop_history.go).
 	toSummarize := messages[:splitIdx]
-	var sb strings.Builder
-	for _, m := range toSummarize {
-		switch m.Role {
-		case "user":
-			fmt.Fprintf(&sb, "user: %s\n", m.Content)
-		case "assistant":
-			fmt.Fprintf(&sb, "assistant: %s\n", SanitizeAssistantContent(m.Content))
-		}
-	}
-
-	sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	timeout := l.compactionTimeout()
+	sctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	inTokens := l.estimateSummaryInputTokens(toSummarize)
-	slog.Info("compact_budget", "agent", l.id, "in_tokens", inTokens, "out_tokens", dynamicSummaryMax(inTokens))
-	chatReq := providers.ChatRequest{
-		Messages: []providers.Message{{
-			Role:    "user",
-			Content: compactionSummaryPrompt + sb.String(),
-		}},
-		Model:   l.model,
-		Options: map[string]any{"max_tokens": dynamicSummaryMax(inTokens), "temperature": 0.3},
-	}
-	resp, err := l.callInternalLLMWithUsage(sctx, chatReq, "mid-loop-compaction")
-	if err != nil {
-		slog.Warn("mid_loop_compaction_failed", "agent", l.id, "error", err)
+	inputCap := l.compactionInputCap()
+	if inputCap <= 0 {
+		slog.Warn("mid_loop_compaction_failed", "agent", l.id, "error", "context_window_unresolved")
 		return nil
 	}
+	units := buildCompactionUnits(toSummarize)
+	summaryContent, chunkCount, err := l.summarizeCompactionUnits(sctx, units, inputCap, 1)
+	if err != nil {
+		slog.Warn("mid_loop_compaction_failed", "agent", l.id, "timeout_seconds", int(timeout/time.Second), "error", err)
+		return nil
+	}
+	slog.Info("compact_budget",
+		"path", "mid-loop",
+		"agent", l.id,
+		"in_tokens", l.estimateSummaryInputTokens(toSummarize),
+		"input_cap_tokens", inputCap,
+		"chunks", chunkCount,
+		"timeout_seconds", int(timeout/time.Second),
+	)
 
 	// Collect MediaRefs from compacted messages (keep up to 30 most recent).
 	const maxPreservedMediaRefs = 30
@@ -106,7 +127,7 @@ func (l *Loop) compactMessagesInPlace(ctx context.Context, messages []providers.
 
 	summary := providers.Message{
 		Role:      "user",
-		Content:   "[Summary of earlier conversation]\n" + SanitizeAssistantContent(resp.Content),
+		Content:   "[Summary of earlier conversation]\n" + summaryContent,
 		MediaRefs: preservedRefs,
 	}
 	result := make([]providers.Message, 0, 1+keepCount)
@@ -122,25 +143,209 @@ func (l *Loop) compactMessagesInPlace(ctx context.Context, messages []providers.
 	return result
 }
 
-// toolChainSplitIndex walks backward from splitIdx to the nearest clean
-// boundary so the kept tail (messages[splitIdx:]) never starts mid tool-chain.
-// A tail starting with a tool result — or splitting an assistant(tool_calls) →
-// tool sequence — produces an orphaned role:"tool" message, which OpenAI
-// rejects with a 400 on the next request. Used by both mid-loop compaction
-// and the background summarizer's truncation.
-func toolChainSplitIndex(messages []providers.Message, splitIdx int) int {
-	if splitIdx > len(messages) {
-		splitIdx = len(messages)
+func (l *Loop) compactionInputCap() int {
+	contextWindow := l.resolveEffectiveContextWindow()
+	if contextWindow <= 0 {
+		return 0
 	}
-	for splitIdx > 0 && splitIdx < len(messages) {
-		m := messages[splitIdx]
-		if m.Role == "tool" || (m.Role == "assistant" && len(m.ToolCalls) > 0) {
-			splitIdx--
+	maxTokens := l.effectiveMaxTokens()
+	hardInputCap := contextWindow - maxTokens
+	share := defaultCompactionShare
+	if l.compactionCfg != nil && l.compactionCfg.MaxRequestShare > 0 && l.compactionCfg.MaxRequestShare <= 1 {
+		share = l.compactionCfg.MaxRequestShare
+	}
+	softTarget := int(float64(contextWindow)*share) - maxTokens
+	return min(hardInputCap, softTarget)
+}
+
+func buildCompactionUnits(messages []providers.Message) []string {
+	units := make([]string, 0, len(messages))
+	for i := 0; i < len(messages); {
+		end := i + 1
+		if messages[i].Role == "assistant" && len(messages[i].ToolCalls) > 0 {
+			for end < len(messages) && messages[end].Role == "tool" {
+				end++
+			}
+		}
+		if text := renderCompactionMessages(messages[i:end]); text != "" {
+			units = append(units, text)
+		}
+		i = end
+	}
+	return units
+}
+
+func renderCompactionMessages(messages []providers.Message) string {
+	var sb strings.Builder
+	for _, m := range messages {
+		switch m.Role {
+		case "user":
+			fmt.Fprintf(&sb, "user: %s\n", m.Content)
+		case "assistant":
+			if content := SanitizeAssistantContent(m.Content); content != "" {
+				fmt.Fprintf(&sb, "assistant: %s\n", content)
+			}
+			// Tool calls carry the assistant's intent (which tool, what args);
+			// dropping them loses the "why" behind each tool result below.
+			for _, tc := range m.ToolCalls {
+				if args, err := json.Marshal(tc.Arguments); err == nil && len(tc.Arguments) > 0 {
+					fmt.Fprintf(&sb, "assistant tool call %s(%s)\n", tc.Name, string(args))
+				} else {
+					fmt.Fprintf(&sb, "assistant tool call %s()\n", tc.Name)
+				}
+			}
+		case "tool":
+			// Tool results hold the technical payload the summary must retain
+			// (search hits, file contents, API responses). buildCompactionUnits
+			// groups these with their assistant tool_call; the previous renderer
+			// silently dropped them, erasing the data before summarization.
+			if m.Content != "" {
+				fmt.Fprintf(&sb, "tool result: %s\n", m.Content)
+			}
+		}
+	}
+	return sb.String()
+}
+
+func (l *Loop) summarizeCompactionUnits(ctx context.Context, units []string, inputCap, level int) (string, int, error) {
+	if len(units) == 0 {
+		return "", 0, fmt.Errorf("no compactable conversation content")
+	}
+	chunks, err := l.packCompactionChunks(units, inputCap)
+	if err != nil {
+		return "", 0, err
+	}
+	if len(chunks) > maxCompactionChunks {
+		return "", 0, fmt.Errorf("compaction chunk limit exceeded: chunks=%d limit=%d", len(chunks), maxCompactionChunks)
+	}
+
+	summaries := make([]string, 0, len(chunks))
+	for i, chunk := range chunks {
+		inputTokens := l.estimateCompactionRequestTokens(chunk)
+		if inputTokens > inputCap {
+			return "", 0, fmt.Errorf("compaction chunk exceeds input cap: chunk=%d input=%d cap=%d", i, inputTokens, inputCap)
+		}
+		outputTokens := dynamicSummaryMax(inputTokens)
+		slog.Debug("compact_chunk_budget",
+			"path", "mid-loop",
+			"agent", l.id,
+			"level", level,
+			"chunk", i+1,
+			"chunks", len(chunks),
+			"in_tokens", inputTokens,
+			"out_tokens", outputTokens,
+			"input_cap_tokens", inputCap,
+		)
+		resp, callErr := l.callInternalLLMWithUsage(ctx, providers.ChatRequest{
+			Messages: []providers.Message{{Role: "user", Content: compactionSummaryPrompt + chunk}},
+			Model:    l.model,
+			Options:  map[string]any{"max_tokens": outputTokens, "temperature": 0.3},
+		}, "mid-loop-compaction")
+		if callErr != nil {
+			return "", 0, callErr
+		}
+		summary := SanitizeAssistantContent(resp.Content)
+		if strings.TrimSpace(summary) == "" {
+			return "", 0, fmt.Errorf("compaction returned empty summary")
+		}
+		summaries = append(summaries, summary)
+	}
+	if len(summaries) == 1 {
+		return summaries[0], len(chunks), nil
+	}
+	if level >= maxCompactionMergeLevels {
+		return "", 0, fmt.Errorf("compaction merge level exceeded: level=%d limit=%d", level, maxCompactionMergeLevels)
+	}
+
+	mergeUnits := make([]string, len(summaries))
+	for i, summary := range summaries {
+		mergeUnits[i] = fmt.Sprintf("partial summary %d: %s\n", i+1, summary)
+	}
+	merged, mergeChunks, mergeErr := l.summarizeCompactionUnits(ctx, mergeUnits, inputCap, level+1)
+	return merged, len(chunks) + mergeChunks, mergeErr
+}
+
+func (l *Loop) packCompactionChunks(units []string, inputCap int) ([]string, error) {
+	var chunks []string
+	var current strings.Builder
+	flush := func() {
+		if current.Len() == 0 {
+			return
+		}
+		chunks = append(chunks, current.String())
+		current.Reset()
+	}
+
+	for _, unit := range units {
+		parts, err := l.splitCompactionUnit(unit, inputCap)
+		if err != nil {
+			return nil, err
+		}
+		for _, part := range parts {
+			candidate := current.String() + part
+			if current.Len() > 0 && l.estimateCompactionRequestTokens(candidate) > inputCap {
+				flush()
+				candidate = part
+			}
+			if l.estimateCompactionRequestTokens(candidate) > inputCap {
+				return nil, fmt.Errorf("atomic compaction unit exceeds input cap")
+			}
+			current.WriteString(part)
+			if len(chunks) >= maxCompactionChunks {
+				return nil, fmt.Errorf("compaction chunk limit exceeded: limit=%d", maxCompactionChunks)
+			}
+		}
+	}
+	flush()
+	return chunks, nil
+}
+
+func (l *Loop) splitCompactionUnit(unit string, inputCap int) ([]string, error) {
+	if l.estimateCompactionRequestTokens(unit) <= inputCap {
+		return []string{unit}, nil
+	}
+	words := strings.Fields(unit)
+	if len(words) == 0 {
+		return nil, fmt.Errorf("empty oversized compaction unit")
+	}
+
+	var parts []string
+	var current strings.Builder
+	for _, word := range words {
+		candidate := word
+		if current.Len() > 0 {
+			candidate = current.String() + " " + word
+		}
+		if l.estimateCompactionRequestTokens(candidate) <= inputCap {
+			if current.Len() > 0 {
+				current.WriteByte(' ')
+			}
+			current.WriteString(word)
 			continue
 		}
-		break
+		if current.Len() == 0 {
+			return nil, fmt.Errorf("atomic compaction token exceeds input cap")
+		}
+		parts = append(parts, current.String()+"\n")
+		current.Reset()
+		current.WriteString("[continued] ")
+		current.WriteString(word)
+		if l.estimateCompactionRequestTokens(current.String()) > inputCap {
+			return nil, fmt.Errorf("atomic compaction token exceeds input cap")
+		}
 	}
-	return splitIdx
+	if current.Len() > 0 {
+		parts = append(parts, current.String()+"\n")
+	}
+	return parts, nil
+}
+
+func (l *Loop) estimateCompactionRequestTokens(content string) int {
+	message := providers.Message{Role: "user", Content: compactionSummaryPrompt + content}
+	if l.tokenCounter != nil {
+		return l.tokenCounter.CountMessages(l.model, []providers.Message{message})
+	}
+	return len([]rune(message.Content))/3 + 4
 }
 
 // dynamicSummaryMax returns the output-token budget for a compaction or

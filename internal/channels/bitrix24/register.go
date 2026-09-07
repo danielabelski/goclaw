@@ -120,7 +120,7 @@ func (c *Channel) unregisterBot(ctx context.Context, botID int) error {
 	if client == nil {
 		return errors.New("bitrix24 unregister: client not initialised")
 	}
-	_, err := client.Call(ctx, "imbot.unregister", map[string]any{"BOT_ID": botID})
+	_, err := client.Call(ctx, "imbot.v2.Bot.unregister", map[string]any{"botId": botID})
 	if err == nil {
 		return nil
 	}
@@ -226,21 +226,53 @@ func (c *Channel) verifyBot(ctx context.Context, botID int) (bool, error) {
 		return false, errors.New("bitrix24 verify: client not initialised")
 	}
 
-	resp, err := client.Call(ctx, "imbot.bot.list", nil)
+	found, err := c.forEachBotPage(ctx, client, func(resp *RawResult) bool {
+		return responseContainsBotID(resp, botID)
+	})
 	if err != nil {
-		// Older portals expose a different endpoint name; try the alternate.
-		alt, altErr := client.Call(ctx, "imbot.list", nil)
-		if altErr != nil {
-			// Surface BOTH errors so operators can see whether this is a
-			// portal-side outage (both fail the same way) vs. an endpoint
-			// naming issue (only one side fails).
-			return false, fmt.Errorf("bitrix24 verify: %w",
-				errors.Join(err, altErr))
-		}
-		resp = alt
+		return false, fmt.Errorf("bitrix24 verify: %w", err)
 	}
+	return found, nil
+}
 
-	return responseContainsBotID(resp, botID), nil
+// botListPageLimit matches the imbot.v2.Bot.list default page size (50). We page
+// explicitly via limit/offset and honor result.hasNextPage so portals with more
+// than one page of bots are fully scanned — scanning only page 1 makes
+// verify/lookup silently fail for any bot past the first 50.
+const botListPageLimit = 50
+
+// maxBotListPages backstops the pagination loop against a server that keeps
+// reporting hasNextPage=true (or a non-advancing offset). 40 pages = 2000 bots,
+// far beyond any real application.
+const maxBotListPages = 40
+
+// forEachBotPage pages through imbot.v2.Bot.list and calls scan on each page's
+// raw result. scan returns true to stop early (match found). Returns
+// (true, nil) on a match, (false, nil) when all pages are exhausted with no
+// match, (false, err) on a transport error. Legacy non-paginated envelopes
+// (no hasNextPage field) are treated as a single page and stop after one call.
+func (c *Channel) forEachBotPage(ctx context.Context, client *Client, scan func(*RawResult) bool) (bool, error) {
+	offset := 0
+	for page := 0; page < maxBotListPages; page++ {
+		resp, err := client.Call(ctx, "imbot.v2.Bot.list", map[string]any{
+			"limit":  botListPageLimit,
+			"offset": offset,
+		})
+		if err != nil {
+			return false, err
+		}
+		if scan(resp) {
+			return true, nil
+		}
+		var p struct {
+			HasNextPage bool `json:"hasNextPage"`
+		}
+		if err := json.Unmarshal(resp.Result, &p); err != nil || !p.HasNextPage {
+			return false, nil
+		}
+		offset += botListPageLimit
+	}
+	return false, nil
 }
 
 // findBotIDByCode scans the portal for a bot whose CODE equals the given
@@ -255,17 +287,17 @@ func (c *Channel) findBotIDByCode(ctx context.Context, code string) (int, error)
 		return 0, errors.New("bitrix24 find: client not initialised")
 	}
 
-	resp, err := client.Call(ctx, "imbot.bot.list", nil)
-	if err != nil {
-		alt, altErr := client.Call(ctx, "imbot.list", nil)
-		if altErr != nil {
-			return 0, fmt.Errorf("bitrix24 find-by-code: %w",
-				errors.Join(err, altErr))
+	var foundID int
+	if _, err := c.forEachBotPage(ctx, client, func(resp *RawResult) bool {
+		if id := findBotIDByCodeInResponse(resp, code); id > 0 {
+			foundID = id
+			return true
 		}
-		resp = alt
+		return false
+	}); err != nil {
+		return 0, fmt.Errorf("bitrix24 find-by-code: %w", err)
 	}
-
-	return findBotIDByCodeInResponse(resp, code), nil
+	return foundID, nil
 }
 
 // fetchAvatarBase64 downloads an image and returns it base64-encoded.
@@ -372,72 +404,82 @@ func intFromResult(r *RawResult) int {
 // The shape is either an array (legacy) or an object keyed by bot id
 // (newer portals) — handle both transparently.
 func responseContainsBotID(r *RawResult, botID int) bool {
-	if r == nil || len(r.Result) == 0 || botID <= 0 {
+	if r == nil || botID <= 0 {
 		return false
 	}
-
-	// Array form.
-	var arr []map[string]json.RawMessage
-	if err := json.Unmarshal(r.Result, &arr); err == nil {
-		for _, row := range arr {
-			if rowHasBotID(row, botID) {
-				return true
-			}
-		}
-		return false
-	}
-
-	// Map form — keys may be numeric strings or {BOT_ID: ..., CODE: ...}.
-	var obj map[string]map[string]json.RawMessage
-	if err := json.Unmarshal(r.Result, &obj); err == nil {
-		for key, row := range obj {
-			if key == fmt.Sprintf("%d", botID) {
-				return true
-			}
-			if rowHasBotID(row, botID) {
-				return true
-			}
+	for _, row := range botListRows(r.Result) {
+		if rowHasBotID(row, botID) {
+			return true
 		}
 	}
 	return false
 }
 
-// findBotIDByCodeInResponse scans imbot.list output for a CODE match and
-// returns the associated bot_id. Returns 0 if the code isn't found.
+// findBotIDByCodeInResponse scans bot-list output for a CODE match and returns
+// the associated bot_id. Returns 0 if the code isn't found.
 func findBotIDByCodeInResponse(r *RawResult, code string) int {
-	if r == nil || len(r.Result) == 0 || code == "" {
+	if r == nil || code == "" {
 		return 0
 	}
-
-	// Array form.
-	var arr []map[string]json.RawMessage
-	if err := json.Unmarshal(r.Result, &arr); err == nil {
-		for _, row := range arr {
-			if rowCodeMatches(row, code) {
-				if id := extractBotID(row); id > 0 {
-					return id
-				}
-			}
-		}
-		return 0
-	}
-
-	// Map form.
-	var obj map[string]map[string]json.RawMessage
-	if err := json.Unmarshal(r.Result, &obj); err == nil {
-		for key, row := range obj {
-			if rowCodeMatches(row, code) {
-				if id := extractBotID(row); id > 0 {
-					return id
-				}
-				// Fall back to the object key if it's numeric (older portals).
-				if id := atoiSafe(key); id > 0 {
-					return id
-				}
+	for _, row := range botListRows(r.Result) {
+		if rowCodeMatches(row, code) {
+			if id := extractBotID(row); id > 0 {
+				return id
 			}
 		}
 	}
 	return 0
+}
+
+// botListRows normalizes the differing envelopes of the bot-list endpoints into
+// a flat slice of row maps:
+//   - imbot.v2.Bot.list : {"bots":[{...}], "users":[...], "hasNextPage":bool}
+//   - imbot.bot.list    : [{...}, ...]            (legacy top-level array)
+//   - older portals     : {"982":{...}, ...}      (map keyed by bot id)
+//
+// For the map form, a numeric key is injected as a synthetic "id" when the row
+// itself lacks one — preserving the legacy key-as-id fallback so callers don't
+// need to know which shape the portal returned.
+func botListRows(result json.RawMessage) []map[string]json.RawMessage {
+	if len(result) == 0 {
+		return nil
+	}
+
+	// v2 wraps rows under "bots"; unwrap before scanning. A legacy array or
+	// numeric-keyed map fails this unmarshal (or yields no "bots"), leaving
+	// payload == result.
+	payload := result
+	var wrap struct {
+		Bots json.RawMessage `json:"bots"`
+	}
+	if err := json.Unmarshal(result, &wrap); err == nil && len(wrap.Bots) > 0 {
+		payload = wrap.Bots
+	}
+
+	// Array form (v2 bots / legacy bot.list).
+	var arr []map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &arr); err == nil {
+		return arr
+	}
+
+	// Map form (older portals): keyed by bot id.
+	var obj map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &obj); err == nil {
+		rows := make([]map[string]json.RawMessage, 0, len(obj))
+		for key, row := range obj {
+			if row == nil {
+				row = map[string]json.RawMessage{}
+			}
+			if extractBotID(row) == 0 {
+				if id := atoiSafe(key); id > 0 {
+					row["id"] = json.RawMessage(fmt.Sprintf("%d", id))
+				}
+			}
+			rows = append(rows, row)
+		}
+		return rows
+	}
+	return nil
 }
 
 func rowHasBotID(row map[string]json.RawMessage, botID int) bool {

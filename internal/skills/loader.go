@@ -23,6 +23,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/nextlevelbuilder/goclaw/internal/config"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
 // Metadata holds parsed SKILL.md frontmatter.
@@ -51,12 +56,14 @@ type Loader struct {
 	globalSkills        string // ~/.goclaw/skills/
 	builtinSkills       string // bundled with binary
 
-	// DB-managed skills directory (set via SetManagedDir).
-	// Uses versioned subdirectory structure: <dir>/<slug>/<version>/SKILL.md
-	managedSkillsDir string
+	// dataDir is the root data directory used to resolve the tenant-scoped
+	// managed skills directory per-call via resolveManagedDir. Managed skills
+	// use versioned subdirectories: <dataDir>/[tenants/<slug>/]skills-store/<slug>/<version>/SKILL.md.
+	dataDir       string
+	managedDirSet bool // true once a data dir has been configured (enables managed lookup)
 
 	mu    sync.RWMutex
-	cache map[string]*Info // name → info (lazily populated)
+	cache map[uuid.UUID]map[string]*Info // tenant ID → name → info (lazily populated, tenant-scoped)
 
 	// Version tracking for hot-reload (matching TS bumpSkillsSnapshotVersion).
 	// Bumped by the watcher on SKILL.md changes; consumers compare to detect staleness.
@@ -88,23 +95,60 @@ func NewLoader(workspace, globalSkills, builtinSkills string) *Loader {
 		personalAgentSkills: personalAgentSkills,
 		globalSkills:        globalSkills,
 		builtinSkills:       builtinSkills,
-		cache:               make(map[string]*Info),
+		cache:               make(map[uuid.UUID]map[string]*Info),
 	}
 }
 
-// SetManagedDir sets the managed skills directory (skills-store).
-// Managed skills use versioned subdirectories: <dir>/<slug>/<version>/SKILL.md.
-// Called after PG stores are created.
+// SetManagedDir sets the root data directory used to resolve each tenant's
+// managed skills directory (skills-store) on every call, via resolveManagedDir.
+// dir must be the root data dir (e.g. GOCLAW_DATA_DIR), NOT a pre-resolved
+// tenant-specific path — resolving a single fixed path here would leak or
+// hide skills across tenants. Called after PG stores are created.
 func (l *Loader) SetManagedDir(dir string) {
-	l.managedSkillsDir = dir
+	l.dataDir = dir
+	l.managedDirSet = dir != ""
 	l.BumpVersion() // trigger re-scan
+}
+
+// resolveManagedDir computes the managed skills directory for the tenant
+// bound to ctx. Resolves to exactly one tenant's directory per call — never
+// enumerates or scans other tenants' directories.
+func (l *Loader) resolveManagedDir(ctx context.Context) string {
+	if !l.managedDirSet {
+		return ""
+	}
+	tid := store.TenantIDFromContext(ctx)
+	if tid == uuid.Nil {
+		tid = store.MasterTenantID
+	}
+	slug := store.TenantSlugFromContext(ctx)
+	return config.TenantSkillsStoreDir(l.dataDir, tid, slug)
+}
+
+// tenantCacheKey returns the tenant ID used to scope the in-memory info cache
+// for ctx, defaulting to the master tenant when unset.
+func tenantCacheKey(ctx context.Context) uuid.UUID {
+	tid := store.TenantIDFromContext(ctx)
+	if tid == uuid.Nil {
+		return store.MasterTenantID
+	}
+	return tid
 }
 
 // ListSkills returns all available skills, respecting the priority hierarchy.
 // Higher-priority sources override lower ones by name.
-func (l *Loader) ListSkills(_ context.Context) []Info {
+func (l *Loader) ListSkills(ctx context.Context) []Info {
+	managedDir := l.resolveManagedDir(ctx)
+	tid := tenantCacheKey(ctx)
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	tenantCache := l.cache[tid]
+	if tenantCache == nil {
+		tenantCache = make(map[string]*Info)
+		l.cache[tid] = tenantCache
+	}
 
 	seen := make(map[string]bool)
 	var skills []Info
@@ -152,19 +196,20 @@ func (l *Loader) ListSkills(_ context.Context) []Info {
 			}
 			skills = append(skills, info)
 			seen[d.Name()] = true
-			l.cache[d.Name()] = &info
+			tenantCache[d.Name()] = &info
 		}
 	}
 
 	// Managed skills (versioned, DB-seeded) come before builtin so their workspace paths win.
-	if l.managedSkillsDir != "" {
-		for _, info := range l.listManagedSkills() {
+	if managedDir != "" {
+		managedSkills := l.listManagedSkills(managedDir)
+		for _, info := range managedSkills {
 			if seen[info.Slug] {
 				continue
 			}
 			skills = append(skills, info)
 			seen[info.Slug] = true
-			l.cache[info.Slug] = &info
+			tenantCache[info.Slug] = &info
 		}
 	}
 
@@ -195,7 +240,7 @@ func (l *Loader) ListSkills(_ context.Context) []Info {
 				}
 				skills = append(skills, info)
 				seen[d.Name()] = true
-				l.cache[d.Name()] = &info
+				tenantCache[d.Name()] = &info
 			}
 		}
 	}
@@ -203,11 +248,12 @@ func (l *Loader) ListSkills(_ context.Context) []Info {
 	return skills
 }
 
-// listManagedSkills scans the managed skills directory for versioned skill directories.
-// Structure: <managedSkillsDir>/<slug>/<version>/SKILL.md
+// listManagedSkills scans the given managed skills directory (already resolved
+// to a single tenant via resolveManagedDir) for versioned skill directories.
+// Structure: <managedDir>/<slug>/<version>/SKILL.md
 // Returns the latest version of each skill found.
-func (l *Loader) listManagedSkills() []Info {
-	dirs, err := os.ReadDir(l.managedSkillsDir)
+func (l *Loader) listManagedSkills(managedDir string) []Info {
+	dirs, err := os.ReadDir(managedDir)
 	if err != nil {
 		return nil
 	}
@@ -220,7 +266,7 @@ func (l *Loader) listManagedSkills() []Info {
 		slug := d.Name()
 
 		// Find the latest version subdirectory
-		latestVersion, latestDir := l.findLatestVersion(slug)
+		latestVersion, latestDir := l.findLatestVersion(managedDir, slug)
 		if latestVersion < 0 {
 			continue
 		}
@@ -248,10 +294,11 @@ func (l *Loader) listManagedSkills() []Info {
 	return skills
 }
 
-// findLatestVersion finds the highest-numbered version subdirectory for a skill slug.
+// findLatestVersion finds the highest-numbered version subdirectory for a skill slug
+// within the given managed directory (already resolved to a single tenant).
 // Returns (version, path) or (-1, "") if no valid version found.
-func (l *Loader) findLatestVersion(slug string) (int, string) {
-	slugDir := filepath.Join(l.managedSkillsDir, slug)
+func (l *Loader) findLatestVersion(managedDir, slug string) (int, string) {
+	slugDir := filepath.Join(managedDir, slug)
 	entries, err := os.ReadDir(slugDir)
 	if err != nil {
 		return -1, ""
@@ -280,7 +327,7 @@ func (l *Loader) findLatestVersion(slug string) (int, string) {
 // LoadSkill reads and returns the content of a skill by name (frontmatter stripped).
 // The {baseDir} placeholder in SKILL.md is replaced with the skill's absolute directory path.
 // Priority: workspace > agents > global > managed > builtin
-func (l *Loader) LoadSkill(_ context.Context, name string) (string, bool) {
+func (l *Loader) LoadSkill(ctx context.Context, name string) (string, bool) {
 	// Check flat skill directories (workspace, agents, global) first
 	for _, dir := range []string{l.workspaceSkills, l.projectAgentSkills, l.personalAgentSkills, l.globalSkills} {
 		if dir == "" {
@@ -297,8 +344,9 @@ func (l *Loader) LoadSkill(_ context.Context, name string) (string, bool) {
 	}
 
 	// Managed skills (DB-seeded, versioned) take priority over raw builtin files.
-	if l.managedSkillsDir != "" {
-		latestVer, latestDir := l.findLatestVersion(name)
+	// Resolved to the calling tenant's own directory only — never scans other tenants'.
+	if managedDir := l.resolveManagedDir(ctx); managedDir != "" {
+		latestVer, latestDir := l.findLatestVersion(managedDir, name)
 		if latestVer >= 0 {
 			path := filepath.Join(latestDir, "SKILL.md")
 			data, err := os.ReadFile(path)
@@ -410,14 +458,78 @@ func (l *Loader) BuildSummary(ctx context.Context, allowList []string) string {
 	return strings.Join(lines, "\n")
 }
 
-// BuildPinnedSummary generates XML summary for only the pinned skill names.
-// Delegates to BuildSummary with pinned names as allowlist.
+// skillInlineMaxBytes caps how many bytes of a single pinned skill's SKILL.md
+// body may be inlined directly into the system prompt. Sampled SKILL.md sizes
+// run 3.6KB-10KB typical; skills above this cap fall back to pointer-only
+// format (name/description/location) so the agent uses use_skill+read_file.
+const skillInlineMaxBytes = 10000
+
+// skillInlineTotalMaxBytes caps the combined inlined size across all pinned
+// skills in a single prompt. Skills that don't fit (in allowlist order) fall
+// back to pointer-only format.
+const skillInlineTotalMaxBytes = skillInlineMaxBytes * 3
+
+// BuildPinnedSummary generates an XML summary for only the pinned skill
+// names, with each skill's full SKILL.md content (frontmatter stripped)
+// inlined directly via <skill_instructions>. Skills whose content exceeds
+// skillInlineMaxBytes, or that would push the combined total over
+// skillInlineTotalMaxBytes, fall back to a pointer-only <skill> entry
+// (name/description/location) so the agent can use_skill+read_file instead.
 // Returns empty string if none match.
 func (l *Loader) BuildPinnedSummary(ctx context.Context, pinnedNames []string) string {
 	if len(pinnedNames) == 0 {
 		return ""
 	}
-	return l.BuildSummary(ctx, pinnedNames)
+
+	allSkills := l.ListSkills(ctx)
+	if len(allSkills) == 0 {
+		return ""
+	}
+
+	byName := make(map[string]bool, len(pinnedNames))
+	for _, name := range pinnedNames {
+		byName[name] = true
+	}
+
+	var filtered []Info
+	for _, s := range allSkills {
+		if byName[s.Slug] {
+			filtered = append(filtered, s)
+		}
+	}
+	if len(filtered) == 0 {
+		return ""
+	}
+
+	var lines []string
+	lines = append(lines, "<available_skills>")
+	totalInlined := 0
+	for _, s := range filtered {
+		content, ok := l.LoadSkill(ctx, s.Slug)
+		content = strings.TrimSpace(content)
+		fits := ok && len(content) <= skillInlineMaxBytes && totalInlined+len(content) <= skillInlineTotalMaxBytes
+		if fits {
+			lines = append(lines, fmt.Sprintf("  <skill_instructions name=%q>", s.Name))
+			lines = append(lines, content)
+			lines = append(lines, "  </skill_instructions>")
+			totalInlined += len(content)
+			continue
+		}
+
+		lines = append(lines, "  <skill>")
+		lines = append(lines, fmt.Sprintf("    <name>%s</name>", escapeXML(s.Name)))
+		desc := s.Description
+		if len([]rune(desc)) > skillDescMaxLen {
+			desc = string([]rune(desc)[:skillDescMaxLen]) + "…"
+		}
+		lines = append(lines, fmt.Sprintf("    <description>%s</description>", escapeXML(desc)))
+		lines = append(lines, fmt.Sprintf("    <location>%s</location>", escapeXML(s.Path)))
+		lines = append(lines, "    <note>content too large to inline, use use_skill+read_file</note>")
+		lines = append(lines, "  </skill>")
+	}
+	lines = append(lines, "</available_skills>")
+
+	return strings.Join(lines, "\n")
 }
 
 // Version returns the current skill snapshot version.
@@ -432,12 +544,18 @@ func (l *Loader) BumpVersion() {
 }
 
 // Dirs returns all non-empty skill directories (for the watcher to monitor).
+// The managed skills directory returned here is always the master tenant's —
+// per-tenant managed directories are resolved dynamically per request via
+// resolveManagedDir and are not enumerated here.
 func (l *Loader) Dirs() []string {
 	var dirs []string
-	for _, d := range []string{l.workspaceSkills, l.projectAgentSkills, l.personalAgentSkills, l.globalSkills, l.builtinSkills, l.managedSkillsDir} {
+	for _, d := range []string{l.workspaceSkills, l.projectAgentSkills, l.personalAgentSkills, l.globalSkills, l.builtinSkills} {
 		if d != "" {
 			dirs = append(dirs, d)
 		}
+	}
+	if masterManagedDir := l.resolveManagedDir(context.Background()); masterManagedDir != "" {
+		dirs = append(dirs, masterManagedDir)
 	}
 	return dirs
 }
@@ -470,9 +588,11 @@ func (l *Loader) GetSkill(ctx context.Context, name string) (*Info, bool) {
 	// Ensure cache is populated
 	l.ListSkills(ctx)
 
+	tid := tenantCacheKey(ctx)
+
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	info, ok := l.cache[name]
+	info, ok := l.cache[tid][name]
 	return info, ok
 }
 

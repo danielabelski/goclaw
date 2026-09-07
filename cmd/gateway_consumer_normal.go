@@ -13,6 +13,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/agent"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
+	"github.com/nextlevelbuilder/goclaw/internal/channels/bitrix24"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/telegram/voiceguard"
 	"github.com/nextlevelbuilder/goclaw/internal/i18n"
 	"github.com/nextlevelbuilder/goclaw/internal/scheduler"
@@ -39,19 +40,49 @@ func processNormalMessage(
 	// Determine target agent via bindings or explicit AgentID
 	agentID := msg.AgentID
 	if agentID == "" {
-		agentID = resolveAgentRoute(deps.Cfg, msg.Channel, msg.ChatID, msg.PeerKind)
+		agentID = resolveAgentRouteForInbound(ctx, deps.Cfg, deps.AgentStore, msg.Channel, msg.ChatID, msg.PeerKind)
 	}
 
 	agentLoop, err := deps.Agents.Get(ctx, agentID)
 	if err != nil {
-		slog.Warn("inbound: agent not found", "agent", agentID, "channel", msg.Channel)
+		slog.Warn("inbound: agent not found", "agent", agentID, "channel", msg.Channel, "error", err)
+		errContent := formatAgentError(err)
+		if deps.ChannelMgr != nil {
+			if ct := deps.ChannelMgr.ChannelTypeForName(msg.Channel); isExternalChannel(ct) {
+				errContent = ""
+			}
+		}
+		deps.MsgBus.PublishOutbound(bus.OutboundMessage{
+			Channel:  msg.Channel,
+			ChatID:   msg.ChatID,
+			Content:  errContent,
+			Metadata: msg.Metadata,
+			TenantID: msg.TenantID,
+		})
 		return
+	}
+	// Team Work and intent gates run before Loop.injectContext. Propagate the
+	// resolved agent budget here so every classifier sees the same authority.
+	ctx = agent.WithAgentBudget(ctx, agentLoop)
+	if uid := agentLoop.UUID(); uid != uuid.Nil {
+		ctx = store.WithAgentID(ctx, uid)
 	}
 
 	// Build session key based on scope config (matching TS buildAgentPeerSessionKey).
 	peerKind := msg.PeerKind
 	if peerKind == "" {
 		peerKind = string(sessions.PeerDirect) // default to DM
+	}
+	// Channel adapters already attach cache-only titles to external inbound
+	// messages. Resolve live hierarchy only for synthetic/re-ingressed messages,
+	// where no adapter metadata exists; this keeps Discord REST off the user
+	// message hot path.
+	chatTitle := resolveInboundChatTitle(ctx, deps.ChannelMgr, msg, peerKind)
+	if chatTitle != "" && chatTitle != msg.Metadata[tools.MetaChatTitle] {
+		if msg.Metadata == nil {
+			msg.Metadata = make(map[string]string)
+		}
+		msg.Metadata[tools.MetaChatTitle] = chatTitle
 	}
 	sessionKey := sessions.BuildScopedSessionKey(agentID, msg.Channel, sessions.PeerKind(peerKind), msg.ChatID)
 
@@ -83,21 +114,10 @@ func processNormalMessage(
 	}
 
 	// Group-scoped UserID: context files, memory, traces, and seeding scope.
-	// - Discord guilds: "guild:{guildID}:user:{senderID}" — per-user per-server,
-	//   shared across all channels within the same server. Session key stays per-channel.
-	// - Other platforms: "group:{channel}:{chatID}" — shared by all users in the chat.
-	// Individual senderID is preserved in InboundMessage for pairing/dedup/mention gate.
-	userID := msg.UserID
-	if peerKind == string(sessions.PeerGroup) && msg.ChatID != "" {
-		if guildID := msg.Metadata["guild_id"]; guildID != "" && msg.SenderID != "" {
-			// Discord guild: per-user scope so each member has own profile
-			// across all channels in the same server.
-			userID = fmt.Sprintf("guild:%s:user:%s", guildID, msg.SenderID)
-		} else {
-			groupID := msg.ChatID
-			userID = fmt.Sprintf("group:%s:%s", msg.Channel, groupID)
-		}
-	}
+	// See deriveGroupUserID for the precedence (Discord guild → openline
+	// participant → group fallback). Individual senderID is preserved in
+	// InboundMessage for pairing/dedup/mention gating regardless of scope.
+	userID := deriveGroupUserID(msg, peerKind)
 
 	// Persist friendly names from channel metadata into session + user profile.
 	sessionMeta := extractSessionMetadata(msg, peerKind)
@@ -133,7 +153,10 @@ func processNormalMessage(
 
 		// Also collect group chat as a contact (for group permission management / merge).
 		// Group IDs (e.g., Telegram "-100456") differ from user IDs — no UNIQUE conflict.
-		if peerKind == string(sessions.PeerGroup) && msg.ChatID != "" {
+		// Discord persists raw entity names plus hierarchy display metadata in its
+		// adapter. Do not overwrite that raw contact title with ChatTitle, which
+		// is intentionally parent-qualified for prompt/display context.
+		if peerKind == string(sessions.PeerGroup) && msg.ChatID != "" && channelType != channels.TypeDiscord {
 			groupTitle := msg.Metadata[tools.MetaChatTitle] // Telegram: message.Chat.Title
 			deps.ContactCollector.EnsureContact(ctx, channelType, msg.Channel, msg.ChatID, "", groupTitle, "", "group", "group", "", "")
 		}
@@ -232,6 +255,22 @@ func processNormalMessage(
 		if msg.SenderID != "" && !bus.IsInternalSender(msg.SenderID) {
 			outMeta["bitrix_address_user_id"] = msg.SenderID
 		}
+	}
+
+	// Forward Bitrix24-specific routing keys so Send() can:
+	//   1. Branch v2 public vs v1 whisper (bitrix_visibility)
+	//   2. Set fields.replyId on v2 public reply (bitrix_message_id)
+	// CopyFinalRoutingMeta is channel-agnostic and doesn't include these.
+	if v := msg.Metadata[bitrix24.MetaKeyVisibility]; v != "" {
+		outMeta[bitrix24.MetaKeyVisibility] = v
+	}
+	if v := msg.Metadata[bitrix24.MetaKeyMessageID]; v != "" {
+		outMeta[bitrix24.MetaKeyMessageID] = v
+	}
+	// Openline sender tag captured on inbound → Send() prepends it to the reply
+	// so the connector routes the answer back to the right external user.
+	if v := msg.Metadata[bitrix24.MetaKeySenderPrefix]; v != "" {
+		outMeta[bitrix24.MetaKeySenderPrefix] = v
 	}
 
 	// Register run with channel manager for streaming/reaction event forwarding.
@@ -401,10 +440,15 @@ func processNormalMessage(
 		}
 	}
 
+	inboundMessage := msg.Content
+
 	// Inject tenant context from channel instance so all store queries are tenant-scoped.
 	if msg.TenantID != uuid.Nil {
 		ctx = store.WithTenantID(ctx, msg.TenantID)
 	}
+
+	gate := applyTeamWorkGateForInbound(ctx, deps, msg, sessionKey, agentID, peerKind, agentLoop.UUID(), skillFilter, agentLoop.Provider(), agentLoop.Model())
+	inboundMessage = gate.Message
 
 	// Inject post-turn dispatch tracker so team task creates are deferred.
 	ptd := tools.NewPendingTeamDispatch()
@@ -441,7 +485,7 @@ func processNormalMessage(
 	// Schedule through main lane (per-session concurrency controlled by maxConcurrent)
 	outCh := deps.Sched.ScheduleWithOpts(schedCtx, "main", agent.RunRequest{
 		SessionKey:   sessionKey,
-		Message:      msg.Content,
+		Message:      inboundMessage,
 		Media:        reqMedia,
 		ForwardMedia: fwdMedia,
 		Channel:      msg.Channel,
@@ -449,22 +493,24 @@ func processNormalMessage(
 		// Forward Bitrix24 portal domain from channel metadata so the
 		// system prompt can teach the LLM the correct entity URL host.
 		// Empty for non-bitrix24 channels — section is skipped downstream.
-		BitrixPortalDomain: msg.Metadata["bitrix_portal"],
-		ChatTitle:          msg.Metadata[tools.MetaChatTitle],
-		ChatID:             msg.ChatID,
-		WorkspaceChatID:    msg.ChatID,
-		PeerKind:           peerKind,
-		LocalKey:           msg.Metadata["local_key"],
-		UserID:             userID,
-		SenderID:           effectiveSenderID,
-		Role:               effectiveRole,
-		SenderName:         resolveSenderName(msg),
-		RunID:              runID,
-		Stream:             providerStream,
-		HistoryLimit:       msg.HistoryLimit,
-		ToolAllow:          msg.ToolAllow,
-		ExtraSystemPrompt:  extraPrompt,
-		SkillFilter:        skillFilter,
+		BitrixPortalDomain:         msg.Metadata["bitrix_portal"],
+		ChatTitle:                  msg.Metadata[tools.MetaChatTitle],
+		ChatID:                     msg.ChatID,
+		WorkspaceChatID:            msg.ChatID,
+		PeerKind:                   peerKind,
+		LocalKey:                   msg.Metadata["local_key"],
+		UserID:                     userID,
+		SenderID:                   effectiveSenderID,
+		Role:                       effectiveRole,
+		SenderName:                 resolveSenderName(msg),
+		RunID:                      runID,
+		Stream:                     providerStream,
+		HistoryLimit:               msg.HistoryLimit,
+		ToolAllow:                  msg.ToolAllow,
+		TelegramManagerPermissions: msg.TelegramManagerPermissions,
+		ExtraSystemPrompt:          extraPrompt,
+		TeamWorkDirective:          gate.Directive,
+		SkillFilter:                skillFilter,
 	}, scheduler.ScheduleOpts{
 		MaxConcurrent: maxConcurrent,
 	})
@@ -529,9 +575,14 @@ func processNormalMessage(
 			return
 		}
 
-		// Suppress empty/NO_REPLY responses (matching TS normalize-reply.ts).
-		// Still publish an empty outbound so channels can clean up placeholder/thinking indicators.
-		if outcome.Result.Content == "" || agent.IsSilentReply(outcome.Result.Content) {
+		// Suppress silent text only when the result has no media. A tool or
+		// delegate may legitimately return NO_REPLY with an attached artifact;
+		// that must continue as a media-only outbound message.
+		resultContent, shouldDeliver := normalizeAgentOutboundContent(
+			outcome.Result.Content,
+			len(outcome.Result.Media),
+		)
+		if !shouldDeliver {
 			slog.Info("inbound: suppressed silent/empty reply",
 				"channel", channel,
 				"chat_id", chatID,
@@ -569,7 +620,7 @@ func processNormalMessage(
 		// Sanitize voice agent replies: replace technical errors with user-friendly fallback.
 		replyContent := voiceguard.SanitizeReply(
 			deps.Cfg.Channels.Telegram.VoiceAgentID, agentKey,
-			channel, peerKind, inboundContent, outcome.Result.Content,
+			channel, peerKind, inboundContent, resultContent,
 			deps.Cfg.Channels.Telegram.AudioGuardFallbackTranscript,
 			deps.Cfg.Channels.Telegram.AudioGuardFallbackNoTranscript,
 			deps.Cfg.Channels.Telegram.AudioGuardErrorMarkers,
@@ -608,7 +659,7 @@ func processNormalMessage(
 		if deps.TeamStore != nil && channel != tools.ChannelSystem && channel != tools.ChannelTeammate && channel != tools.ChannelDashboard {
 			go autoSetFollowup(ctx, deps.TeamStore, deps.AgentStore, agentKey, channel, chatID, replyContent)
 		}
-	}(agentID, msg.Channel, msg.ChatID, sessionKey, runID, peerKind, msg.Content, outMeta, blockReply, chatBehavior, channelStream, ptd, msg.TenantID, agentLoop.UUID(), agentLoop.OtherConfig())
+	}(agentID, msg.Channel, msg.ChatID, sessionKey, runID, peerKind, inboundMessage, outMeta, blockReply, chatBehavior, channelStream, ptd, msg.TenantID, agentLoop.UUID(), agentLoop.OtherConfig())
 }
 
 func buildDeliveryRuntime(ctx context.Context, deps *ConsumerDeps, agentLoop agent.Agent, behavior channels.ResolvedChatBehavior, msg bus.InboundMessage, userID, peerKind, channelType, agentKey string) channels.DeliveryRuntime {
@@ -697,4 +748,33 @@ func isSafeBitrixEntityToken(s string, maxLen int) bool {
 		}
 	}
 	return true
+}
+
+// deriveGroupUserID computes the per-message scope userID used for context
+// files, memory, traces, and seeding. Direct messages keep msg.UserID. Group
+// messages pick a synthetic scope, in precedence order:
+//
+//  1. Discord guild member: "guild:{guildID}:user:{senderID}" — per-user across
+//     every channel in the same server.
+//  2. Openline participant: the per-participant id minted by bitrix24/handle.go
+//     ("openlines:{instance}:{chat}:{uid}") when a connector relayed a customer
+//     message carrying a stable uid — so each external person gets their own
+//     USER.md / memory instead of collapsing into the shared connector proxy.
+//     Absent for legacy/name-only/operator messages → falls through.
+//  3. Group fallback: "group:{channel}:{chatID}" — shared by everyone in the chat.
+//
+// The individual senderID stays on InboundMessage for pairing / dedup / mention
+// gating regardless of which scope is chosen.
+func deriveGroupUserID(msg bus.InboundMessage, peerKind string) string {
+	if peerKind != string(sessions.PeerGroup) || msg.ChatID == "" {
+		return msg.UserID
+	}
+	switch {
+	case msg.Metadata["guild_id"] != "" && msg.SenderID != "":
+		return fmt.Sprintf("guild:%s:user:%s", msg.Metadata["guild_id"], msg.SenderID)
+	case msg.Metadata[bitrix24.MetaKeyParticipantUserID] != "":
+		return msg.Metadata[bitrix24.MetaKeyParticipantUserID]
+	default:
+		return fmt.Sprintf("group:%s:%s", msg.Channel, msg.ChatID)
+	}
 }

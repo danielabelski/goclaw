@@ -53,9 +53,17 @@ func (c *tiktokenCounter) CountMessages(model string, msgs []providers.Message) 
 		return c.fallback.CountMessages(model, msgs)
 	}
 
+	// The per-message count depends on the tokenizer, so the cache key MUST
+	// include the tokenizer identity. Otherwise a message counted with model A's
+	// tokenizer (e.g. cl100k for Claude) would return that stale count when the
+	// same message is re-counted for model B on a different tokenizer (e.g.
+	// o200k for GPT-4o) — most visibly on fallback candidates. Models that share
+	// a tokenizer correctly share cache entries.
+	tokenizerID := resolveModelInfo(model).TokenizerID
+
 	total := 0
 	for _, m := range msgs {
-		hash := messageHash(m)
+		hash := messageHash(tokenizerID, m)
 
 		c.mu.RLock()
 		cached, ok := c.msgCache[hash]
@@ -67,10 +75,29 @@ func (c *tiktokenCounter) CountMessages(model string, msgs []providers.Message) 
 		}
 
 		count := len(enc.Encode(m.Content, nil, nil)) + PerMessageOverhead
+		// Thinking/reasoning is sent back to the provider on subsequent turns
+		// (Anthropic requires it for tool-use passback), so it counts toward input.
+		if m.Thinking != "" {
+			count += len(enc.Encode(m.Thinking, nil, nil))
+		}
+		// Tool result correlation id (role="tool" messages).
+		if m.ToolCallID != "" {
+			count += len(enc.Encode(m.ToolCallID, nil, nil))
+		}
+		// Raw assistant content blocks (Anthropic thinking-block passback) are
+		// serialized into the wire payload verbatim — count their bytes.
+		if len(m.RawAssistantContent) > 0 {
+			count += len(enc.Encode(string(m.RawAssistantContent), nil, nil))
+		}
 		for _, tc := range m.ToolCalls {
 			count += len(enc.Encode(tc.Name, nil, nil))
 			count += len(enc.Encode(tc.ID, nil, nil))
+			// Tool call arguments are serialized as JSON into the request and can
+			// dominate token cost; the previous counter ignored them entirely.
+			count += encodeToolArgs(enc, tc.Arguments)
 		}
+		// Media (images/videos) carry a per-item token cost when sent inline.
+		count += mediaTokenCost(m)
 
 		c.mu.Lock()
 		c.msgCache[hash] = count
@@ -167,17 +194,82 @@ func resolveModelInfo(model string) ModelInfo {
 }
 
 // messageHash computes FNV-1a hash of message content for cache keying.
-func messageHash(m providers.Message) uint64 {
+// It MUST cover every field that CountMessages encodes; otherwise a payload
+// whose thinking/args/tool-result/raw-blocks/media changed but whose Content is
+// unchanged would return a stale cached count for a different wire payload.
+// The tokenizer ID is folded in first because the token count is
+// tokenizer-dependent: the same message yields different counts under cl100k vs
+// o200k, so counts must not be shared across tokenizers.
+func messageHash(tokenizerID TokenizerID, m providers.Message) uint64 {
 	h := fnv.New64a()
+	h.Write([]byte(tokenizerID))
+	h.Write([]byte{0}) // separator
 	h.Write([]byte(m.Role))
 	h.Write([]byte{0}) // separator
 	h.Write([]byte(m.Content))
+	h.Write([]byte{0})
+	h.Write([]byte(m.Thinking))
+	h.Write([]byte{0})
+	h.Write([]byte(m.ToolCallID))
+	h.Write([]byte{0})
+	h.Write(m.RawAssistantContent)
 	for _, tc := range m.ToolCalls {
 		h.Write([]byte{0})
 		h.Write([]byte(tc.ID))
 		h.Write([]byte(tc.Name))
+		if b, err := json.Marshal(tc.Arguments); err == nil {
+			h.Write(b)
+		}
+	}
+	for _, img := range m.Images {
+		h.Write([]byte{0})
+		h.Write([]byte(img.MimeType))
+		h.Write([]byte(img.URL))
+	}
+	for _, vid := range m.Videos {
+		h.Write([]byte{0})
+		h.Write([]byte(vid.MimeType))
+		h.Write([]byte(vid.URL))
 	}
 	return h.Sum64()
+}
+
+// encodeToolArgs returns the BPE token count of a tool call's arguments as they
+// are serialized into the request payload (JSON). Returns 0 when arguments are
+// empty or cannot be marshalled.
+func encodeToolArgs(enc *tiktoken.Tiktoken, args map[string]any) int {
+	if len(args) == 0 {
+		return 0
+	}
+	b, err := json.Marshal(args)
+	if err != nil {
+		return 0
+	}
+	return len(enc.Encode(string(b), nil, nil))
+}
+
+// mediaTokenCost approximates the token cost of inline media on a message.
+// This is BEST-EFFORT, not a proven bound: a flat per-item estimate can
+// under-count a large inline video whose true token cost far exceeds it. It
+// exists so inline media is not counted as zero. Tool-internal media that
+// travels out-of-band (provider file/transcription APIs) is measured separately
+// by size in the caps guard (EstimateOutOfBandMediaTokens); this path only
+// covers media actually embedded in the message. Callers that persist media as
+// MediaRefs (not inlined) incur no cost here.
+func mediaTokenCost(m providers.Message) int {
+	const perInlineMediaItem = 1600 // best-effort estimate per inline image/video
+	cost := 0
+	for _, img := range m.Images {
+		if img.Data != "" || img.URL != "" {
+			cost += perInlineMediaItem
+		}
+	}
+	for _, vid := range m.Videos {
+		if vid.Data != "" || vid.URL != "" {
+			cost += perInlineMediaItem
+		}
+	}
+	return cost
 }
 
 // NewTokenCounter creates the best available counter.

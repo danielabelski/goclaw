@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
@@ -92,13 +93,22 @@ func TestSubagentExecTool_NilStoreIsSafe(t *testing.T) {
 func captureEmbeddingRequest(t *testing.T, es *store.EmbeddingSettings) map[string]any {
 	t.Helper()
 
+	// Pin Docker detection off so the loopback httptest URL is not rewritten
+	// to host.docker.internal when this suite runs inside a container.
+	t.Cleanup(config.SetInDockerForTest(false))
+
 	var requestBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
 			t.Fatalf("Decode() error = %v", err)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"data":[{"embedding":[0.1,0.2]}]}`))
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{{
+				"embedding": make([]float32, store.RequiredMemoryEmbeddingDimensions),
+				"index":     0,
+			}},
+		})
 	}))
 	defer server.Close()
 
@@ -135,5 +145,67 @@ func TestBuildEmbeddingProviderIgnoresIncompatibleStoredDimensions(t *testing.T)
 	})
 	if got := requestBody["dimensions"]; got != float64(1536) {
 		t.Fatalf("dimensions = %v, want fallback 1536", got)
+	}
+}
+
+type embeddingProviderStoreStub struct {
+	masterProviders []store.LLMProviderData
+	allProviders    []store.LLMProviderData
+	listTenant      uuid.UUID
+	listAllCalled   bool
+}
+
+func (s *embeddingProviderStoreStub) CreateProvider(context.Context, *store.LLMProviderData) error {
+	return nil
+}
+func (s *embeddingProviderStoreStub) GetProvider(context.Context, uuid.UUID) (*store.LLMProviderData, error) {
+	return nil, nil
+}
+func (s *embeddingProviderStoreStub) GetProviderByName(context.Context, string) (*store.LLMProviderData, error) {
+	return nil, nil
+}
+func (s *embeddingProviderStoreStub) ListProviders(ctx context.Context) ([]store.LLMProviderData, error) {
+	s.listTenant = store.TenantIDFromContext(ctx)
+	return s.masterProviders, nil
+}
+func (s *embeddingProviderStoreStub) ListAllProviders(context.Context) ([]store.LLMProviderData, error) {
+	s.listAllCalled = true
+	return s.allProviders, nil
+}
+func (s *embeddingProviderStoreStub) UpdateProvider(context.Context, uuid.UUID, map[string]any) error {
+	return nil
+}
+func (s *embeddingProviderStoreStub) DeleteProvider(context.Context, uuid.UUID) error { return nil }
+
+func TestResolveEmbeddingProviderAutoDetectUsesMasterTenantOnly(t *testing.T) {
+	embeddingSettings := json.RawMessage(`{"embedding":{"enabled":true}}`)
+	providerStore := &embeddingProviderStoreStub{
+		masterProviders: []store.LLMProviderData{{
+			TenantID:     store.MasterTenantID,
+			Name:         "master-embedding",
+			ProviderType: store.ProviderOpenAICompat,
+			APIBase:      "http://master.invalid/v1",
+			APIKey:       "master-key",
+			Enabled:      true,
+			Settings:     embeddingSettings,
+		}},
+		allProviders: []store.LLMProviderData{{
+			TenantID:     uuid.New(),
+			Name:         "tenant-controlled-endpoint",
+			ProviderType: store.ProviderOpenAICompat,
+			Enabled:      true,
+			Settings:     embeddingSettings,
+		}},
+	}
+
+	provider := resolveEmbeddingProvider(providerStore, nil, nil)
+	if provider == nil || provider.Name() != "master-embedding" {
+		t.Fatalf("resolveEmbeddingProvider() = %v, want master-embedding", provider)
+	}
+	if providerStore.listTenant != store.MasterTenantID {
+		t.Fatalf("ListProviders tenant = %s, want master tenant", providerStore.listTenant)
+	}
+	if providerStore.listAllCalled {
+		t.Fatal("ListAllProviders was called; cross-tenant auto-detect must stay disabled")
 	}
 }

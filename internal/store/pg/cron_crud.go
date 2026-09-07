@@ -81,7 +81,17 @@ func (s *PGCronStore) AddJob(ctx context.Context, name string, schedule store.Cr
 
 	s.cacheLoaded = false // invalidate cache
 
-	job, _ := s.GetJob(ctx, id.String())
+	// Read back with a tenant-consistent context. The INSERT above uses
+	// tenantIDForInsert(ctx), which falls back to MasterTenantID when the
+	// caller has no tenant in context (gateway-token / CLI / master-scope UI).
+	// scanJob, however, rejects a nil-tenant context with "tenant_id required".
+	// Reading back under the same tenant the row was inserted with keeps the
+	// insert and readback symmetric, so we never swallow the created job.
+	readCtx := store.WithTenantID(ctx, tenantIDForInsert(ctx))
+	job, ok := s.GetJob(readCtx, id.String())
+	if !ok || job == nil {
+		return nil, fmt.Errorf("cron job %s created but readback failed", id)
+	}
 	return job, nil
 }
 
@@ -101,7 +111,7 @@ func (s *PGCronStore) ListJobs(ctx context.Context, includeDisabled bool, agentI
 	q := `SELECT id, tenant_id, agent_id, user_id, name, enabled, schedule_kind, cron_expression, run_at, timezone,
 		 interval_ms, payload, delete_after_run, stateless, deliver, deliver_channel, deliver_to, wake_heartbeat,
 		 next_run_at, last_run_at, last_status, last_error,
-		 created_at, updated_at FROM cron_jobs WHERE 1=1`
+		 created_at, updated_at, provider_id, model FROM cron_jobs WHERE 1=1`
 
 	var args []any
 	argIdx := 1

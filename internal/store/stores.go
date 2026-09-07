@@ -15,6 +15,7 @@ type Stores struct {
 	Tracing               TracingStore
 	RunTimeline           RunTimelineStore
 	MCP                   MCPServerStore
+	MCPOAuthTokens        MCPOAuthTokenStore
 	ChannelInstances      ChannelInstanceStore
 	ConfigSecrets         ConfigSecretsStore
 	AgentLinks            AgentLinkStore
@@ -39,6 +40,7 @@ type Stores struct {
 	SkillEvolution        SkillEvolutionStore
 	SystemConfigs         SystemConfigStore
 	SubagentTasks         SubagentTaskStore
+	SubagentTaskRecovery  SubagentTaskRecoveryStore
 	Vault                 VaultStore
 	Episodic              EpisodicStore
 	EvolutionMetrics      EvolutionMetricsStore

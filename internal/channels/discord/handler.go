@@ -16,6 +16,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/channels/media"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/typing"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/systemmessages"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
 
@@ -34,7 +35,8 @@ func (c *Channel) handleMessage(_ *discordgo.Session, m *discordgo.MessageCreate
 	}
 
 	senderID := m.Author.ID
-	senderName := resolveDisplayName(m)
+	displayName := resolveDisplayName(m)
+	authorLabel := discordAuthorLabel(m.Author, m.Member)
 
 	channelID := m.ChannelID
 	isDM := m.GuildID == ""
@@ -70,7 +72,7 @@ func (c *Channel) handleMessage(_ *discordgo.Session, m *discordgo.MessageCreate
 		if !c.checkGroupPolicy(ctx, senderID, channelID, mentioned) {
 			slog.Debug("discord group message rejected by policy",
 				"user_id", senderID,
-				"username", senderName,
+				"username", displayName,
 			)
 			return
 		}
@@ -88,7 +90,7 @@ func (c *Channel) handleMessage(_ *discordgo.Session, m *discordgo.MessageCreate
 	if m.ReferencedMessage != nil {
 		author := "unknown"
 		if m.ReferencedMessage.Author != nil {
-			author = m.ReferencedMessage.Author.Username
+			author = discordAuthorLabel(m.ReferencedMessage.Author, m.ReferencedMessage.Member)
 		}
 		body := channels.Truncate(m.ReferencedMessage.Content, 500)
 		replyCtx := fmt.Sprintf("[Replying to %s]\n%s\n[/Replying]", author, body)
@@ -118,7 +120,7 @@ func (c *Channel) handleMessage(_ *discordgo.Session, m *discordgo.MessageCreate
 	// Process media: STT, document extraction, build tags
 	var mediaFiles []bus.MediaFile
 	if len(mediaList) > 0 {
-		var extraContent string
+		var extraContent strings.Builder
 		for i := range mediaList {
 			mi := &mediaList[i]
 
@@ -150,7 +152,7 @@ func (c *Channel) handleMessage(_ *discordgo.Session, m *discordgo.MessageCreate
 					if err != nil {
 						slog.Warn("discord: document extraction failed", "file", mi.FileName, "error", err)
 					} else if docContent != "" {
-						extraContent += "\n\n" + docContent
+						extraContent.WriteString("\n\n" + docContent)
 					}
 				}
 			}
@@ -174,8 +176,8 @@ func (c *Channel) handleMessage(_ *discordgo.Session, m *discordgo.MessageCreate
 			}
 		}
 
-		if extraContent != "" {
-			content += extraContent
+		if extraContent.String() != "" {
+			content += extraContent.String()
 		}
 	}
 
@@ -195,24 +197,27 @@ func (c *Channel) handleMessage(_ *discordgo.Session, m *discordgo.MessageCreate
 					mediaPaths = append(mediaPaths, mf.Path)
 				}
 			}
+			parentHistoryKey := c.parentHistoryKeyForChannel(ctx, channelID)
 			c.GroupHistory().Record(channelID, channels.HistoryEntry{
-				Sender:    senderName,
-				SenderID:  senderID,
-				Body:      content,
-				Media:     mediaPaths,
-				Timestamp: m.Timestamp,
-				MessageID: m.ID,
+				Sender:           authorLabel,
+				SenderID:         senderID,
+				Body:             content,
+				ParentHistoryKey: parentHistoryKey,
+				Media:            mediaPaths,
+				Timestamp:        m.Timestamp,
+				MessageID:        m.ID,
 			}, c.HistoryLimit())
 
 			// Collect contact even when bot is not mentioned (cache prevents DB spam).
 			if cc := c.ContactCollector(); cc != nil {
-				cc.EnsureContact(ctx, c.Type(), c.Name(), senderID, senderID, senderName, m.Author.Username, "group", "user", "", "")
+				cc.EnsureContact(ctx, c.Type(), c.Name(), senderID, senderID, displayName, m.Author.Username, "group", "user", "", "")
+				cc.EnsureContactWithMetadata(ctx, c.Type(), c.Name(), channelID, "", c.resolveCachedChannelTitle(channelID), "", "group", "group", "", "", c.cachedContactMetadata(channelID))
 			}
 
 			slog.Debug("discord group message recorded (no mention)",
 				"channel_id", channelID,
 				"user_id", senderID,
-				"username", senderName,
+				"username", displayName,
 			)
 			return
 		}
@@ -266,7 +271,7 @@ func (c *Channel) handleMessage(_ *discordgo.Session, m *discordgo.MessageCreate
 	// Build final content with group context.
 	finalContent := content
 	if peerKind == "group" {
-		annotated := fmt.Sprintf("[From: %s (<@%s>)]\n%s", senderName, senderID, content)
+		annotated := fmt.Sprintf("[From: %s (<@%s>)]\n%s", displayName, senderID, content)
 		if threadBackfill.Context != "" {
 			annotated = threadBackfill.Context + "\n\n" + annotated
 		}
@@ -290,35 +295,26 @@ func (c *Channel) handleMessage(_ *discordgo.Session, m *discordgo.MessageCreate
 		"message_id":      m.ID,
 		"user_id":         senderID,
 		"username":        m.Author.Username,
-		"display_name":    channels.SanitizeDisplayName(senderName),
+		"display_name":    channels.SanitizeDisplayName(displayName),
 		"guild_id":        m.GuildID,
 		"channel_id":      channelID,
 		"is_dm":           fmt.Sprintf("%t", isDM),
 		"placeholder_key": m.ID, // keyed by inbound message ID for placeholder lookup
 	}
 	if !isDM {
-		if title := c.resolveCachedChannelTitle(channelID); title != "" {
+		if title := c.resolveCachedGroupDisplayTitle(channelID); title != "" {
 			metadata[tools.MetaChatTitle] = title
 		}
 	}
 
-	// Voice agent routing
-	targetAgentID := c.AgentID()
-	if c.config.VoiceAgentID != "" {
-		for _, mi := range mediaList {
-			if mi.Type == media.TypeAudio || mi.Type == media.TypeVoice {
-				targetAgentID = c.config.VoiceAgentID
-				slog.Debug("discord: routing voice inbound to speaking agent",
-					"agent_id", targetAgentID, "media_type", mi.Type,
-				)
-				break
-			}
-		}
-	}
+	targetAgentID := c.targetAgentID(mediaList)
 
 	// Collect contact for processed messages (DM + group-mentioned).
 	if cc := c.ContactCollector(); cc != nil {
-		cc.EnsureContact(ctx, c.Type(), c.Name(), senderID, senderID, senderName, m.Author.Username, peerKind, "user", "", "")
+		cc.EnsureContact(ctx, c.Type(), c.Name(), senderID, senderID, displayName, m.Author.Username, peerKind, "user", "", "")
+		if peerKind == "group" {
+			cc.EnsureContactWithMetadata(ctx, c.Type(), c.Name(), channelID, "", c.resolveCachedChannelTitle(channelID), "", "group", "group", "", "", c.cachedContactMetadata(channelID))
+		}
 	}
 
 	// Publish directly to bus (to preserve MediaFile MIME types)
@@ -339,6 +335,22 @@ func (c *Channel) handleMessage(_ *discordgo.Session, m *discordgo.MessageCreate
 	if peerKind == "group" {
 		c.GroupHistory().Clear(channelID)
 	}
+}
+
+func (c *Channel) targetAgentID(mediaList []media.MediaInfo) string {
+	targetAgentID := c.AgentID()
+	if c.config.VoiceAgentID == "" {
+		return targetAgentID
+	}
+	for _, mi := range mediaList {
+		if mi.Type == media.TypeAudio || mi.Type == media.TypeVoice {
+			slog.Debug("discord: routing voice inbound to speaking agent",
+				"agent_id", c.config.VoiceAgentID, "media_type", mi.Type,
+			)
+			return c.config.VoiceAgentID
+		}
+	}
+	return targetAgentID
 }
 
 // checkGroupPolicy evaluates the group policy for a sender, with pairing support.
@@ -393,10 +405,11 @@ func (c *Channel) sendPairingReply(ctx context.Context, senderID, channelID stri
 		return
 	}
 
-	replyText := fmt.Sprintf(
-		"GoClaw: access not configured.\n\nYour Discord user ID: %s\n\nPairing code: %s\n\nAsk the bot owner to approve with:\n  goclaw pairing approve %s",
-		senderID, code, code,
-	)
+	replyText := c.SystemMessage("", systemmessages.KeyPairingAccountRequired, systemmessages.Vars{
+		"platform":  "Discord",
+		"sender_id": senderID,
+		"code":      code,
+	})
 
 	if _, err := c.session.ChannelMessageSend(channelID, replyText); err != nil {
 		slog.Warn("failed to send discord pairing reply", "error", err)
@@ -409,13 +422,68 @@ func (c *Channel) sendPairingReply(ctx context.Context, senderID, channelID stri
 // resolveDisplayName returns the best available display name for a Discord message author.
 // Priority: server nickname > global display name > username.
 func resolveDisplayName(m *discordgo.MessageCreate) string {
-	if m.Member != nil && m.Member.Nick != "" {
-		return m.Member.Nick
+	if m == nil {
+		return ""
 	}
-	if m.Author.GlobalName != "" {
-		return m.Author.GlobalName
+	return discordDisplayName(m.Author, m.Member)
+}
+
+func discordAuthorLabel(user *discordgo.User, member *discordgo.Member) string {
+	display := discordDisplayName(user, member)
+	if display == "" {
+		display = "unknown"
 	}
-	return m.Author.Username
+	handle := discordHandle(user)
+	if handle == "" && user != nil {
+		handle = user.Username
+	}
+	if user == nil || user.ID == "" {
+		if handle == "" {
+			return display
+		}
+		return fmt.Sprintf("%s (@%s)", display, handle)
+	}
+	if handle == "" {
+		return fmt.Sprintf("%s (id: %s)", display, user.ID)
+	}
+	return fmt.Sprintf("%s (@%s, id: %s)", display, handle, user.ID)
+}
+
+func discordDisplayName(user *discordgo.User, member *discordgo.Member) string {
+	if member != nil {
+		if member.Nick != "" {
+			return member.Nick
+		}
+		if member.User != nil {
+			if member.User.GlobalName != "" {
+				return member.User.GlobalName
+			}
+			if member.User.Username != "" {
+				return member.User.Username
+			}
+		}
+	}
+	if user == nil {
+		return ""
+	}
+	if user.GlobalName != "" {
+		return user.GlobalName
+	}
+	return user.Username
+}
+
+func discordHandle(user *discordgo.User) string {
+	if user == nil {
+		return ""
+	}
+	handle := strings.TrimSpace(user.Username)
+	if handle == "" {
+		return ""
+	}
+	if user.Discriminator != "" && user.Discriminator != "0" {
+		return handle + "#" + user.Discriminator
+	}
+	return handle
 }
 
 func (c *Channel) resolveCachedChannelTitle(channelID string) string {
@@ -427,4 +495,109 @@ func (c *Channel) resolveCachedChannelTitle(channelID string) string {
 		return ""
 	}
 	return channels.SanitizeDisplayName(ch.Name)
+}
+
+func (c *Channel) cachedContactMetadata(channelID string) map[string]string {
+	if c == nil || c.session == nil || c.session.State == nil || channelID == "" {
+		return nil
+	}
+	ch, err := c.session.State.Channel(channelID)
+	if err != nil || ch == nil {
+		return nil
+	}
+	return discordContactMetadata(ch, func(id string) *discordgo.Channel {
+		parent, _ := c.session.State.Channel(id)
+		return parent
+	})
+}
+
+func (c *Channel) ResolveGroupTitle(_ context.Context, channelID string) (string, error) {
+	if title := c.resolveCachedChannelTitle(channelID); title != "" {
+		return title, nil
+	}
+	return "", fmt.Errorf("discord channel title not cached")
+}
+
+func (c *Channel) ResolveGroupTitles(ctx context.Context, channelIDs []string) (map[string]string, error) {
+	if c == nil || c.session == nil || len(channelIDs) == 0 {
+		return map[string]string{}, nil
+	}
+	remaining := make(map[string]struct{}, len(channelIDs))
+	titles := make(map[string]string, len(channelIDs))
+	for _, id := range channelIDs {
+		if id == "" {
+			continue
+		}
+		if title := c.resolveCachedChannelTitle(id); title != "" {
+			titles[id] = title
+			continue
+		}
+		remaining[id] = struct{}{}
+	}
+	if len(remaining) == 0 {
+		return titles, nil
+	}
+
+	var guildIDs []string
+	if c.session.State != nil {
+		c.session.State.RLock()
+		guildIDs = make([]string, 0, len(c.session.State.Guilds))
+		for _, guild := range c.session.State.Guilds {
+			if guild != nil && guild.ID != "" {
+				guildIDs = append(guildIDs, guild.ID)
+			}
+		}
+		c.session.State.RUnlock()
+	}
+
+	for _, guildID := range guildIDs {
+		select {
+		case <-ctx.Done():
+			return titles, nil
+		default:
+		}
+		lookupCtx, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
+		guildChannels, err := c.session.GuildChannels(guildID, discordgo.WithContext(lookupCtx))
+		cancel()
+		if err != nil {
+			slog.Debug("discord channel title batch lookup failed", "guild_id", guildID, "error", err)
+			continue
+		}
+		for _, ch := range guildChannels {
+			if ch == nil {
+				continue
+			}
+			if _, ok := remaining[ch.ID]; !ok {
+				continue
+			}
+			if title := channels.SanitizeDisplayName(ch.Name); title != "" {
+				titles[ch.ID] = title
+				delete(remaining, ch.ID)
+			}
+		}
+		if len(remaining) == 0 {
+			break
+		}
+	}
+	for id := range remaining {
+		select {
+		case <-ctx.Done():
+			return titles, nil
+		default:
+		}
+		lookupCtx, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
+		ch, err := c.session.Channel(id, discordgo.WithContext(lookupCtx))
+		cancel()
+		if err != nil {
+			slog.Debug("discord channel title direct lookup failed", "channel_id", id, "error", err)
+			continue
+		}
+		if ch == nil {
+			continue
+		}
+		if title := channels.SanitizeDisplayName(ch.Name); title != "" {
+			titles[id] = title
+		}
+	}
+	return titles, nil
 }

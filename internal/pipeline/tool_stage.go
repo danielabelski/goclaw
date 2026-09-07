@@ -14,6 +14,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/hooks"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/tracing"
 )
 
 const (
@@ -50,6 +51,15 @@ func (s *ToolStage) Execute(ctx context.Context, state *RunState) error {
 		return fmt.Errorf("ExecuteToolCall callback not configured")
 	}
 
+	// Surface this iteration's resolved tool allowlist to the tools themselves,
+	// so a tool can introspect whether a sibling tool is available to the
+	// calling agent (e.g. use_skill inlining skill content when read_file
+	// isn't granted). Covers both the sequential and parallel dispatch paths
+	// below since both derive their ctx from this one.
+	if state.Tool.AllowedTools != nil {
+		ctx = store.WithAvailableToolNames(ctx, state.Tool.AllowedTools)
+	}
+
 	// Parallel path: separate I/O (parallel) from state mutation (sequential).
 	// Requires both ExecuteToolRaw and ProcessToolResult callbacks.
 	if len(toolCalls) > 1 && s.canExecuteParallel(toolCalls) && !s.batchExceedsBudget(state, toolCalls) {
@@ -58,14 +68,20 @@ func (s *ToolStage) Execute(ctx context.Context, state *RunState) error {
 	}
 
 	// Sequential fallback: ExecuteToolCall handles both I/O and state mutation.
+	// Non-tool messages (warnings, nudges) are deferred until all tool results
+	// are emitted to maintain correct tool_result grouping for OpenAI-compatible
+	// providers. See https://github.com/nextlevelbuilder/goclaw/issues/1177
 	cumulativeWaitMs := 0
+	var deferredNonTool []providers.Message
 	for _, tc := range toolCalls {
 		if s.shouldStopBeforeTool(ctx, state) {
+			appendDeferredMessages(state, deferredNonTool)
 			return nil
 		}
 		if s.deps.SequentialToolCall != nil && s.deps.SequentialToolCall(tc) {
 			cumulativeWaitMs += toolCallTimeMs(tc)
 			if cumulativeWaitMs > maxSequentialWaitBatchMs {
+				appendDeferredMessages(state, deferredNonTool)
 				s.result = AbortRun
 				return nil
 			}
@@ -82,14 +98,16 @@ func (s *ToolStage) Execute(ctx context.Context, state *RunState) error {
 		if err != nil {
 			return fmt.Errorf("execute tool %s: %w", tc.Name, err)
 		}
-		for _, msg := range msgs {
-			state.Messages.AppendPending(msg)
-		}
+		appendToolBatchMessages(state, msgs, &deferredNonTool)
 		state.Tool.TotalToolCalls++
 
 		// Hook: async PostToolUse — fire and forget with detached context.
+		// Parent the hook span to the tool span so it nests under the tool call.
 		if s.deps.Hooks != nil {
 			detached := context.WithoutCancel(ctx)
+			if state.CurrentToolSpanID != nil {
+				detached = tracing.WithParentSpanID(detached, *state.CurrentToolSpanID)
+			}
 			go s.deps.FireHook(detached, hooks.Event{ //nolint:errcheck
 				EventID:   uuid.NewString(),
 				SessionID: state.Input.SessionKey,
@@ -102,15 +120,18 @@ func (s *ToolStage) Execute(ctx context.Context, state *RunState) error {
 		}
 
 		if state.Tool.LoopKilled {
+			appendDeferredMessages(state, deferredNonTool)
 			s.result = BreakLoop
 			return nil
 		}
 		if ctx.Err() != nil {
+			appendDeferredMessages(state, deferredNonTool)
 			s.result = AbortRun
 			return nil
 		}
 	}
 
+	appendDeferredMessages(state, deferredNonTool)
 	s.checkExitConditions(state)
 	return nil
 }
@@ -155,11 +176,18 @@ func (s *ToolStage) preflightToolCall(ctx context.Context, state *RunState, tc p
 				Role:       "tool",
 				Content:    reason,
 				ToolCallID: tc.ID,
+				ToolName:   tc.Name,
 				IsError:    true,
 			}
 		}
 	}
-	r, _ := s.deps.FireHook(ctx, hooks.Event{
+	// Parent the pre_tool_use hook span to the current LLM-call span so it nests
+	// alongside the tool call it gates.
+	hookCtx := ctx
+	if state.CurrentLLMSpanID != nil {
+		hookCtx = tracing.WithParentSpanID(ctx, *state.CurrentLLMSpanID)
+	}
+	r, _ := s.deps.FireHook(hookCtx, hooks.Event{
 		EventID:   uuid.NewString(),
 		SessionID: state.Input.SessionKey,
 		TenantID:  store.TenantIDFromContext(ctx),
@@ -173,6 +201,7 @@ func (s *ToolStage) preflightToolCall(ctx context.Context, state *RunState, tc p
 			Role:       "tool",
 			Content:    "Hook blocked: pre_tool_use",
 			ToolCallID: tc.ID,
+			ToolName:   tc.Name,
 		}
 	}
 	if r.UpdatedToolInput != nil {
@@ -265,7 +294,11 @@ func (s *ToolStage) executeParallel(ctx context.Context, state *RunState, prefli
 				results[idx] = rawResult{index: item.index, tc: item.tc, err: ctx.Err()}
 				return
 			}
-			msg, rawData, err := s.deps.ExecuteToolRaw(ctx, item.tc)
+			itemCtx := ctx
+			if state.CurrentLLMSpanID != nil {
+				itemCtx = tracing.WithParentSpanID(ctx, *state.CurrentLLMSpanID)
+			}
+			msg, rawData, err := s.deps.ExecuteToolRaw(itemCtx, item.tc)
 			results[idx] = rawResult{index: item.index, tc: item.tc, msg: msg, rawData: rawData, err: err}
 		}(i, item)
 	}
@@ -277,11 +310,13 @@ func (s *ToolStage) executeParallel(ctx context.Context, state *RunState, prefli
 		"limit", defaultParallelToolCallLimit,
 		"duration_ms", time.Since(startedAt).Milliseconds())
 
-	// Phase 2: sequential state mutation (safe, deterministic order)
+	// Phase 2: sequential state mutation (safe, deterministic order).
+	// Non-tool messages deferred until all tool results are emitted (#1177).
 	resultByIndex := make(map[int]rawResult, len(results))
 	for _, r := range results {
 		resultByIndex[r.index] = r
 	}
+	var deferredNonTool []providers.Message
 	for _, item := range preflight.ordered {
 		tc := item.tc
 		if item.blocked != nil {
@@ -297,15 +332,20 @@ func (s *ToolStage) executeParallel(ctx context.Context, state *RunState, prefli
 			return fmt.Errorf("execute tool %s: %w", tc.Name, r.err)
 		}
 		processed := s.deps.ProcessToolResult(ctx, state, tc, r.msg, r.rawData)
-		for _, msg := range processed {
-			state.Messages.AppendPending(msg)
-		}
+		appendToolBatchMessages(state, processed, &deferredNonTool)
 		state.Tool.TotalToolCalls++
 
 		// Hook: async PostToolUse for parallel path — fire and forget.
 		// PreToolUse already ran in preflight before any raw I/O was scheduled.
+		// The parallel tool I/O is parented to the LLM span (see ExecuteToolRaw
+		// call site above), so parent the parallel hook span there too — the
+		// per-tool span ID is not plumbed back to the pipeline from the opaque
+		// rawData payload, so the LLM span is the correct shared ancestor.
 		if s.deps.Hooks != nil {
 			detached := context.WithoutCancel(ctx)
+			if state.CurrentLLMSpanID != nil {
+				detached = tracing.WithParentSpanID(detached, *state.CurrentLLMSpanID)
+			}
 			go s.deps.FireHook(detached, hooks.Event{ //nolint:errcheck
 				EventID:   uuid.NewString(),
 				SessionID: state.Input.SessionKey,
@@ -318,13 +358,36 @@ func (s *ToolStage) executeParallel(ctx context.Context, state *RunState, prefli
 		}
 
 		if state.Tool.LoopKilled {
+			appendDeferredMessages(state, deferredNonTool)
 			s.result = BreakLoop
 			return nil
 		}
 	}
 
+	appendDeferredMessages(state, deferredNonTool)
 	s.checkExitConditions(state)
 	return nil
+}
+
+// appendToolBatchMessages appends tool-role messages immediately and defers
+// non-tool messages (warnings, nudges) so that all tool results for a single
+// assistant turn stay contiguous. This prevents OpenAI-compatible providers
+// from rejecting the transcript due to interleaved user messages (#1177).
+func appendToolBatchMessages(state *RunState, msgs []providers.Message, deferred *[]providers.Message) {
+	for _, msg := range msgs {
+		if msg.Role == "tool" {
+			state.Messages.AppendPending(msg)
+		} else {
+			*deferred = append(*deferred, msg)
+		}
+	}
+}
+
+// appendDeferredMessages flushes deferred non-tool messages into pending.
+func appendDeferredMessages(state *RunState, deferred []providers.Message) {
+	for _, msg := range deferred {
+		state.Messages.AppendPending(msg)
+	}
 }
 
 // checkExitConditions checks read-only streak and tool budget.

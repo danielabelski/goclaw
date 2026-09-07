@@ -29,9 +29,6 @@ type BuiltinToolStore interface {
 	Get(ctx context.Context, name string) (*BuiltinToolDef, error)
 	Update(ctx context.Context, name string, updates map[string]any) error
 	Seed(ctx context.Context, tools []BuiltinToolDef) error
-	// Upsert inserts/updates tools without reconcile — safe for additive fork-specific tools.
-	// Does NOT delete rows not in the provided list.
-	Upsert(ctx context.Context, tools []BuiltinToolDef) error
 	ListEnabled(ctx context.Context) ([]BuiltinToolDef, error)
 	GetSettings(ctx context.Context, name string) (json.RawMessage, error)
 }

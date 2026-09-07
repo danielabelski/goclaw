@@ -17,14 +17,18 @@ import (
 // fakeResolver returns a static provider + model. Counts resolve calls for
 // cache-hit assertions.
 type fakeResolver struct {
-	prov     providers.Provider
-	model    string
-	calls    atomic.Int32
-	resolveErr error
+	prov              providers.Provider
+	model             string
+	calls             atomic.Int32
+	resolveErr        error
+	preferredProvider string
+	preferredModel    string
 }
 
-func (f *fakeResolver) ResolveForHook(_ context.Context, _ uuid.UUID, _ string) (providers.Provider, string, error) {
+func (f *fakeResolver) ResolveForHook(_ context.Context, _ uuid.UUID, preferredProvider, preferredModel string) (providers.Provider, string, error) {
 	f.calls.Add(1)
+	f.preferredProvider = preferredProvider
+	f.preferredModel = preferredModel
 	if f.resolveErr != nil {
 		return nil, "", f.resolveErr
 	}
@@ -112,6 +116,42 @@ func TestPrompt_Allow_StructuredOutput(t *testing.T) {
 	}
 	if dec != hooks.DecisionAllow {
 		t.Errorf("decision=%q, want allow", dec)
+	}
+}
+
+func TestPrompt_ExplicitProviderPassedToResolver(t *testing.T) {
+	prov := &fakeProvider{nextResp: okResp("allow")}
+	resolver := &fakeResolver{prov: prov, model: "gpt-5.6-terra"}
+	h := &handlers.PromptHandler{Resolver: resolver}
+	cfg := makePromptCfg(t)
+	cfg.Config["provider"] = "cppai"
+	cfg.Config["model"] = "gpt-5.6-terra"
+
+	dec, err := h.Execute(context.Background(), cfg, makePromptEv())
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if dec != hooks.DecisionAllow {
+		t.Fatalf("decision=%q, want allow", dec)
+	}
+	if resolver.preferredProvider != "cppai" || resolver.preferredModel != "gpt-5.6-terra" {
+		t.Fatalf("resolver preferences=(%q, %q), want (cppai, gpt-5.6-terra)", resolver.preferredProvider, resolver.preferredModel)
+	}
+}
+
+func TestPrompt_ExplicitProviderWithoutModelUsesProviderDefault(t *testing.T) {
+	prov := &fakeProvider{nextResp: okResp("allow")}
+	resolver := &fakeResolver{prov: prov, model: "provider-default"}
+	h := &handlers.PromptHandler{Resolver: resolver, DefaultModel: "haiku"}
+	cfg := makePromptCfg(t)
+	cfg.Config["provider"] = "cppai"
+	delete(cfg.Config, "model")
+
+	if _, err := h.Execute(context.Background(), cfg, makePromptEv()); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if resolver.preferredModel != "" {
+		t.Fatalf("preferred model=%q, want empty provider-default sentinel", resolver.preferredModel)
 	}
 }
 

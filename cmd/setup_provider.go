@@ -47,10 +47,11 @@ func addProvider() {
 	typeOptions := []SelectOption[string]{
 		{"Anthropic", "anthropic"},
 		{"OpenAI", "openai"},
+		{"Atlas Cloud", "atlascloud"},
 		{"API Route", "api_route"},
 		{"OpenRouter", "openrouter"},
 		{"DashScope (Alibaba)", "dashscope"},
-		{"OpenAI-compatible", "openai-compat"},
+		{"OpenAI-compatible", "openai_compat"},
 	}
 	providerType, err := promptSelect("Provider type", typeOptions, 0)
 	if err != nil {
@@ -69,9 +70,11 @@ func addProvider() {
 	}
 
 	baseURL := ""
-	if providerType == "openai-compat" || providerType == "api_route" {
+	if providerType == "openai_compat" || providerType == "atlascloud" || providerType == "api_route" {
 		defaultURL := ""
-		if providerType == "api_route" {
+		if providerType == "atlascloud" {
+			defaultURL = "https://api.atlascloud.ai/v1"
+		} else if providerType == "api_route" {
 			defaultURL = "https://global.api-route.com/v1"
 		}
 		baseURL, err = promptString("Base URL", "e.g. https://api.example.com/v1", defaultURL)

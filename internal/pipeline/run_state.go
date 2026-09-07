@@ -2,6 +2,9 @@ package pipeline
 
 import (
 	"context"
+	"sync"
+
+	"github.com/google/uuid"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
@@ -37,6 +40,16 @@ type RunState struct {
 	Iteration int
 	RunID     string
 	ExitCode  StageResult
+
+	// CurrentLLMSpanID is the most recent LLM-call span in this run; tool spans parent to it.
+	CurrentLLMSpanID *uuid.UUID
+	// CurrentToolSpanID is the most recent tool-call span; post-tool-use hook spans parent to it.
+	CurrentToolSpanID *uuid.UUID
+
+	// Calls is the per-call usage breakdown (LLM calls + tool-internal LLM calls),
+	// appended during the run. Guarded by callsMu for the parallel tool path.
+	Calls   []providers.CallUsage
+	callsMu sync.Mutex
 }
 
 // NewRunState creates a RunState with identity fields set.
@@ -51,6 +64,13 @@ func NewRunState(input *RunInput, ws *workspace.WorkspaceContext, model string, 
 	}
 }
 
+// AppendCall records one call's usage in the run breakdown (thread-safe).
+func (rs *RunState) AppendCall(c providers.CallUsage) {
+	rs.callsMu.Lock()
+	rs.Calls = append(rs.Calls, c)
+	rs.callsMu.Unlock()
+}
+
 // BuildResult converts final RunState into a RunResult.
 func (rs *RunState) BuildResult() *RunResult {
 	return &RunResult{
@@ -58,6 +78,7 @@ func (rs *RunState) BuildResult() *RunResult {
 		Content:        rs.Observe.FinalContent,
 		Thinking:       rs.Observe.FinalThinking,
 		TotalUsage:     rs.Think.TotalUsage,
+		LastUsage:      rs.Think.LastUsage,
 		Iterations:     rs.Iteration,
 		ToolCalls:      rs.Tool.TotalToolCalls,
 		LoopKilled:     rs.Tool.LoopKilled,
@@ -66,45 +87,47 @@ func (rs *RunState) BuildResult() *RunResult {
 		Deliverables:   rs.Tool.Deliverables,
 		BlockReplies:   rs.Observe.BlockReplies,
 		LastBlockReply: rs.Observe.LastBlockReply,
+		Calls:          rs.Calls,
 	}
 }
 
 // RunInput is the pipeline's view of a run request.
 // Converted from agent.RunRequest by the adapter in Phase 8.
 type RunInput struct {
-	SessionKey         string
-	Message            string
-	Media              []bus.MediaFile
-	ForwardMedia       []bus.MediaFile
-	Channel            string
-	ChannelType        string
-	BitrixPortalDomain string // bitrix24-only: portal domain for entity URL construction
-	ChatTitle          string
-	ChatID             string
-	PeerKind           string
-	RunID              string
-	UserID             string
-	SenderID           string
-	SenderName         string
-	Stream             bool
-	ExtraSystemPrompt  string
-	SkillFilter        []string
-	HistoryLimit       int
-	ToolAllow          []string
-	LightContext       bool
-	RunKind            string
-	DelegationID       string
-	TeamID             string
-	TeamTaskID         string
-	ParentAgentID      string
-	MaxIterations      int
-	ModelOverride      string
-	HideInput          bool
-	ContentSuffix      string
-	LeaderAgentID      string
-	WorkspaceChannel   string
-	WorkspaceChatID    string
-	TeamWorkspace      string
+	SessionKey                 string
+	Message                    string
+	Media                      []bus.MediaFile
+	ForwardMedia               []bus.MediaFile
+	Channel                    string
+	ChannelType                string
+	BitrixPortalDomain         string // bitrix24-only: portal domain for entity URL construction
+	ChatTitle                  string
+	ChatID                     string
+	PeerKind                   string
+	RunID                      string
+	UserID                     string
+	SenderID                   string
+	SenderName                 string
+	Stream                     bool
+	ExtraSystemPrompt          string
+	SkillFilter                []string
+	HistoryLimit               int
+	ToolAllow                  []string
+	TelegramManagerPermissions []string
+	LightContext               bool
+	RunKind                    string
+	DelegationID               string
+	TeamID                     string
+	TeamTaskID                 string
+	ParentAgentID              string
+	MaxIterations              int
+	ModelOverride              string
+	HideInput                  bool
+	ContentSuffix              string
+	LeaderAgentID              string
+	WorkspaceChannel           string
+	WorkspaceChatID            string
+	TeamWorkspace              string
 }
 
 // MediaResult represents a media file produced during tool execution.

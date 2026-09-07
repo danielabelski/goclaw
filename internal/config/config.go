@@ -44,6 +44,7 @@ func (f *FlexibleStringSlice) UnmarshalJSON(data []byte) error {
 // Config is the root configuration for the GoClaw Gateway.
 type Config struct {
 	DataDir   string          `json:"data_dir,omitempty"` // persistent data directory (default: ~/.goclaw/data)
+	Branding  BrandingConfig  `json:"branding,omitempty"`
 	Agents    AgentsConfig    `json:"agents"`
 	Channels  ChannelsConfig  `json:"channels"`
 	Providers ProvidersConfig `json:"providers"`
@@ -60,7 +61,41 @@ type Config struct {
 	Bindings  []AgentBinding  `json:"bindings,omitempty"`
 	Hooks     HooksConfig     `json:"hooks"`
 	Packages  PackagesConfig  `json:"packages"` // runtime package mgmt (GitHub updater)
+	Messages  SystemMsgConfig `json:"system_messages,omitempty"`
 	mu        sync.RWMutex
+}
+
+// BrandingConfig customizes public app metadata and media used by the web UI.
+// URL fields may point to external URLs or to uploaded /branding-assets/* files.
+type BrandingConfig struct {
+	AppName           string `json:"app_name,omitempty"`
+	AppShortName      string `json:"app_short_name,omitempty"`
+	MetaTitle         string `json:"meta_title,omitempty"`
+	MetaDescription   string `json:"meta_description,omitempty"`
+	MetaKeywords      string `json:"meta_keywords,omitempty"`
+	LogoURL           string `json:"logo_url,omitempty"`
+	FaviconURL        string `json:"favicon_url,omitempty"`
+	AppleTouchIconURL string `json:"apple_touch_icon_url,omitempty"`
+	OGTitle           string `json:"og_title,omitempty"`
+	OGDescription     string `json:"og_description,omitempty"`
+	OGImageURL        string `json:"og_image_url,omitempty"`
+	ThemeColor        string `json:"theme_color,omitempty"`
+}
+
+// HasValues reports whether any branding override is configured.
+func (b BrandingConfig) HasValues() bool {
+	return strings.TrimSpace(b.AppName) != "" ||
+		strings.TrimSpace(b.AppShortName) != "" ||
+		strings.TrimSpace(b.MetaTitle) != "" ||
+		strings.TrimSpace(b.MetaDescription) != "" ||
+		strings.TrimSpace(b.MetaKeywords) != "" ||
+		strings.TrimSpace(b.LogoURL) != "" ||
+		strings.TrimSpace(b.FaviconURL) != "" ||
+		strings.TrimSpace(b.AppleTouchIconURL) != "" ||
+		strings.TrimSpace(b.OGTitle) != "" ||
+		strings.TrimSpace(b.OGDescription) != "" ||
+		strings.TrimSpace(b.OGImageURL) != "" ||
+		strings.TrimSpace(b.ThemeColor) != ""
 }
 
 // PackagesConfig tunes the runtime package update flow (Phase 1: GitHub
@@ -82,6 +117,38 @@ type PackagesConfig struct {
 }
 
 // UpdatesCheckTTLDuration parses UpdatesCheckTTL returning 1h on empty/invalid.
+// SystemMsgConfig customizes operator-facing system messages that GoClaw
+// sends directly, outside normal LLM replies. Message templates use
+// {{variable}} placeholders and may be overridden per locale.
+type SystemMsgConfig struct {
+	DefaultLocale string                            `json:"default_locale,omitempty"`
+	Messages      map[string]LocalizedSystemMessage `json:"messages,omitempty"`
+}
+
+// LocalizedSystemMessage maps locale code ("en", "vi", "zh", "ko", "ru") to a
+// template override for one system message key.
+type LocalizedSystemMessage map[string]string
+
+// Clone returns a deep copy safe for snapshots and ReplaceFrom.
+func (s SystemMsgConfig) Clone() SystemMsgConfig {
+	out := SystemMsgConfig{DefaultLocale: strings.TrimSpace(s.DefaultLocale)}
+	if len(s.Messages) == 0 {
+		return out
+	}
+	out.Messages = make(map[string]LocalizedSystemMessage, len(s.Messages))
+	for key, byLocale := range s.Messages {
+		if len(byLocale) == 0 {
+			continue
+		}
+		cp := make(LocalizedSystemMessage, len(byLocale))
+		for locale, template := range byLocale {
+			cp[locale] = template
+		}
+		out.Messages[key] = cp
+	}
+	return out
+}
+
 func (p PackagesConfig) UpdatesCheckTTLDuration() time.Duration {
 	if p.UpdatesCheckTTL == "" {
 		return time.Hour
@@ -263,8 +330,10 @@ type AgentDefaults struct {
 // Matching TS agents.defaults.compaction.
 type CompactionConfig struct {
 	ReserveTokensFloor int                `json:"reserveTokensFloor,omitempty"` // min reserve tokens (default 20000)
-	MaxHistoryShare    float64            `json:"maxHistoryShare,omitempty"`    // max share of context for history (default 0.85)
+	MaxHistoryShare    float64            `json:"maxHistoryShare,omitempty"`    // max share of context for history-only post-turn compaction (default 0.85)
+	MaxRequestShare    float64            `json:"maxRequestShare,omitempty"`    // max share of context for the final request sent to the model (default 0.85)
 	KeepLastMessages   int                `json:"keepLastMessages,omitempty"`   // messages to keep after compaction (default 4)
+	TimeoutSeconds     int                `json:"timeoutSeconds,omitempty"`     // summarization timeout in seconds (default 120)
 	MemoryFlush        *MemoryFlushConfig `json:"memoryFlush,omitempty"`        // pre-compaction flush
 }
 
@@ -358,6 +427,7 @@ type SandboxConfig struct {
 	User           string `json:"user,omitempty"`             // container user (e.g. "1000:1000", "nobody")
 	TmpfsSizeMB    int    `json:"tmpfs_size_mb,omitempty"`    // default tmpfs size in MB (0 = Docker default)
 	MaxOutputBytes int    `json:"max_output_bytes,omitempty"` // limit exec output capture (default 1MB)
+	Workdir        string `json:"workdir,omitempty"`          // container workdir + workspace mount target (default "/workspace")
 
 	// Pruning (matching TS SandboxPruneSettings)
 	IdleHours        int `json:"idle_hours,omitempty"`         // prune containers idle > N hours (default 24)
@@ -431,6 +501,9 @@ func (sc *SandboxConfig) ToSandboxConfig() sandbox.Config {
 	if sc.MaxOutputBytes > 0 {
 		cfg.MaxOutputBytes = sc.MaxOutputBytes
 	}
+	if sc.Workdir != "" {
+		cfg.Workdir = sc.Workdir
+	}
 
 	// Pruning
 	if sc.IdleHours > 0 {
@@ -479,10 +552,15 @@ type CronConfig struct {
 	RetryMaxDelay   string `json:"retry_max_delay,omitempty"`  // maximum backoff delay (default "30s", Go duration)
 	DefaultTimezone string `json:"default_timezone,omitempty"` // IANA timezone for cron expressions when not set per-job (e.g. "Asia/Ho_Chi_Minh")
 	JobTimeout      string `json:"job_timeout,omitempty"`      // max duration per cron job execution (default "10m", Go duration)
+	CommandEnabled  bool   `json:"command_enabled,omitempty"`  // allow deterministic shell-command cron payloads (kind="command"). Default false. These run inside the gateway process with its privileges — enable only on trusted deployments.
+	CommandTimeout  string `json:"command_timeout,omitempty"`  // default per-command wall-clock timeout when a job sets none (default "5m", Go duration)
 }
 
 // DefaultJobTimeout is the fallback timeout for cron job execution.
 const DefaultJobTimeout = 10 * time.Minute
+
+// DefaultCommandTimeout is the fallback per-command timeout for command cron payloads.
+const DefaultCommandTimeout = 5 * time.Minute
 
 // JobTimeoutDuration returns the configured job timeout or the default (10m).
 func (cc CronConfig) JobTimeoutDuration() time.Duration {
@@ -494,6 +572,19 @@ func (cc CronConfig) JobTimeoutDuration() time.Duration {
 		slog.Warn("cron: invalid job_timeout, using default", "value", cc.JobTimeout, "default", DefaultJobTimeout)
 	}
 	return DefaultJobTimeout
+}
+
+// CommandTimeoutDuration returns the configured default per-command timeout or
+// the default (5m). A per-job timeoutSeconds, when set, overrides this.
+func (cc CronConfig) CommandTimeoutDuration() time.Duration {
+	if cc.CommandTimeout != "" {
+		d, err := time.ParseDuration(cc.CommandTimeout)
+		if err == nil && d > 0 {
+			return d
+		}
+		slog.Warn("cron: invalid command_timeout, using default", "value", cc.CommandTimeout, "default", DefaultCommandTimeout)
+	}
+	return DefaultCommandTimeout
 }
 
 // ToRetryConfig converts CronConfig to cron.RetryConfig with defaults applied.
@@ -515,10 +606,10 @@ func (cc CronConfig) ToRetryConfig() cron.RetryConfig {
 	return cfg
 }
 
-// SubagentsConfig configures the subagent system (matching TS agents.defaults.subagents).
+// SubagentsConfig configures the GoClaw subagent system.
 // All fields optional — zero values mean "use default".
 type SubagentsConfig struct {
-	MaxConcurrent       int    `json:"maxConcurrent,omitempty"`       // default 8 (TS: DEFAULT_SUBAGENT_MAX_CONCURRENT)
+	MaxConcurrent       int    `json:"maxConcurrent,omitempty"`       // executing descendants per root agent; default 20
 	MaxSpawnDepth       int    `json:"maxSpawnDepth,omitempty"`       // default 1, range 1-5
 	MaxChildrenPerAgent int    `json:"maxChildrenPerAgent,omitempty"` // default 5, range 1-20
 	ArchiveAfterMinutes int    `json:"archiveAfterMinutes,omitempty"` // default 60
@@ -551,6 +642,7 @@ func (c *Config) ReplaceFrom(src *Config) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.DataDir = src.DataDir
+	c.Branding = src.Branding
 	c.Agents = src.Agents
 	c.Channels = src.Channels
 	c.Providers = src.Providers
@@ -564,6 +656,7 @@ func (c *Config) ReplaceFrom(src *Config) {
 	c.Telemetry = src.Telemetry
 	c.Tailscale = src.Tailscale
 	c.Bindings = src.Bindings
+	c.Messages = src.Messages.Clone()
 }
 
 // Clone returns a deep copy of the config while holding the read lock.
@@ -582,6 +675,14 @@ func (c *Config) Clone() *Config {
 	return cp
 }
 
+// BrandingSnapshot returns the current branding overrides without exposing the
+// mutable root config to HTTP handlers.
+func (c *Config) BrandingSnapshot() BrandingConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Branding
+}
+
 // ShellDenyGroupsSnapshot returns a copy of the current global shell deny-group
 // overrides. Callers can safely resolve patterns without racing config reloads.
 func (c *Config) ShellDenyGroupsSnapshot() map[string]bool {
@@ -594,6 +695,14 @@ func (c *Config) ShellDenyGroupsSnapshot() map[string]bool {
 	groups := make(map[string]bool, len(c.Tools.ShellDenyGroups))
 	maps.Copy(groups, c.Tools.ShellDenyGroups)
 	return groups
+}
+
+// SystemMessagesSnapshot returns a deep copy of configured system-message
+// overrides without exposing mutable config state to long-lived channels.
+func (c *Config) SystemMessagesSnapshot() SystemMsgConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Messages.Clone()
 }
 
 // IdentityConfig defines agent persona / display identity.

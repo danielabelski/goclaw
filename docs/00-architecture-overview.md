@@ -115,7 +115,7 @@ flowchart TD
 | `internal/skills/` | SKILL.md loader (5-tier hierarchy) + BM25 search + hot-reload via fsnotify |
 | `internal/channels/` | Channel manager + adapters: Telegram (forum topics, STT, bot commands), Feishu/Lark (streaming cards, media), Zalo OA, Zalo Personal, Discord, WhatsApp, Slack |
 | `internal/mcp/` | MCP server bridge (stdio, SSE, streamable-HTTP transports) |
-| `internal/scheduler/` | Lane-based concurrency control (main, subagent, cron, team lanes) with per-session serialization. Per-edition rate limits (`MaxSubagentConcurrent`, `MaxSubagentDepth`) with tenant-scoped concurrency |
+| `internal/scheduler/` | Lane-based concurrency control (main, subagent, cron, team lanes) with per-session serialization. Self-spawn and Agent Link callbacks additionally use process-wide child-run admission with per-root limits |
 | `internal/memory/` | Memory system (pgvector hybrid search) |
 | `internal/subagent/` | Subagent lifecycle: spawn, roster, task persistence (subagent_tasks table), announce queue (producer-consumer), auto-retry, per-edition rate limiting |
 | `internal/permissions/` | RBAC policy engine (admin, operator, viewer roles) |
@@ -192,7 +192,7 @@ flowchart TD
 - **SSRF hardening (HTTPHandler)**: Caller supplies net.Dialer pinning resolved IP, blocking loopback/link-local/private ranges; no HTTP redirects (CheckRedirect returns ErrUseLastResponse)
 - **Auth header encryption**: `Authorization` + other sensitive fields in cfg.Config["headers"] encrypted at rest via AES-256-GCM; decrypted only at HTTP send-time
 - **Audit logging**: All hook invocations logged to `hook_executions` table (encrypted, PII-redacted) with dedup_key for idempotency
-- **Loop-depth guard (M5)**: SubagentStart checks recursion depth; max 3 levels prevents infinite delegation chains
+- **Hook recursion guard (M5)**: Hook dispatch tracks recursive hook re-entry and rejects it after 3 levels. Agent Link delegation uses separate admission, concurrency, and timeout safeguards.
 - **Circuit breaker**: Auto-disables hook after 3 consecutive failures in recent window (C4 mitigation)
 
 ### Pipeline Integration
@@ -282,8 +282,8 @@ sequenceDiagram
     PG-->>GW: PG stores created
     GW->>GW: 5. Start tracing collector
     GW->>PG: 6. Register providers from DB
-    GW->>PG: 7. Wire embedding provider to PGMemoryStore
-    GW->>PG: 8. Backfill memory embeddings (background)
+    GW->>PG: 7. Wire embedding provider to vector-enabled PG stores
+    GW->>PG: 8. Backfill missing embeddings in bounded background batches
 
     GW->>GW: 9. Register config-based providers
     GW->>GW: 10. Create tool registry (filesystem, exec, web, memory, browser, TTS, subagent, MCP)
@@ -302,6 +302,15 @@ sequenceDiagram
     GW->>Engine: 21. Start skills watcher + inbound consumer
     GW->>Engine: 22. Listen on host:port
 ```
+
+Embedding recovery covers memory chunks, knowledge graph entities, active
+skills, non-cancelled team tasks, active agents, episodic summaries, and vault
+documents. The process-wide provider is resolved from the master tenant because
+startup recovery may process semantic content from multiple tenants. Agent,
+episodic, and vault backfills run sequentially with independent deadlines and
+bounded batches. They only select rows whose embedding is `NULL`, re-check the
+source fields before writing, isolate malformed rows, and can retry remaining
+rows on the next startup.
 
 ---
 
@@ -379,6 +388,35 @@ flowchart TD
 | `subagent` | 50 | `GOCLAW_LANE_SUBAGENT` | Spawned subagents |
 | `team` | 100 | `GOCLAW_LANE_TEAM` | Agent team/delegation executions |
 | `cron` | 30 | `GOCLAW_LANE_CRON` | Scheduled cron jobs |
+
+### Scaling Beyond the Lane Defaults
+
+`main` bounds how many users can be answered at once, but raising it alone just
+moves the queue downstream. These knobs need to move with it:
+
+| Setting | Default | Env Override | Why it binds |
+|---------|:-------:|--------------|--------------|
+| Postgres max open conns | 25 | `GOCLAW_PG_MAX_OPEN_CONNS` | Held per query, not per run — undersizing shows up as burst latency when many runs load context at once |
+| Postgres max idle conns | 10 | `GOCLAW_PG_MAX_IDLE_CONNS` | Clamped to max open |
+| Provider idle conns | 100 | `GOCLAW_HTTP_MAX_IDLE_CONNS` | Total across all provider hosts |
+| Provider idle conns per host | 10 | `GOCLAW_HTTP_MAX_IDLE_CONNS_PER_HOST` | When one provider takes nearly all traffic, every request past this limit pays a fresh TCP+TLS handshake. Self-hosted/in-network providers should match `main`. |
+| Outbound dispatch shards | 8 | `GOCLAW_OUTBOUND_SHARDS` | See below |
+
+Channel-side rate limits are metered by the *remote* platform and are not
+covered by any of the above — DingTalk's AI Card API, for instance, meters per
+app, so `card_update_interval_ms` decides how many conversations can stream
+concurrently regardless of local capacity.
+
+### Outbound Dispatch
+
+Outbound delivery is sharded by `channel + ChatID`. A conversation always maps
+to the same shard and is delivered serially there, so the ordering a run
+depends on — block replies, retry notices, then the final answer — is
+preserved. Unrelated conversations run in parallel, so one slow send (a media
+upload of several seconds) no longer stalls every other reply in the process.
+
+Raising `GOCLAW_OUTBOUND_SHARDS` past the point where the remote API meters the
+gateway only moves queueing from this process into theirs.
 
 ### Session Queue Concurrency
 

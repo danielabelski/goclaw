@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -299,13 +300,23 @@ func copyMediaFile(src, dst string) error {
 	return out.Close()
 }
 
-// enrichDocumentPaths updates the last user message to include persisted file paths
-// in <media:document> tags. This allows skills (e.g. pdf skill via exec) to access
-// the file directly, matching how Claude Code skills work with file paths.
-func (l *Loop) enrichDocumentPaths(messages []providers.Message, refs []providers.MediaRef) {
+// enrichDocumentPaths updates document tags with exact media IDs and
+// workspace-relative paths. It upgrades historical tags and pairs current refs
+// with the last user message. Paths outside the active workspace are omitted.
+func (l *Loop) enrichDocumentPaths(messages []providers.Message, refs []providers.MediaRef, workspace string) {
 	if len(messages) == 0 {
 		return
 	}
+
+	// Upgrade historical tags as they re-enter the prompt. Current-turn refs
+	// are handled below because they are not yet attached to message history.
+	for i := range messages {
+		if messages[i].Role != "user" || len(messages[i].MediaRefs) == 0 {
+			continue
+		}
+		messages[i].Content = l.enrichDocumentTagContent(messages[i].Content, messages[i].MediaRefs, workspace)
+	}
+
 	lastIdx := -1
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == "user" {
@@ -316,41 +327,62 @@ func (l *Loop) enrichDocumentPaths(messages []providers.Message, refs []provider
 	if lastIdx < 0 {
 		return
 	}
+	messages[lastIdx].Content = l.enrichDocumentTagContent(messages[lastIdx].Content, refs, workspace)
+}
 
-	content := messages[lastIdx].Content
+func (l *Loop) enrichDocumentTagContent(content string, refs []providers.MediaRef, workspace string) string {
 	for _, ref := range refs {
 		if ref.Kind != "document" {
 			continue
 		}
 		p := ref.Path
 		if p == "" && l.mediaStore != nil {
-			var err error
-			p, err = l.mediaStore.LoadPath(ref.ID)
-			if err != nil {
-				continue
+			if loaded, err := l.mediaStore.LoadPath(ref.ID); err == nil {
+				p = loaded
 			}
 		}
-		if p == "" {
+		logical := logicalWorkspaceMediaPath(workspace, p)
+
+		updateTag := func(tag string) string {
+			tag = setTagAttr(tag, "id", ref.ID)
+			if logical == "" {
+				return removeTagAttr(tag, "path")
+			}
+			return setTagAttr(tag, "path", logical)
+		}
+
+		// Prefer a tag already carrying the exact media ID. This also upgrades
+		// legacy absolute paths without relying on attribute order.
+		var replaced bool
+		content, replaced = replaceFirstMediaTag(content, "<media:document", func(tag string) bool {
+			return tagHasAttrValue(tag, "id", ref.ID)
+		}, updateTag)
+		if replaced {
 			continue
 		}
-		pathAttr := fmt.Sprintf(" path=%q", p)
 
-		// Match first <media:document> without a path — covers bare, named, and file= variants.
+		// Fallback: pair the next tag without an ID with this persisted ref.
 		content, _ = replaceFirstMediaTag(content, "<media:document", func(tag string) bool {
-			return !tagHasAttr(tag, "path")
-		}, func(tag string) string {
-			return appendTagAttrs(tag, pathAttr)
-		})
+			return !tagHasAttr(tag, "id")
+		}, updateTag)
 	}
-	messages[lastIdx].Content = content
+	return content
 }
 
-// enrichAudioIDs updates the last user message to embed persisted media IDs
-// in <media:audio> and <media:voice> tags so the LLM can reference them.
-func (l *Loop) enrichAudioIDs(messages []providers.Message, refs []providers.MediaRef) {
+// enrichAudioIDs updates audio/voice tags with exact media IDs and logical
+// workspace paths. Historical tags are upgraded when they re-enter the prompt.
+func (l *Loop) enrichAudioIDs(messages []providers.Message, refs []providers.MediaRef, workspace string) {
 	if len(messages) == 0 {
 		return
 	}
+
+	for i := range messages {
+		if messages[i].Role != "user" || len(messages[i].MediaRefs) == 0 {
+			continue
+		}
+		messages[i].Content = l.enrichAudioTagContent(messages[i].Content, messages[i].MediaRefs, workspace)
+	}
+
 	lastIdx := -1
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == "user" {
@@ -361,31 +393,55 @@ func (l *Loop) enrichAudioIDs(messages []providers.Message, refs []providers.Med
 	if lastIdx < 0 {
 		return
 	}
+	messages[lastIdx].Content = l.enrichAudioTagContent(messages[lastIdx].Content, refs, workspace)
+}
 
-	content := messages[lastIdx].Content
+func (l *Loop) enrichAudioTagContent(content string, refs []providers.MediaRef, workspace string) string {
 	for _, ref := range refs {
 		if ref.Kind != "audio" {
 			continue
 		}
-		idAttr := fmt.Sprintf(" id=%q", ref.ID)
+		p := ref.Path
+		if p == "" && l.mediaStore != nil {
+			if loaded, err := l.mediaStore.LoadPath(ref.ID); err == nil {
+				p = loaded
+			}
+		}
+		logical := logicalWorkspaceMediaPath(workspace, p)
+		updateTag := func(tag string) string {
+			tag = setTagAttr(tag, "id", ref.ID)
+			if logical == "" {
+				return removeTagAttr(tag, "path")
+			}
+			return setTagAttr(tag, "path", logical)
+		}
 
+		// Upgrade a historical tag already carrying this exact ID first.
 		var replaced bool
 		content, replaced = replaceFirstMediaTag(content, "<media:audio", func(tag string) bool {
-			return !tagHasAttr(tag, "id")
-		}, func(tag string) string {
-			return appendTagAttrs(tag, idAttr)
-		})
+			return tagHasAttrValue(tag, "id", ref.ID)
+		}, updateTag)
+		if replaced {
+			continue
+		}
+		content, replaced = replaceFirstMediaTag(content, "<media:voice", func(tag string) bool {
+			return tagHasAttrValue(tag, "id", ref.ID)
+		}, updateTag)
 		if replaced {
 			continue
 		}
 
-		content, _ = replaceFirstMediaTag(content, "<media:voice", func(tag string) bool {
+		// Pair a current ref with the next unowned audio/voice tag.
+		content, replaced = replaceFirstMediaTag(content, "<media:audio", func(tag string) bool {
 			return !tagHasAttr(tag, "id")
-		}, func(tag string) string {
-			return appendTagAttrs(tag, idAttr)
-		})
+		}, updateTag)
+		if !replaced {
+			content, _ = replaceFirstMediaTag(content, "<media:voice", func(tag string) bool {
+				return !tagHasAttr(tag, "id")
+			}, updateTag)
+		}
 	}
-	messages[lastIdx].Content = content
+	return content
 }
 
 // enrichVideoIDs updates the last user message to embed persisted media IDs
@@ -422,11 +478,11 @@ func (l *Loop) enrichVideoIDs(messages []providers.Message, refs []providers.Med
 }
 
 // enrichImageIDs updates the last user message to embed persisted media IDs
-// and file paths in <media:image> tags so the LLM knows images were received
-// and stored. The path attribute allows tools called via MCP bridge (e.g.
+// and logical workspace paths in <media:image> tags so the LLM knows images
+// were received and stored. The path attribute allows tools called via MCP bridge (e.g.
 // claude-cli) to access images via read_image(path=...) even though the
 // bridge context does not carry WithMediaImages.
-func (l *Loop) enrichImageIDs(messages []providers.Message, refs []providers.MediaRef) {
+func (l *Loop) enrichImageIDs(messages []providers.Message, refs []providers.MediaRef, workspace string) {
 	if len(messages) == 0 {
 		return
 	}
@@ -448,8 +504,8 @@ func (l *Loop) enrichImageIDs(messages []providers.Message, refs []providers.Med
 		}
 		idAttr := fmt.Sprintf(" id=%q", ref.ID)
 		pathAttr := ""
-		if ref.Path != "" {
-			pathAttr = fmt.Sprintf(" path=%q", ref.Path)
+		if logical := logicalWorkspaceMediaPath(workspace, ref.Path); logical != "" {
+			pathAttr = fmt.Sprintf(" path=%q", logical)
 		}
 
 		content, _ = replaceFirstMediaTag(content, "<media:image", func(tag string) bool {
@@ -465,15 +521,12 @@ func (l *Loop) enrichImageIDs(messages []providers.Message, refs []providers.Med
 	messages[lastIdx].Content = content
 }
 
-// enrichImagePaths updates ALL user messages to include persisted file paths
+// enrichImagePaths updates ALL user messages to include logical workspace paths
 // in <media:image> tags. This enables the LLM to call read_image(path=...)
 // to analyze images without inline base64 (saving context tokens).
 // Unlike enrichImageIDs (last user message only), this enriches ALL messages
 // so historical images from prior turns are also accessible via file path.
-func (l *Loop) enrichImagePaths(messages []providers.Message) {
-	if l.mediaStore == nil {
-		return
-	}
+func (l *Loop) enrichImagePaths(messages []providers.Message, workspace string) {
 	for i := range messages {
 		if messages[i].Role != "user" || len(messages[i].MediaRefs) == 0 {
 			continue
@@ -485,7 +538,7 @@ func (l *Loop) enrichImagePaths(messages []providers.Message) {
 				continue
 			}
 			p := ref.Path
-			if p == "" {
+			if p == "" && l.mediaStore != nil {
 				var err error
 				p, err = l.mediaStore.LoadPath(ref.ID)
 				if err != nil {
@@ -495,14 +548,26 @@ func (l *Loop) enrichImagePaths(messages []providers.Message) {
 			if p == "" {
 				continue
 			}
-			pathAttr := fmt.Sprintf(" path=%q", p)
+			logical := logicalWorkspaceMediaPath(workspace, p)
+			if logical == "" {
+				var stripped bool
+				content, stripped = replaceFirstMediaTag(content, "<media:image", func(tag string) bool {
+					return tagHasAttrValue(tag, "id", ref.ID) && tagHasAttr(tag, "path")
+				}, func(tag string) string {
+					return removeTagAttr(tag, "path")
+				})
+				changed = changed || stripped
+				continue
+			}
 
-			// Prefer tags that already carry the matching media ID.
+			// Prefer tags that already carry the matching media ID. Replacing an
+			// existing path also upgrades legacy messages that persisted absolute
+			// host paths before logical media paths became the prompt contract.
 			var replaced bool
 			content, replaced = replaceFirstMediaTag(content, "<media:image", func(tag string) bool {
-				return tagHasAttrValue(tag, "id", ref.ID) && !tagHasAttr(tag, "path")
+				return tagHasAttrValue(tag, "id", ref.ID)
 			}, func(tag string) string {
-				return appendTagAttrs(tag, pathAttr)
+				return setTagAttr(tag, "path", logical)
 			})
 			if replaced {
 				changed = true
@@ -513,7 +578,7 @@ func (l *Loop) enrichImagePaths(messages []providers.Message) {
 			content, replaced = replaceFirstMediaTag(content, "<media:image", func(tag string) bool {
 				return !tagHasAttr(tag, "id")
 			}, func(tag string) string {
-				return appendTagAttrs(tag, fmt.Sprintf(` id=%q`, ref.ID), pathAttr)
+				return appendTagAttrs(tag, fmt.Sprintf(` id=%q`, ref.ID), fmt.Sprintf(` path=%q`, logical))
 			})
 			if replaced {
 				changed = true
@@ -523,6 +588,26 @@ func (l *Loop) enrichImagePaths(messages []providers.Message) {
 			messages[i].Content = content
 		}
 	}
+}
+
+// logicalWorkspaceMediaPath converts a persisted host path into the stable path
+// contract exposed to models. Paths outside the active workspace are omitted.
+func logicalWorkspaceMediaPath(workspace, mediaPath string) string {
+	if workspace == "" || mediaPath == "" {
+		return ""
+	}
+	if !filepath.IsAbs(mediaPath) {
+		clean := filepath.Clean(mediaPath)
+		if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return ""
+		}
+		return filepath.ToSlash(clean)
+	}
+	rel, err := filepath.Rel(filepath.Clean(workspace), filepath.Clean(mediaPath))
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return ""
+	}
+	return filepath.ToSlash(rel)
 }
 
 // mediaKindFromMime returns the media kind ("image", "video", "audio", "document")
@@ -578,6 +663,36 @@ func appendTagAttrs(tag string, attrs ...string) string {
 		return tag
 	}
 	return strings.TrimSuffix(tag, ">") + strings.Join(attrs, "") + ">"
+}
+
+func setTagAttr(tag, attr, value string) string {
+	prefix := " " + attr + `="`
+	start := strings.Index(tag, prefix)
+	if start < 0 {
+		return appendTagAttrs(tag, fmt.Sprintf(` %s=%q`, attr, value))
+	}
+	valueStart := start + len(prefix)
+	valueEnd := strings.IndexByte(tag[valueStart:], '"')
+	if valueEnd < 0 {
+		return tag
+	}
+	valueEnd += valueStart
+	quoted := strconv.Quote(value)
+	return tag[:valueStart] + quoted[1:len(quoted)-1] + tag[valueEnd:]
+}
+
+func removeTagAttr(tag, attr string) string {
+	prefix := " " + attr + `="`
+	start := strings.Index(tag, prefix)
+	if start < 0 {
+		return tag
+	}
+	valueStart := start + len(prefix)
+	valueEnd := strings.IndexByte(tag[valueStart:], '"')
+	if valueEnd < 0 {
+		return tag
+	}
+	return tag[:start] + tag[valueStart+valueEnd+1:]
 }
 
 // maxMediaReloadMessages is the default number of recent messages with image MediaRefs

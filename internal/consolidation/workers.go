@@ -45,6 +45,7 @@ func Register(deps ConsolidationDeps) func() {
 		eventBus:      deps.EventBus,
 		alertDeps:     deps.AlertDeps,
 		usageCaps:     deps.UsageCaps,
+		agents:        deps.AgentStore,
 	}
 	semantic := &semanticWorker{
 		kgStore:   deps.KGStore,
@@ -66,6 +67,7 @@ func Register(deps ConsolidationDeps) func() {
 		threshold:     dreamingDefaultThreshold,
 		debounce:      dreamingDefaultDebounce,
 		resolveConfig: newAgentStoreResolver(deps.AgentStore),
+		agents:        deps.AgentStore,
 	}
 
 	unsub1 := deps.EventBus.Subscribe(eventbus.EventSessionCompleted, episodic.Handle)

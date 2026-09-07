@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,12 +26,15 @@ func NewPGEpisodicStore(db *sql.DB) *PGEpisodicStore {
 }
 
 func (s *PGEpisodicStore) SetEmbeddingProvider(p store.EmbeddingProvider) { s.embProvider = p }
-func (s *PGEpisodicStore) Close() error                                  { return nil }
+func (s *PGEpisodicStore) Close() error                                   { return nil }
 
 // Create inserts a new episodic summary with optional embedding.
 func (s *PGEpisodicStore) Create(ctx context.Context, ep *store.EpisodicSummary) error {
 	id := uuid.Must(uuid.NewV7())
 	ep.ID = id
+	if ep.L0Abstract == "" {
+		ep.L0Abstract = fallbackEpisodicL0(ep.Summary)
+	}
 
 	topics := pq.Array(ep.KeyTopics)
 	now := time.Now().UTC()
@@ -61,6 +65,15 @@ func (s *PGEpisodicStore) Create(ctx context.Context, ep *store.EpisodicSummary)
 	}
 	ep.CreatedAt = now
 	return nil
+}
+
+func fallbackEpisodicL0(summary string) string {
+	const maxRunes = 500
+	runes := []rune(summary)
+	if len(runes) <= maxRunes {
+		return summary
+	}
+	return string(runes[:maxRunes])
 }
 
 // Get retrieves an episodic summary by ID.
@@ -137,15 +150,31 @@ func (s *PGEpisodicStore) Search(ctx context.Context, query, agentID, userID str
 		tw = 0.4
 	}
 
+	query = strings.TrimSpace(query)
+	if isEpisodicListQuery(query) {
+		merged := s.recentSearch(ctx, agentID, userID, maxResults, opts)
+		results := make([]store.EpisodicSearchResult, 0, len(merged))
+		for _, m := range merged {
+			if opts.MinScore > 0 && m.score < opts.MinScore {
+				continue
+			}
+			results = append(results, store.EpisodicSearchResult{
+				EpisodicID: m.id, L0Abstract: m.l0, KeyTopics: m.keyTopics, Score: m.score,
+				CreatedAt: m.createdAt, ExpiresAt: m.expiresAt, SessionKey: m.sessionKey,
+			})
+		}
+		return results, nil
+	}
+
 	// FTS search
-	ftsResults := s.ftsSearch(ctx, query, agentID, userID, maxResults*2)
+	ftsResults := s.ftsSearch(ctx, query, agentID, userID, maxResults*2, opts)
 
 	// Vector search (if embedding provider available)
 	var vecResults []episodicScored
 	if s.embProvider != nil {
 		vecs, err := s.embProvider.Embed(ctx, []string{query})
 		if err == nil && len(vecs) > 0 {
-			vecResults = s.vectorSearch(ctx, vecs[0], agentID, userID, maxResults*2)
+			vecResults = s.vectorSearch(ctx, vecs[0], agentID, userID, maxResults*2, opts)
 		}
 	}
 
@@ -163,8 +192,8 @@ func (s *PGEpisodicStore) Search(ctx context.Context, query, agentID, userID str
 			continue
 		}
 		results = append(results, store.EpisodicSearchResult{
-			EpisodicID: m.id, L0Abstract: m.l0, Score: m.score,
-			CreatedAt: m.createdAt, SessionKey: m.sessionKey,
+			EpisodicID: m.id, L0Abstract: m.l0, KeyTopics: m.keyTopics, Score: m.score,
+			CreatedAt: m.createdAt, ExpiresAt: m.expiresAt, SessionKey: m.sessionKey,
 		})
 	}
 	return results, nil
@@ -180,12 +209,23 @@ func (s *PGEpisodicStore) ExistsBySourceID(ctx context.Context, agentID, userID,
 	return exists, err
 }
 
-// PruneExpired deletes episodic summaries past their expiry within the caller's tenant.
+func (s *PGEpisodicStore) GetBySourceID(ctx context.Context, agentID, userID, sourceID string) (*store.EpisodicSummary, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, tenant_id, agent_id, user_id, session_key, summary, key_topics,
+		       turn_count, token_count, l0_abstract, source_id, source_type,
+		       created_at, expires_at, recall_count, recall_score, last_recalled_at
+		FROM episodic_summaries
+		WHERE agent_id = $1 AND user_id = $2 AND source_id = $3 AND tenant_id = $4`,
+		agentID, userID, sourceID, store.TenantIDFromContext(ctx))
+	return scanEpisodic(row)
+}
+
+// PruneExpired deletes all episodic summaries past their expiry across all tenants.
+// This is a global maintenance operation and does not filter by tenant.
 func (s *PGEpisodicStore) PruneExpired(ctx context.Context) (int, error) {
-	tenantID := store.TenantIDFromContext(ctx)
 	res, err := s.db.ExecContext(ctx, `
 		DELETE FROM episodic_summaries
-		WHERE expires_at IS NOT NULL AND expires_at < NOW() AND tenant_id = $1`, tenantID)
+		WHERE expires_at IS NOT NULL AND expires_at < NOW()`)
 	if err != nil {
 		return 0, err
 	}

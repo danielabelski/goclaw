@@ -29,7 +29,13 @@ type skillSlashCommandResult struct {
 }
 
 func (l *Loop) applySkillSlashCommand(ctx context.Context, req *RunRequest, message, extraPrompt string, skillFilter []string) (string, string, []string) {
-	result := resolveSkillSlashCommand(ctx, l.skillsLoader, l.resolveSkillSlashCommandConfig(ctx), message)
+	// l.skillAllowList is the visibility + grant filter computed when the agent was
+	// resolved (internal/agent/resolver.go). The inline <available_skills> block already
+	// honours it; the slash path did not, so /<slug> activated any skill the loader could
+	// see — including internal skills never granted to this agent, and skills belonging to
+	// another tenant's store if the loader had them. Filtering here also stops the
+	// not-found suggestions from disclosing that such a skill exists.
+	result := resolveSkillSlashCommand(ctx, l.skillsLoader, l.skillAllowList, l.resolveSkillSlashCommandConfig(ctx), message)
 	if result.Kind == skillSlashCommandNone {
 		return message, extraPrompt, skillFilter
 	}
@@ -76,7 +82,10 @@ func (l *Loop) resolveSkillSlashCommandConfig(ctx context.Context) config.SkillS
 	return cfg
 }
 
-func resolveSkillSlashCommand(ctx context.Context, loader *skills.Loader, cfg config.SkillSlashCommandConfig, message string) skillSlashCommandResult {
+// resolveSkillSlashCommand matches a slash command against the skills this agent may
+// use. allowList follows the loader's convention: nil means every skill, an empty slice
+// means none, and a populated slice is an explicit set of slugs.
+func resolveSkillSlashCommand(ctx context.Context, loader *skills.Loader, allowList []string, cfg config.SkillSlashCommandConfig, message string) skillSlashCommandResult {
 	if loader == nil || !cfg.EffectiveEnabled() {
 		return skillSlashCommandResult{Kind: skillSlashCommandNone}
 	}
@@ -84,7 +93,7 @@ func resolveSkillSlashCommand(ctx context.Context, loader *skills.Loader, cfg co
 	if !ok {
 		return skillSlashCommandResult{Kind: skillSlashCommandNone}
 	}
-	all := loader.ListSkills(ctx)
+	all := skillsReachableBySlash(loader.ListSkills(ctx), allowList)
 	switch parsed.verb {
 	case "list-skills":
 		return skillSlashCommandResult{Kind: skillSlashCommandList, Guidance: buildSkillSlashListGuidance(all)}
@@ -99,6 +108,40 @@ func resolveSkillSlashCommand(ctx context.Context, loader *skills.Loader, cfg co
 	default:
 		return resolveSkillActivation(ctx, loader, all, parsed.target+" "+parsed.rest, cfg)
 	}
+}
+
+// skillsReachableBySlash applies the agent's allow list to the skills the DB governs,
+// and lets the rest through.
+//
+// The allow list comes from SkillAccessStore.ListAccessible, which queries the `skills`
+// table only (internal/store/pg/skills_grants.go:410). Filesystem-tier skills — the
+// workspace, .agents and ~/.agents/~/.goclaw directories of the five-tier loader — have
+// no row there, so filtering every skill against the list would make those four tiers
+// unreachable by slash while `skill_search` still finds them
+// (internal/tools/skill_search.go:81 calls ListSkills unfiltered). Gating only the
+// managed tier closes the grant bypass without stranding skills an operator placed on
+// disk deliberately.
+//
+// Builtin skills are seeded into the table with is_system = true and ListAccessible
+// returns those unconditionally, so they stay reachable either way.
+//
+// A nil allow list means no restriction; an empty one means no managed skill is allowed.
+func skillsReachableBySlash(all []skills.Info, allowList []string) []skills.Info {
+	if allowList == nil {
+		return all
+	}
+	allowed := make(map[string]bool, len(allowList))
+	for _, slug := range allowList {
+		allowed[slug] = true
+	}
+	out := make([]skills.Info, 0, len(all))
+	for _, s := range all {
+		if s.Source == "managed" && !allowed[s.Slug] {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 func resolveSkillActivation(ctx context.Context, loader *skills.Loader, all []skills.Info, raw string, cfg config.SkillSlashCommandConfig) skillSlashCommandResult {

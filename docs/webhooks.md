@@ -95,9 +95,27 @@ Fields:
 
 ### List — `GET /v1/webhooks`
 
-Query params: `agent_id=<uuid>` (optional filter).
+Query params (all optional):
+- `agent_id=<uuid>` — filter by bound agent.
+- `q=<text>` — case-insensitive match on name, or prefix match on `secret_prefix`.
+- `include_revoked=true` — include revoked webhooks (default: excluded).
+- `limit` — page size (default 20, max 200).
+- `offset` — page offset (default 0).
 
-Returns array of webhook objects. `secret` and `hmac_signing_key` are **not** included.
+Returns a paginated envelope. `secret` and `hmac_signing_key` are **not** included.
+
+```json
+{
+  "items": [ /* webhook objects */ ],
+  "total": 42,
+  "limit": 20,
+  "offset": 0
+}
+```
+
+### List calls — `GET /v1/webhooks/{id}/calls`
+
+Delivery history for a webhook. Query params (all optional): `status` (`queued`|`running`|`done`|`failed`|`dead`), `limit` (default 20, max 200), `offset`. Returns the same `{items, total, limit, offset}` envelope.
 
 ### Get — `GET /v1/webhooks/{id}`
 
@@ -246,15 +264,71 @@ Triggers an agent with an input prompt. Available in all editions.
   "agent_id": "<uuid>",
   "output": "Here are the metrics: ...",
   "usage": {
-    "prompt_tokens": 150,
-    "completion_tokens": 200,
-    "total_tokens": 350
+    "prompt_tokens": 250,
+    "completion_tokens": 220,
+    "total_tokens": 470,
+    "cache_read_input_tokens": 120,
+    "cache_creation_input_tokens": 30,
+    "prompt_tokens_include_cached_segments": true
   },
+  "total_cost_usd": 0.0279,
+  "calls": [
+    {
+      "type": "llm_call", "name": "9router/cx/gpt-5.6 #1",
+      "provider": "9router", "model": "cx/gpt-5.6",
+      "prompt_tokens": 150, "completion_tokens": 200, "total_tokens": 350,
+      "cache_read_input_tokens": 120, "cache_creation_input_tokens": 30,
+      "prompt_tokens_include_cached_segments": true, "cost_usd": 0.0187
+    },
+    {
+      "type": "tool_call", "name": "read_image",
+      "provider": "9router", "model": "cx/gpt-5.5",
+      "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
+      "cost_usd": 0.0092
+    }
+  ],
   "finish_reason": "stop"
 }
 ```
 
-Sync mode times out at **30 seconds**. On timeout: `504 Gateway Timeout` with `webhook.llm_timeout`.
+> `cache_read_input_tokens` and `cache_creation_input_tokens` are present only when
+> prompt caching was active (omitted otherwise). When
+> `prompt_tokens_include_cached_segments` is `true`, `prompt_tokens` already counts
+> the cached segments, so non-cached input = `prompt_tokens - cache_read_input_tokens`.
+>
+> `calls[]` lists every LLM call and every tool that makes a **direct** internal LLM
+> call (e.g. `read_image`, `read_video`), each attributed to its `provider`/`model`
+> with its own tokens and `cost_usd`. `usage` is the **sum of all calls** — so it
+> includes tool-internal LLM tokens — and `total_cost_usd` is the sum of
+> `calls[].cost_usd` (best-effort; `0` when a model has no configured pricing).
+>
+> Note: token spend inside **nested agent runs** (`subagent`/`delegate` tools, which
+> spawn a separate child agent loop) is **not** itemized in `calls[]` and not included
+> in `usage`/`total_cost_usd` — consistent with how the child run's usage has always
+> been excluded from the parent's totals.
+
+Sync mode times out after the configured deadline (default **600s**). On timeout: `504 Gateway Timeout` with `webhook.llm_timeout`.
+
+#### Agent-run timeouts (configurable)
+
+Both webhook agent-run deadlines default to **600s** and are capped at **3600s**. Configure via `config.json` or environment variables (env overrides config):
+
+| Setting (config) | Env var | Applies to | Default |
+|------------------|---------|-----------|---------|
+| `gateway.webhook_sync_timeout_sec` | `GOCLAW_WEBHOOK_SYNC_TIMEOUT_SEC` | sync + admin test calls | 600 |
+| `gateway.webhook_async_timeout_sec` | `GOCLAW_WEBHOOK_ASYNC_TIMEOUT_SEC` | async worker runs | 600 |
+
+> Sync mode holds the HTTP connection open for the whole run — a value above an upstream proxy/load-balancer read timeout may be cut before the agent finishes. Async mode returns `202` immediately and runs in the background, so a longer deadline is safe.
+
+#### Prompt caching (internal streaming)
+
+Server-side webhook agent runs (sync, async, and admin test) stream provider responses internally by default. This lets OpenAI-compatible providers/routers populate and serve their prompt cache for the large, stable system+tools+history prefix — non-streaming requests are not cached by some routers, so webhook runs would otherwise pay full input-token price on every turn even with a stable session. The response returned to the caller is unchanged (the gateway assembles the streamed chunks into the same JSON/SSE payload).
+
+| Setting (config) | Env var | Applies to | Default |
+|------------------|---------|-----------|---------|
+| `gateway.webhook_stream` | `GOCLAW_WEBHOOK_STREAM` | sync + async + test webhook agent runs | `true` |
+
+> Set to `false` to restore non-streaming requests (e.g. for a provider that misbehaves when streaming). Caching for `cache_control`-style providers (Anthropic/DashScope) is unaffected by this flag.
 
 ### Async Response — 202 Accepted
 
@@ -387,14 +461,37 @@ User-Agent: goclaw-webhook/1
   "status": "done",
   "output": "Agent response text...",
   "usage": {
-    "prompt_tokens": 150,
-    "completion_tokens": 200,
-    "total_tokens": 350
+    "prompt_tokens": 250,
+    "completion_tokens": 220,
+    "total_tokens": 470,
+    "cache_read_input_tokens": 120,
+    "cache_creation_input_tokens": 30,
+    "prompt_tokens_include_cached_segments": true
   },
+  "total_cost_usd": 0.0279,
+  "calls": [
+    {
+      "type": "llm_call", "name": "9router/cx/gpt-5.6 #1",
+      "provider": "9router", "model": "cx/gpt-5.6",
+      "prompt_tokens": 150, "completion_tokens": 200, "total_tokens": 350,
+      "cache_read_input_tokens": 120, "cache_creation_input_tokens": 30,
+      "prompt_tokens_include_cached_segments": true, "cost_usd": 0.0187
+    },
+    {
+      "type": "tool_call", "name": "read_image",
+      "provider": "9router", "model": "cx/gpt-5.5",
+      "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
+      "cost_usd": 0.0092
+    }
+  ],
   "metadata": {},
   "error": ""
 }
 ```
+
+> `calls[]` and `total_cost_usd` on the async callback follow the same semantics as
+> the sync response above: `usage` is the sum of all `calls[]` (including
+> tool-internal LLM calls), each call carries its own `provider`/`model`/tokens/`cost_usd`.
 
 `status` is `"done"` on success, `"failed"` on agent error. `error` is non-empty on failure.
 

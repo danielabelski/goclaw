@@ -24,11 +24,11 @@ import (
 // ── Public surface ──────────────────────────────────────────────────────────
 
 // ProviderResolver returns a provider + resolved model name for a given
-// (tenantID, preferredModel). preferredModel is the UI/config-specified
-// model (e.g. "haiku"); resolver may expand aliases or fall back to the
-// tenant's default when the alias is unknown.
+// tenant. preferredProvider and preferredModel come from hook config. Legacy
+// hooks may omit preferredProvider, in which case the resolver applies its
+// backward-compatible alias/config fallback chain.
 type ProviderResolver interface {
-	ResolveForHook(ctx context.Context, tenantID uuid.UUID, preferredModel string) (providers.Provider, string, error)
+	ResolveForHook(ctx context.Context, tenantID uuid.UUID, preferredProvider, preferredModel string) (providers.Provider, string, error)
 }
 
 // PromptHandler implements hooks.Handler via an LLM structured-output call.
@@ -150,8 +150,9 @@ func (h *PromptHandler) Execute(ctx context.Context, cfg hooks.HookConfig, ev ho
 	}
 
 	// 4. Resolve provider
-	model := h.modelFor(cfg)
-	provider, resolvedModel, err := h.Resolver.ResolveForHook(ctx, ev.TenantID, model)
+	providerName := h.providerFor(cfg)
+	model := h.modelFor(cfg, providerName != "")
+	provider, resolvedModel, err := h.Resolver.ResolveForHook(ctx, ev.TenantID, providerName, model)
 	if err != nil || provider == nil {
 		return hooks.DecisionError, fmt.Errorf("hook: prompt handler: resolve provider: %w", err)
 	}
@@ -233,9 +234,19 @@ func (h *PromptHandler) maxInvocations(cfg hooks.HookConfig) int {
 	return defaultPromptMaxInvocations
 }
 
-func (h *PromptHandler) modelFor(cfg hooks.HookConfig) string {
+func (h *PromptHandler) providerFor(cfg hooks.HookConfig) string {
+	provider, _ := cfg.Config["provider"].(string)
+	return strings.TrimSpace(provider)
+}
+
+func (h *PromptHandler) modelFor(cfg hooks.HookConfig, hasExplicitProvider bool) string {
 	if m, _ := cfg.Config["model"].(string); m != "" {
 		return m
+	}
+	// An explicit provider with no model means "use that provider's default".
+	// Only legacy model-only hooks inherit the historical Haiku fallback.
+	if hasExplicitProvider {
+		return ""
 	}
 	if h.DefaultModel != "" {
 		return h.DefaultModel

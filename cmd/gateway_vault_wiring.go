@@ -36,6 +36,10 @@ func wireVault(stores *store.Stores, toolsReg *tools.Registry, workspace string,
 	if stores.Episodic != nil {
 		vaultReadTool.SetEpisodicStore(stores.Episodic)
 	}
+	// Tenant slug fallback for runs whose context carries no slug (channels, cron).
+	if stores.Tenants != nil {
+		vaultReadTool.SetTenantStore(stores.Tenants)
+	}
 	toolsReg.Register(vaultReadTool)
 
 	// Build VaultSearchService: fan-out across vault + episodic + KG.

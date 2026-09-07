@@ -27,13 +27,13 @@ func TestVaultRead_SharedAtWorkspaceRoot(t *testing.T) {
 	ws := t.TempDir()
 	body := strings.Repeat("KG_03 body line\n", 300) // ~4.8KB
 	relPath := "KG_03_Test.md"
-	if err := os.WriteFile(filepath.Join(ws, relPath), []byte(body), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(tenantWorkspaceDir(t, ws, tenantID), relPath), []byte(body), 0o644); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
 
 	// Register doc directly (avoids spinning up the full rescan pipeline).
 	doc := makeSharedVaultDoc(tenantID.String(), relPath, "KG_03 Test")
-	ctx := tenantCtx(tenantID)
+	ctx := tenantCtxSlug(tenantID)
 	ctx = store.WithAgentID(ctx, agentID)
 	if err := vs.UpsertDocument(ctx, doc); err != nil {
 		t.Fatalf("UpsertDocument: %v", err)
@@ -68,12 +68,12 @@ func TestVaultRead_PersonalCrossAgentDenied(t *testing.T) {
 
 	ws := t.TempDir()
 	relPath := "private.md"
-	if err := os.WriteFile(filepath.Join(ws, relPath), []byte("secret"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(tenantWorkspaceDir(t, ws, tenantID), relPath), []byte("secret"), 0o644); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
 
 	doc := makeVaultDoc(tenantID.String(), agentA.String(), relPath, "Private")
-	ctxA := store.WithAgentID(tenantCtx(tenantID), agentA)
+	ctxA := store.WithAgentID(tenantCtxSlug(tenantID), agentA)
 	if err := vs.UpsertDocument(ctxA, doc); err != nil {
 		t.Fatalf("UpsertDocument: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestVaultRead_PersonalCrossAgentDenied(t *testing.T) {
 	tool.SetWorkspace(ws)
 
 	// Agent B reads → must be denied.
-	ctxB := store.WithAgentID(tenantCtx(tenantID), agentB)
+	ctxB := store.WithAgentID(tenantCtxSlug(tenantID), agentB)
 	res := tool.Execute(ctxB, map[string]any{"doc_id": doc.ID})
 	if !res.IsError {
 		t.Fatalf("expected access denied for cross-agent personal read, got content")
@@ -102,7 +102,7 @@ func TestVaultRead_MediaRejected(t *testing.T) {
 
 	ws := t.TempDir()
 	relPath := "pic.png"
-	if err := os.WriteFile(filepath.Join(ws, relPath), []byte("pretend-png"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(tenantWorkspaceDir(t, ws, tenantID), relPath), []byte("pretend-png"), 0o644); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
 
@@ -117,7 +117,7 @@ func TestVaultRead_MediaRejected(t *testing.T) {
 		ContentHash: "abc",
 		Metadata:    map[string]any{"mime_type": "image/png"},
 	}
-	ctx := store.WithAgentID(tenantCtx(tenantID), agentID)
+	ctx := store.WithAgentID(tenantCtxSlug(tenantID), agentID)
 	if err := vs.UpsertDocument(ctx, doc); err != nil {
 		t.Fatalf("UpsertDocument: %v", err)
 	}
@@ -144,12 +144,12 @@ func TestVaultRead_OversizeTruncation(t *testing.T) {
 	ws := t.TempDir()
 	relPath := "big.md"
 	big := bytes.Repeat([]byte("a"), 300_000)
-	if err := os.WriteFile(filepath.Join(ws, relPath), big, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(tenantWorkspaceDir(t, ws, tenantID), relPath), big, 0o644); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
 
 	doc := makeSharedVaultDoc(tenantID.String(), relPath, "Big Doc")
-	ctx := store.WithAgentID(tenantCtx(tenantID), agentID)
+	ctx := store.WithAgentID(tenantCtxSlug(tenantID), agentID)
 	if err := vs.UpsertDocument(ctx, doc); err != nil {
 		t.Fatalf("UpsertDocument: %v", err)
 	}
@@ -194,11 +194,11 @@ func TestVaultRead_OutlinksScopeMatrix(t *testing.T) {
 
 	ws := t.TempDir()
 	tid := tenantID.String()
-	ctxSelf := store.WithAgentID(tenantCtx(tenantID), agentSelf)
+	ctxSelf := store.WithAgentID(tenantCtxSlug(tenantID), agentSelf)
 
 	// Source file on disk + doc (shared so read is allowed).
 	srcRel := "src.md"
-	if err := os.WriteFile(filepath.Join(ws, srcRel), []byte("src body"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(tenantWorkspaceDir(t, ws, tenantID), srcRel), []byte("src body"), 0o644); err != nil {
 		t.Fatalf("write src: %v", err)
 	}
 	src := makeSharedVaultDoc(tid, srcRel, "Source")

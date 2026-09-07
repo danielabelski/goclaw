@@ -122,6 +122,8 @@ export const Methods = {
 
   QUOTA_USAGE: "quota.usage",
 
+  LLM_COMPLETE: "llm.complete",
+
   SEND: "send",
 
   // Agent links (delegation)

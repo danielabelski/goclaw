@@ -168,57 +168,6 @@ func (s *SQLiteBuiltinToolStore) Seed(ctx context.Context, tools []store.Builtin
 	return tx.Commit()
 }
 
-// Upsert inserts or updates builtin tool definitions without reconcile DELETE.
-// Safe for additive fork-specific tools -- does NOT delete rows not in the list.
-func (s *SQLiteBuiltinToolStore) Upsert(ctx context.Context, tools []store.BuiltinToolDef) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	stmt, err := tx.PrepareContext(ctx,
-		`INSERT INTO builtin_tools (name, display_name, description, category, enabled, settings, requires, metadata, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT (name) DO UPDATE SET
-		   display_name = excluded.display_name,
-		   description = excluded.description,
-		   category = excluded.category,
-		   requires = excluded.requires,
-		   metadata = excluded.metadata,
-		   settings = CASE
-		     WHEN builtin_tools.settings IS NULL OR builtin_tools.settings IN ('{}', 'null')
-		     THEN excluded.settings
-		     ELSE builtin_tools.settings
-		   END,
-		   updated_at = excluded.updated_at`)
-	if err != nil {
-		return fmt.Errorf("prepare upsert stmt: %w", err)
-	}
-	defer stmt.Close()
-
-	now := time.Now()
-	for _, t := range tools {
-		settings := t.Settings
-		if settings == nil {
-			settings = json.RawMessage("{}")
-		}
-		metadata := t.Metadata
-		if metadata == nil {
-			metadata = json.RawMessage("{}")
-		}
-		_, err := stmt.ExecContext(ctx,
-			t.Name, t.DisplayName, t.Description, t.Category,
-			t.Enabled, []byte(settings), jsonStringArray(t.Requires), []byte(metadata), now, now,
-		)
-		if err != nil {
-			return fmt.Errorf("upsert tool %s: %w", t.Name, err)
-		}
-	}
-
-	return tx.Commit()
-}
-
 func (s *SQLiteBuiltinToolStore) scanTool(row *sql.Row) (*store.BuiltinToolDef, error) {
 	var def store.BuiltinToolDef
 	var settings []byte

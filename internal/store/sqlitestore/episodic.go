@@ -34,6 +34,9 @@ func (s *SQLiteEpisodicStore) Close() error { return nil }
 func (s *SQLiteEpisodicStore) Create(ctx context.Context, ep *store.EpisodicSummary) error {
 	id := uuid.Must(uuid.NewV7())
 	ep.ID = id
+	if ep.L0Abstract == "" {
+		ep.L0Abstract = fallbackEpisodicL0(ep.Summary)
+	}
 	now := time.Now().UTC()
 
 	topics := jsonStringArray(ep.KeyTopics)
@@ -61,6 +64,15 @@ func (s *SQLiteEpisodicStore) Create(ctx context.Context, ep *store.EpisodicSumm
 	}
 	ep.CreatedAt = now
 	return nil
+}
+
+func fallbackEpisodicL0(summary string) string {
+	const maxRunes = 500
+	runes := []rune(summary)
+	if len(runes) <= maxRunes {
+		return summary
+	}
+	return string(runes[:maxRunes])
 }
 
 // Get retrieves an episodic summary by ID.
@@ -131,14 +143,26 @@ func (s *SQLiteEpisodicStore) ExistsBySourceID(ctx context.Context, agentID, use
 	return exists, err
 }
 
-// PruneExpired deletes episodic summaries past their expiry.
-func (s *SQLiteEpisodicStore) PruneExpired(ctx context.Context) (int, error) {
+func (s *SQLiteEpisodicStore) GetBySourceID(ctx context.Context, agentID, userID, sourceID string) (*store.EpisodicSummary, error) {
 	tenantID := tenantIDForInsert(ctx)
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, tenant_id, agent_id, user_id, session_key, summary, key_topics,
+		       turn_count, token_count, l0_abstract, source_id, source_type,
+		       created_at, expires_at, recall_count, recall_score, last_recalled_at
+		FROM episodic_summaries
+		WHERE agent_id = ? AND user_id = ? AND source_id = ? AND tenant_id = ?`,
+		agentID, userID, sourceID, tenantID.String())
+	return scanSQLiteEpisodic(row)
+}
+
+// PruneExpired deletes all episodic summaries past their expiry across all tenants.
+// This is a global maintenance operation and does not filter by tenant.
+func (s *SQLiteEpisodicStore) PruneExpired(ctx context.Context) (int, error) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	res, err := s.db.ExecContext(ctx, `
 		DELETE FROM episodic_summaries
-		WHERE expires_at IS NOT NULL AND expires_at < ? AND tenant_id = ?`,
-		now, tenantID.String())
+		WHERE expires_at IS NOT NULL AND expires_at < ?`,
+		now)
 	if err != nil {
 		return 0, err
 	}

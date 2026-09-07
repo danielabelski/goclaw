@@ -3,7 +3,7 @@ package hooks
 import "context"
 
 // ScriptResult carries non-decision outputs from a script handler execution
-// (reason text, updatedInput proposal, captured stdout). The dispatcher
+// (reason text, additional context, updatedInput proposal, captured stdout). The dispatcher
 // provisions one via context before calling Handler.Execute; the handler
 // populates it on success. Phase 03 wires this into the dispatcher so that
 // only builtin-source hooks can apply UpdatedInput to the pipeline state.
@@ -13,6 +13,10 @@ import "context"
 type ScriptResult struct {
 	// Reason is the human-readable explanation returned by the script.
 	Reason string
+	// AdditionalContext is instruction text appended to the current run's
+	// extra system prompt after the hook returns allow. It does not mutate the
+	// original user input.
+	AdditionalContext string
 	// UpdatedInput is a proposed replacement for Event.ToolInput. Dispatcher
 	// applies only when cfg.Source == "builtin" (source-tier capability).
 	UpdatedInput map[string]any

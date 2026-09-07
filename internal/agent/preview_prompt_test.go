@@ -2,13 +2,18 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 
+	"github.com/nextlevelbuilder/goclaw/internal/config"
+	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/skills"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
 
 func baseAgent() *store.AgentData {
@@ -38,6 +43,7 @@ func TestBuildPreviewPrompt_SkillsInline(t *testing.T) {
 	r := BuildPreviewPrompt(context.Background(), baseAgent(), PromptFull, "", PreviewDeps{
 		SkillsLoader: &mockSkillsLoader{
 			summary: "<available_skills>\n<skill name=\"git\">Git operations</skill>\n</available_skills>",
+			infos:   skillInfoN(1, 20),
 		},
 	})
 	if !strings.Contains(r.Prompt, "<available_skills>") {
@@ -47,11 +53,53 @@ func TestBuildPreviewPrompt_SkillsInline(t *testing.T) {
 
 func TestBuildPreviewPrompt_SkillsSearchMode(t *testing.T) {
 	bigSummary := strings.Repeat("x", 10000)
+	// 100 skills at the 200-rune description cap: ~5300 estimated tokens, past the 3000
+	// inline ceiling. The estimate is taken from the skill list, not from the rendered
+	// summary, so the count and description length are what push it over.
 	r := BuildPreviewPrompt(context.Background(), baseAgent(), PromptFull, "", PreviewDeps{
-		SkillsLoader: &mockSkillsLoader{summary: bigSummary},
+		SkillsLoader: &mockSkillsLoader{summary: bigSummary, infos: skillInfoN(100, 200)},
 	})
 	if strings.Contains(r.Prompt, bigSummary) {
 		t.Error("expected large summary to be excluded (search-only mode)")
+	}
+}
+
+// The preview endpoint exists to show the prompt the agent actually gets. It used to
+// decide inline-vs-search with tokencount.NewFallbackCounter() over the rendered XML
+// while the runtime estimated name+description at chars/4 — on 18 real skills that read
+// 3087 against 944, so the preview claimed search mode for an agent running inline.
+// Both paths now call shouldInlineSkills; this pins them to the same verdict.
+func TestPreviewInlineDecisionMatchesRuntime(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		count      int
+		descLen    int
+		wantInline bool
+	}{
+		{"empty", 0, 0, false},
+		{"one small skill", 1, 20, true},
+		// Count gate, isolated: descriptions stay tiny so the token estimate is far
+		// under the ceiling and only the count can decide.
+		{"at the count ceiling", skillInlineMaxCount, 10, true},
+		{"one past the count ceiling", skillInlineMaxCount + 1, 10, false},
+		// Token gate, isolated: the count stays under the ceiling, so a false verdict
+		// can only come from the token estimate. 58 x (8 + 200 + 10) / 4 = 3161 > 3000.
+		{"under the count ceiling, under the token ceiling", 40, 200, true},
+		{"under the count ceiling, over the token ceiling", 58, 200, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			infos := skillInfoN(tc.count, tc.descLen)
+			if got := shouldInlineSkills(infos); got != tc.wantInline {
+				t.Fatalf("shouldInlineSkills = %v, want %v", got, tc.wantInline)
+			}
+
+			loader := &mockSkillsLoader{summary: "<available_skills>marker</available_skills>", infos: infos}
+			r := BuildPreviewPrompt(context.Background(), baseAgent(), PromptFull, "", PreviewDeps{SkillsLoader: loader})
+			gotInPreview := strings.Contains(r.Prompt, "<available_skills>marker</available_skills>")
+			if gotInPreview != tc.wantInline {
+				t.Fatalf("preview inlined = %v, want %v (must match shouldInlineSkills)", gotInPreview, tc.wantInline)
+			}
+		})
 	}
 }
 
@@ -73,6 +121,7 @@ func TestBuildPreviewPrompt_SkillAllowList(t *testing.T) {
 	ag := baseAgent()
 	loader := &mockSkillsLoader{
 		summary: "<available_skills><skill name=\"allowed\">ok</skill></available_skills>",
+		infos:   []skills.Info{{Slug: "allowed-skill", Name: "allowed", Description: "ok"}},
 	}
 	r := BuildPreviewPrompt(context.Background(), ag, PromptFull, "user1", PreviewDeps{
 		SkillsLoader: loader,
@@ -92,6 +141,7 @@ func TestBuildPreviewPrompt_SkillAccessStoreError(t *testing.T) {
 	ag := baseAgent()
 	loader := &mockSkillsLoader{
 		summary: "<available_skills><skill name=\"s\">desc</skill></available_skills>",
+		infos:   skillInfoN(3, 20),
 	}
 	r := BuildPreviewPrompt(context.Background(), ag, PromptFull, "user1", PreviewDeps{
 		SkillsLoader:     loader,
@@ -100,11 +150,21 @@ func TestBuildPreviewPrompt_SkillAccessStoreError(t *testing.T) {
 	if r.Prompt == "" {
 		t.Fatal("expected non-empty prompt on SkillAccessStore error")
 	}
-	if loader.capturedAllow == nil || len(loader.capturedAllow) != 0 {
-		t.Errorf("expected empty (non-nil) allow list on error, got %v", loader.capturedAllow)
+	// Fail closed: an access-store error must not fall back to showing every skill.
+	// The tag itself appears in the skill-loading protocol text regardless, so match on
+	// the summary body.
+	if strings.Contains(r.Prompt, "<skill name=\"s\">") {
+		t.Error("expected no skills in the prompt when the access store errors")
+	}
+	if loader.capturedAllow != nil {
+		t.Errorf("BuildSummary should not run for an empty allow list, got %v", loader.capturedAllow)
 	}
 }
 
+// TestBuildPreviewPrompt_MCPToolDescs proves that when MCP tools are present,
+// the prompt text carries the behavioral note (prefer-MCP-over-core-tools,
+// optional-parameter guidance) but no longer enumerates per-tool name+description
+// lines — that's now pure duplication with the real schema in ToolDefs/`tools:`.
 func TestBuildPreviewPrompt_MCPToolDescs(t *testing.T) {
 	r := BuildPreviewPrompt(context.Background(), baseAgent(), PromptFull, "", PreviewDeps{
 		ToolLister: &mockToolLister{
@@ -114,8 +174,14 @@ func TestBuildPreviewPrompt_MCPToolDescs(t *testing.T) {
 			},
 		},
 	})
-	if !strings.Contains(r.Prompt, "mcp_pg_query") {
-		t.Error("expected MCP tool description in prompt")
+	if !strings.Contains(r.Prompt, "## MCP Tools (prefer over core tools)") {
+		t.Error("expected MCP Tools behavioral section header in prompt")
+	}
+	if !strings.Contains(r.Prompt, "always prefer the MCP tool") {
+		t.Error("expected prefer-MCP-over-core-tools instruction in prompt")
+	}
+	if strings.Contains(r.Prompt, "mcp_pg_query:") {
+		t.Error("expected per-tool MCP description enumeration to be removed from prompt text (now duplicated by ToolDefs schema)")
 	}
 }
 
@@ -234,5 +300,279 @@ func TestBuildPreviewPrompt_ToolDefs(t *testing.T) {
 	}
 	if !found {
 		t.Error("expected alias 'Read' in tool defs")
+	}
+}
+
+// TestBuildPreviewPrompt_DeniedToolAliasExcludedFromDefs proves that when a
+// canonical tool is denied via tools_config, its alias must NOT reappear in
+// ToolDefs (regression test for the alias-reinjection bug: aliases were
+// previously appended unconditionally regardless of the deny filter).
+func TestBuildPreviewPrompt_DeniedToolAliasExcludedFromDefs(t *testing.T) {
+	ag := baseAgent()
+	ag.ToolsConfig = []byte(`{"deny":["exec"]}`)
+	r := BuildPreviewPrompt(context.Background(), ag, PromptFull, "", PreviewDeps{
+		ToolLister: &mockToolLister{
+			tools: map[string]string{
+				"read_file": "Read a file",
+				"exec":      "Execute shell",
+			},
+			aliases: map[string]string{
+				"Bash": "exec",
+			},
+		},
+	})
+	for _, td := range r.ToolDefs {
+		if td.Function.Name == "Bash" || td.Function.Name == "exec" {
+			t.Errorf("denied tool %q (or its alias) should not appear in ToolDefs, got defs: %+v", td.Function.Name, r.ToolDefs)
+		}
+	}
+	found := false
+	for _, td := range r.ToolDefs {
+		if td.Function.Name == "read_file" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected non-denied tool 'read_file' in ToolDefs")
+	}
+}
+
+// TestBuildPreviewPrompt_MCPToolInDefs proves that store-based MCP tool
+// descriptions (from MCPLister, no live registry entry) are converted into
+// ToolDefinition entries with at least name+description populated, and that
+// when the MCPLister entry has NO cached parameter schema, the genuine
+// unknown-schema placeholder is used as a fallback.
+func TestBuildPreviewPrompt_MCPToolInDefs(t *testing.T) {
+	ag := baseAgent()
+	r := BuildPreviewPrompt(context.Background(), ag, PromptFull, "u1", PreviewDeps{
+		ToolLister: &mockToolLister{
+			tools: map[string]string{
+				"read_file": "Read a file",
+			},
+		},
+		MCPLister: &mockMCPLister{
+			tools: []MCPToolPreviewInfo{
+				{RegisteredName: "mcp_pg_query", Description: "Run PostgreSQL queries"},
+			},
+		},
+	})
+	var found *providers.ToolDefinition
+	for i := range r.ToolDefs {
+		if r.ToolDefs[i].Function.Name == "mcp_pg_query" {
+			found = &r.ToolDefs[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected mcp_pg_query in ToolDefs, got: %+v", r.ToolDefs)
+	}
+	if found.Function.Description != "Run PostgreSQL queries" {
+		t.Errorf("expected description to be populated, got %q", found.Function.Description)
+	}
+	if found.Function.Parameters == nil {
+		t.Error("expected placeholder parameters schema, got nil")
+	}
+}
+
+// TestBuildPreviewPrompt_MCPToolRealSchemaInDefs proves that when the
+// MCPLister provides a real cached parameter schema (captured from a live
+// MCP connection, see buildCachedToolInfo in internal/mcp/manager_connect.go),
+// BuildPreviewPrompt's ToolDefs uses that REAL schema instead of the honest
+// "unknown schema" placeholder — closing the gap between preview and the
+// live conversation path (which always sends real schemas via
+// BridgeTool.Parameters()).
+func TestBuildPreviewPrompt_MCPToolRealSchemaInDefs(t *testing.T) {
+	ag := baseAgent()
+	realSchema := `{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`
+	r := BuildPreviewPrompt(context.Background(), ag, PromptFull, "u1", PreviewDeps{
+		MCPLister: &mockMCPLister{
+			tools: []MCPToolPreviewInfo{
+				{
+					RegisteredName: "mcp_pg_query",
+					Description:    "Run PostgreSQL queries",
+					Parameters:     json.RawMessage(realSchema),
+				},
+			},
+		},
+	})
+	var found *providers.ToolDefinition
+	for i := range r.ToolDefs {
+		if r.ToolDefs[i].Function.Name == "mcp_pg_query" {
+			found = &r.ToolDefs[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected mcp_pg_query in ToolDefs, got: %+v", r.ToolDefs)
+	}
+	params := found.Function.Parameters
+	props, ok := params["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected real schema properties, got %+v", params)
+	}
+	if _, ok := props["query"]; !ok {
+		t.Errorf("expected real schema property 'query', got %+v", props)
+	}
+}
+
+// TestBuildPreviewPrompt_GlobalDenyApplied proves that a globally-denied tool
+// (configured via the web UI's global Tools policy, with NO per-agent deny
+// config) is excluded from preview's tool list. This mirrors the bug where
+// preview hand-rolled a deny-only reimplementation that only consulted
+// per-agent deny and never the PolicyEngine's global deny.
+func TestBuildPreviewPrompt_GlobalDenyApplied(t *testing.T) {
+	ag := baseAgent() // tools_config is nil — no per-agent deny
+	pe := tools.NewPolicyEngine(&config.ToolsConfig{
+		Deny: []string{"cron", "delegate"},
+	})
+	r := BuildPreviewPrompt(context.Background(), ag, PromptFull, "", PreviewDeps{
+		ToolLister: &mockToolLister{
+			tools: map[string]string{
+				"read_file": "Read a file",
+				"cron":      "Schedule tasks",
+				"delegate":  "Delegate to sub-agent",
+			},
+		},
+		ToolPolicy: pe,
+	})
+	if strings.Contains(r.Prompt, "cron") {
+		t.Error("expected globally-denied tool 'cron' to be excluded from preview prompt")
+	}
+	if strings.Contains(r.Prompt, "delegate") {
+		t.Error("expected globally-denied tool 'delegate' to be excluded from preview prompt")
+	}
+	if !strings.Contains(r.Prompt, "read_file") {
+		t.Error("expected non-denied tool 'read_file' to remain in preview prompt")
+	}
+}
+
+// TestBuildPreviewPrompt_MCPToolGlobalDenyApplied proves that MCP tools
+// injected from deps.MCPLister (store-based, not live registry) are also
+// subject to a literal-name deny check via deps.ToolPolicy.IsDenied. A
+// globally-denied MCP tool must be excluded from both the prompt text and
+// ToolDefs, while other MCP tools from the same server remain included.
+// This closes the gap where the MCPLister supplement path added MCP tools
+// without consulting ToolPolicy at all.
+func TestBuildPreviewPrompt_MCPToolGlobalDenyApplied(t *testing.T) {
+	ag := baseAgent() // tools_config is nil — no per-agent deny
+	pe := tools.NewPolicyEngine(&config.ToolsConfig{
+		Deny: []string{"mcp_cloudflare__delete_dns_record"},
+	})
+	r := BuildPreviewPrompt(context.Background(), ag, PromptFull, "u1", PreviewDeps{
+		MCPLister: &mockMCPLister{
+			tools: []MCPToolPreviewInfo{
+				{RegisteredName: "mcp_cloudflare__delete_dns_record", Description: "Delete a DNS record"},
+				{RegisteredName: "mcp_cloudflare__list_dns_records", Description: "List DNS records"},
+			},
+		},
+		ToolPolicy: pe,
+	})
+
+	// Prompt text no longer enumerates per-tool names/descriptions (removed as
+	// pure duplication of the real schema now carried in ToolDefs/`tools:`) —
+	// so allow/deny is asserted against ToolDefs below, not prompt text.
+	if strings.Contains(r.Prompt, "mcp_cloudflare__delete_dns_record") {
+		t.Error("expected globally-denied MCP tool to be excluded from preview prompt")
+	}
+
+	for _, def := range r.ToolDefs {
+		if def.Function != nil && def.Function.Name == "mcp_cloudflare__delete_dns_record" {
+			t.Errorf("expected globally-denied MCP tool to be excluded from ToolDefs, got: %+v", r.ToolDefs)
+		}
+	}
+	var foundAllowed bool
+	for _, def := range r.ToolDefs {
+		if def.Function != nil && def.Function.Name == "mcp_cloudflare__list_dns_records" {
+			foundAllowed = true
+		}
+	}
+	if !foundAllowed {
+		t.Errorf("expected non-denied MCP tool in ToolDefs, got: %+v", r.ToolDefs)
+	}
+}
+
+// TestBuildPreviewPrompt_MCPToolAllowedViaGroupExpansion proves that an MCP
+// tool granted only through a "group:mcp" AlsoAllow spec — the exact pattern
+// production uses (see agentToolPolicyWithMCP in resolver_helpers.go, which
+// injects AlsoAllow: ["group:mcp"] for every agent) — is correctly INCLUDED
+// in BuildPreviewPrompt's ToolDefs and tool names.
+//
+// This is a regression test for the reg=nil bug: WouldAllow(nil, ...) cannot
+// expand "group:mcp" (group expansion requires a concrete *tools.Registry to
+// look up group membership), so with a restrictive Allow list that excludes
+// the tool by literal name, the AlsoAllow group grant would silently fail to
+// restore it — exactly what happened for every MCP tool in production preview.
+// Using a *tools.Registry (not the narrower mockToolLister) here exercises the
+// real reg-resolution path added by ResolveConcreteRegistry.
+func TestBuildPreviewPrompt_MCPToolAllowedViaGroupExpansion(t *testing.T) {
+	ag := baseAgent()
+	// Mirrors production: Allow restricts to a literal core-tool name only,
+	// and AlsoAllow additively grants the whole "group:mcp" set (the pattern
+	// injected for every agent by resolver_helpers.go's agentToolPolicyWithMCP).
+	ag.ToolsConfig = []byte(`{"allow":["read_file"],"alsoAllow":["group:mcp"]}`)
+
+	reg := tools.NewRegistry()
+	reg.Register(&mockTool{name: "read_file", desc: "Read a file"})
+	reg.Register(&mockTool{name: "mcp_pg_query", desc: "Run PostgreSQL queries"})
+	reg.RegisterToolGroup("mcp", []string{"mcp_pg_query"})
+
+	pe := tools.NewPolicyEngine(&config.ToolsConfig{})
+
+	r := BuildPreviewPrompt(context.Background(), ag, PromptFull, "u1", PreviewDeps{
+		ToolLister: reg,
+		ToolPolicy: pe,
+	})
+
+	var found *providers.ToolDefinition
+	for i := range r.ToolDefs {
+		if r.ToolDefs[i].Function.Name == "mcp_pg_query" {
+			found = &r.ToolDefs[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected mcp_pg_query (granted via group:mcp AlsoAllow) in ToolDefs, got: %+v", r.ToolDefs)
+	}
+}
+
+// TestBuildPreviewPrompt_MCPToolNotDeniedIncludedWithoutGroupExpansion proves
+// that MCP tools supplied via deps.MCPLister are included in preview purely
+// because they are NOT literally denied — inclusion does NOT depend on
+// group-expansion machinery (e.g. "group:mcp" resolving against a registry)
+// at all. This is a regression test for the preview-vs-live tool-visibility
+// gap: MCP tools are only ever registered into ephemeral per-agent registry
+// clones at live-connection time (internal/mcp/manager_connect.go), never
+// into the shared/global registry used by preview, so any check that
+// requires "group:mcp" to expand against a registry can never work correctly
+// here. The agent's tools_config below deliberately has a restrictive Allow
+// list (excluding the MCP tool by literal name) and no AlsoAllow group grant
+// at all — under the old WouldAllow-based gate this MCP tool would have been
+// incorrectly excluded, since group:mcp cannot resolve against the (empty)
+// global registry. With the fix, since the tool is not in any Deny list, it
+// must still appear.
+func TestBuildPreviewPrompt_MCPToolNotDeniedIncludedWithoutGroupExpansion(t *testing.T) {
+	ag := baseAgent()
+	// Restrictive Allow list that does NOT include the MCP tool by literal
+	// name, and NO AlsoAllow group grant — the exact scenario where
+	// group-expansion-dependent gating would previously have failed.
+	ag.ToolsConfig = []byte(`{"allow":["read_file"]}`)
+	pe := tools.NewPolicyEngine(&config.ToolsConfig{
+		Deny: []string{"mcp_cloudflare__delete_dns_record"}, // unrelated tool, different name
+	})
+
+	r := BuildPreviewPrompt(context.Background(), ag, PromptFull, "u1", PreviewDeps{
+		MCPLister: &mockMCPLister{
+			tools: []MCPToolPreviewInfo{
+				{RegisteredName: "mcp_pg_query", Description: "Run PostgreSQL queries"},
+			},
+		},
+		ToolPolicy: pe,
+	})
+
+	var found *providers.ToolDefinition
+	for i := range r.ToolDefs {
+		if r.ToolDefs[i].Function != nil && r.ToolDefs[i].Function.Name == "mcp_pg_query" {
+			found = &r.ToolDefs[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected mcp_pg_query (not literally denied) in ToolDefs regardless of group-expansion resolution, got: %+v", r.ToolDefs)
 	}
 }

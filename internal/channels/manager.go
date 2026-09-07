@@ -11,6 +11,7 @@ import (
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/systemmessages"
 )
 
 // ChannelStream is the per-run streaming handle stored on RunContext.
@@ -54,9 +55,18 @@ type RunContext struct {
 	thinkingBuffer       string        // accumulated thinking/reasoning text
 	hasThinking          bool          // true if any thinking events received this iteration
 	thinkingDone         bool          // true after first chunk arrives (reasoning→answer transition complete)
-	tagParseSkipped      bool          // true after first chunk with no <think> tags (skip re-parsing)
+	tagParsePending      string        // raw trailing text withheld because it may be a split <think> tag
 	reasoningBubbles     *reasoningBubbleBuffer
 	reasoningBubbleTimer *time.Timer
+
+	// Activity indicator state (for ActivityIndicatorChannel, e.g. Bitrix24).
+	// Ephemeral "agent is working" indicator driven by agent events + a conditional
+	// heartbeat ticker. All fields guarded by mu.
+	activityStatus  string        // current platform-native status code (e.g. THINKING)
+	lastActivityAt  time.Time     // last time a notify was sent (throttle + heartbeat gate)
+	activityStarted bool          // true once the heartbeat ticker is running (start-once guard)
+	activityTicker  *time.Ticker  // heartbeat ticker; nil when not running
+	activityStop    chan struct{} // closed to stop the heartbeat goroutine
 }
 
 // Manager manages all registered channels, handling their lifecycle
@@ -66,9 +76,11 @@ type Manager struct {
 	health           map[string]ChannelHealth
 	bus              *bus.MessageBus
 	runs             sync.Map // runID string → *RunContext
+	mediaClaims      sync.Map // temp media path → struct{}, in-flight dispatch claims
 	dispatchTask     *asyncTask
 	mu               sync.RWMutex
 	contactCollector *store.ContactCollector
+	systemMessages   *systemmessages.Resolver
 }
 
 type asyncTask struct {
@@ -159,6 +171,23 @@ func (m *Manager) GetChannel(name string) (Channel, bool) {
 	return channel, ok
 }
 
+// ClearGroupApproval removes a chat from a channel's in-memory pairing
+// approval cache (BaseChannel.approvedGroups). Used when a group pairing is
+// revoked so the bot re-enters the pairing gate on the next message instead of
+// continuing to reply as if it were still approved. Channels that don't embed
+// BaseChannel are ignored.
+func (m *Manager) ClearGroupApproval(channelName, chatID string) {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return
+	}
+	if c, ok := ch.(interface{ ClearGroupApproval(string) }); ok {
+		c.ClearGroupApproval(chatID)
+	}
+}
+
 // GetStatus returns the running status of all channels.
 func (m *Manager) GetStatus() map[string]any {
 	m.mu.RLock()
@@ -196,11 +225,33 @@ func (m *Manager) RegisterChannel(name string, channel Channel) {
 			bc.SetContactCollector(m.contactCollector)
 		}
 	}
+	if m.systemMessages != nil {
+		if sm, ok := channel.(interface {
+			SetSystemMessages(*systemmessages.Resolver)
+		}); ok {
+			sm.SetSystemMessages(m.systemMessages)
+		}
+	}
 	m.channels[name] = channel
 	if hc, ok := channel.(interface{ MarkRegistered(string) }); ok {
 		hc.MarkRegistered("Configured")
 	}
 	m.syncChannelHealthLocked(name, channel)
+}
+
+// SetSystemMessages sets the resolver propagated to channels registered now and
+// in the future.
+func (m *Manager) SetSystemMessages(r *systemmessages.Resolver) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.systemMessages = r
+	for _, channel := range m.channels {
+		if sm, ok := channel.(interface {
+			SetSystemMessages(*systemmessages.Resolver)
+		}); ok {
+			sm.SetSystemMessages(r)
+		}
+	}
 }
 
 // RecordHealth stores runtime health for an instance, including failures before registration.
@@ -320,6 +371,84 @@ func (m *Manager) ListGroupMembers(ctx context.Context, channelName, chatID stri
 		return nil, fmt.Errorf("channel %q does not support listing group members", channelName)
 	}
 	return gmp.ListGroupMembers(ctx, chatID)
+}
+
+// ListGroups delegates to the channel's GroupListProvider if available.
+func (m *Manager) ListGroups(ctx context.Context, channelName string) ([]GroupInfo, error) {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("channel %q not found", channelName)
+	}
+	glp, ok := ch.(GroupListProvider)
+	if !ok {
+		return nil, fmt.Errorf("channel %q does not support listing groups", channelName)
+	}
+	return glp.ListGroups(ctx)
+}
+
+// ResolveGroupTitle delegates to the channel's GroupTitleProvider if available.
+func (m *Manager) ResolveGroupTitle(ctx context.Context, channelName, chatID string) (string, error) {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return "", fmt.Errorf("channel %q not found", channelName)
+	}
+	gtp, ok := ch.(GroupTitleProvider)
+	if !ok {
+		return "", fmt.Errorf("channel %q does not support resolving group titles", channelName)
+	}
+	return gtp.ResolveGroupTitle(ctx, chatID)
+}
+
+// ResolveGroupTitles delegates to the channel's batch GroupTitlesProvider when available.
+func (m *Manager) ResolveGroupTitles(ctx context.Context, channelName string, chatIDs []string) (map[string]string, error) {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("channel %q not found", channelName)
+	}
+	gtp, ok := ch.(GroupTitlesProvider)
+	if !ok {
+		return nil, fmt.Errorf("channel %q does not support resolving group titles", channelName)
+	}
+	return gtp.ResolveGroupTitles(ctx, chatIDs)
+}
+
+// ResolveGroupDisplayTitle resolves a presentation-only title for a group.
+// It is deliberately separate from ResolveGroupTitle so callers that need a
+// platform's raw title keep their existing contract.
+func (m *Manager) ResolveGroupDisplayTitle(ctx context.Context, channelName, chatID string) (string, error) {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return "", fmt.Errorf("channel %q not found", channelName)
+	}
+	provider, ok := ch.(GroupDisplayTitleProvider)
+	if !ok {
+		return "", fmt.Errorf("channel %q does not support resolving group display titles", channelName)
+	}
+	return provider.ResolveGroupDisplayTitle(ctx, chatID)
+}
+
+// ManageTelegram delegates a whitelisted Telegram management action to a
+// Telegram-capable channel instance.
+func (m *Manager) ManageTelegram(ctx context.Context, channelName string, req TelegramManagerRequest) (TelegramManagerResult, error) {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return TelegramManagerResult{}, fmt.Errorf("channel %q not found", channelName)
+	}
+	mp, ok := ch.(TelegramManagerProvider)
+	if !ok {
+		return TelegramManagerResult{}, fmt.Errorf("channel %q does not support Telegram management", channelName)
+	}
+	return mp.ManageTelegram(ctx, req)
 }
 
 // UnregisterChannel removes a channel from the manager.

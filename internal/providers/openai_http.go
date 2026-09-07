@@ -20,7 +20,13 @@ func (p *OpenAIProvider) doRequest(ctx context.Context, body any) (io.ReadCloser
 		return nil, fmt.Errorf("%s: marshal request: %w", p.name, err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.apiBase+p.chatPath, bytes.NewReader(data))
+	// Ollama: route to native /api/chat so options.num_ctx is honored.
+	// The OpenAI-compat shim at /v1/chat/completions silently ignores options.num_ctx.
+	url := p.apiBase + p.chatPath
+	if p.isOllamaEndpoint() {
+		url = p.ollamaNativeURL()
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("%s: create request: %w", p.name, err)
 	}
@@ -70,8 +76,12 @@ func (p *OpenAIProvider) doRequest(ctx context.Context, body any) (io.ReadCloser
 	return resp.Body, nil
 }
 
-func (p *OpenAIProvider) parseResponse(resp *openAIResponse) *ChatResponse {
+func (p *OpenAIProvider) parseResponse(resp *openAIResponse, tools ...[]ToolDefinition) *ChatResponse {
 	result := &ChatResponse{FinishReason: "stop"}
+	var toolDefs []ToolDefinition
+	if len(tools) > 0 {
+		toolDefs = tools[0]
+	}
 
 	if len(resp.Choices) > 0 {
 		msg := resp.Choices[0].Message
@@ -123,6 +133,14 @@ func (p *OpenAIProvider) parseResponse(resp *openAIResponse) *ChatResponse {
 				Data:     b64Data,
 			})
 		}
+
+		normalized := normalizeControlOutput(result.Content, result.Thinking, toolDefs)
+		result.Content = normalized.Content
+		result.Thinking = normalized.Thinking
+		result.ToolCalls = append(result.ToolCalls, normalized.ToolCalls...)
+		if len(result.ToolCalls) > 0 && result.FinishReason != "length" {
+			result.FinishReason = "tool_calls"
+		}
 	}
 
 	if resp.Usage != nil {
@@ -134,7 +152,7 @@ func (p *OpenAIProvider) parseResponse(resp *openAIResponse) *ChatResponse {
 		}
 		if resp.Usage.PromptTokensDetails != nil {
 			result.Usage.CacheReadTokens = resp.Usage.PromptTokensDetails.CachedTokens
-			result.Usage.CacheCreationTokens = resp.Usage.PromptTokensDetails.CacheWriteTokens
+			result.Usage.CacheCreationTokens = resp.Usage.PromptTokensDetails.CacheWriteTokens + resp.Usage.PromptTokensDetails.CacheCreationInputTokens
 			result.Usage.PromptTokensIncludeCachedSegments = true
 		}
 		if resp.Usage.CompletionTokensDetails != nil && resp.Usage.CompletionTokensDetails.ReasoningTokens > 0 {
@@ -146,6 +164,21 @@ func (p *OpenAIProvider) parseResponse(resp *openAIResponse) *ChatResponse {
 	}
 
 	return result
+}
+
+func emitNormalizedControlChunk(result *ChatResponse, normalized controlOutput, stripThinking bool, onChunk func(StreamChunk)) {
+	if normalized.Thinking != "" && !stripThinking {
+		result.Thinking = joinThinking(result.Thinking, normalized.Thinking)
+		if onChunk != nil {
+			onChunk(StreamChunk{Thinking: normalized.Thinking})
+		}
+	}
+	if normalized.Content != "" {
+		result.Content += normalized.Content
+		if onChunk != nil {
+			onChunk(StreamChunk{Content: normalized.Content})
+		}
+	}
 }
 
 // maxTokensLimitRe matches "supports at most N completion tokens" from OpenAI 400 errors.

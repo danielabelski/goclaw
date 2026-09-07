@@ -97,6 +97,9 @@ func Default() *Config {
 			Telegram: TelegramConfig{
 				ReactionLevel: "full",
 			},
+			Discord: DiscordConfig{
+				HistoryLimit: 200,
+			},
 		},
 		Gateway: GatewayConfig{
 			Host:            "0.0.0.0",
@@ -156,6 +159,8 @@ func (c *Config) applyEnvOverrides() {
 	envStr("GOCLAW_ANTHROPIC_BASE_URL", &c.Providers.Anthropic.APIBase)
 	envStr("GOCLAW_OPENAI_API_KEY", &c.Providers.OpenAI.APIKey)
 	envStr("GOCLAW_OPENAI_BASE_URL", &c.Providers.OpenAI.APIBase)
+	envStr("GOCLAW_ATLASCLOUD_API_KEY", &c.Providers.AtlasCloud.APIKey)
+	envStr("GOCLAW_ATLASCLOUD_BASE_URL", &c.Providers.AtlasCloud.APIBase)
 	envStr("GOCLAW_API_ROUTE_API_KEY", &c.Providers.APIRoute.APIKey)
 	envStr("GOCLAW_API_ROUTE_BASE_URL", &c.Providers.APIRoute.APIBase)
 	envStr("GOCLAW_OPENROUTER_API_KEY", &c.Providers.OpenRouter.APIKey)
@@ -183,6 +188,7 @@ func (c *Config) applyEnvOverrides() {
 	envStr("GOCLAW_VERTEX_REGION", &c.Providers.Vertex.Region)
 	envStr("GOCLAW_VERTEX_MODEL", &c.Providers.Vertex.Model)
 	envStr("GOCLAW_GATEWAY_TOKEN", &c.Gateway.Token)
+	envStr("GOCLAW_MCP_SERVER_TOKEN", &c.Gateway.MCPServerToken)
 	envStr("GOCLAW_TELEGRAM_TOKEN", &c.Channels.Telegram.Token)
 	envStr("GOCLAW_DISCORD_TOKEN", &c.Channels.Discord.Token)
 	envStr("GOCLAW_ZALO_TOKEN", &c.Channels.Zalo.Token)
@@ -253,6 +259,18 @@ func (c *Config) applyEnvOverrides() {
 			c.Skills.MaxUploadSizeMB = ClampSkillMaxUploadSizeMB(mb)
 		}
 	}
+	// Webhook agent-run timeouts (seconds). Bounds (default 600, cap 3600) are
+	// applied at consumption via webhooks.ResolveTimeoutSec.
+	if v := os.Getenv("GOCLAW_WEBHOOK_ASYNC_TIMEOUT_SEC"); v != "" {
+		if sec, err := strconv.Atoi(v); err == nil && sec > 0 {
+			c.Gateway.WebhookAsyncTimeoutSec = sec
+		}
+	}
+	if v := os.Getenv("GOCLAW_WEBHOOK_SYNC_TIMEOUT_SEC"); v != "" {
+		if sec, err := strconv.Atoi(v); err == nil && sec > 0 {
+			c.Gateway.WebhookSyncTimeoutSec = sec
+		}
+	}
 	envBoolPtr := func(key string, dst **bool) {
 		if v := os.Getenv(key); v != "" {
 			b := parseEnvBool(v)
@@ -264,6 +282,8 @@ func (c *Config) applyEnvOverrides() {
 			*dst = parseEnvBool(v)
 		}
 	}
+	// Webhook internal streaming toggle (default true; nil → on via webhooks.ResolveStream).
+	envBoolPtr("GOCLAW_WEBHOOK_STREAM", &c.Gateway.WebhookStream)
 	envBoolPtr("GOCLAW_SKILLS_SLASH_COMMANDS_ENABLED", &c.Skills.SlashCommands.Enabled)
 	envBoolPtr("GOCLAW_SKILLS_SLASH_COMMANDS_SUGGEST_NOT_FOUND", &c.Skills.SlashCommands.SuggestNotFound)
 	envBool("GOCLAW_SKILLS_SLASH_COMMANDS_PARTIAL_MATCHING", &c.Skills.SlashCommands.PartialMatching)
@@ -311,6 +331,19 @@ func (c *Config) applyEnvOverrides() {
 			}
 		}
 		c.Gateway.AllowedOrigins = origins
+	}
+
+	// Trusted MCP server hosts from env (comma-separated, whitespace-trimmed).
+	// These hosts are exempt from the private-IP SSRF block when registering MCP
+	// servers (e.g. self-hosted MCP on a private network).
+	if v := os.Getenv("GOCLAW_MCP_ALLOWED_HOSTS"); v != "" {
+		var hosts []string
+		for h := range strings.SplitSeq(v, ",") {
+			if trimmed := strings.TrimSpace(h); trimmed != "" {
+				hosts = append(hosts, trimmed)
+			}
+		}
+		c.Gateway.MCPAllowedHosts = hosts
 	}
 
 	// Tailscale (tsnet)
@@ -365,9 +398,13 @@ func (c *Config) applyEnvOverrides() {
 
 	// Browser (for Docker-compose browser sidecar overlay)
 	envStr("GOCLAW_BROWSER_REMOTE_URL", &c.Tools.Browser.RemoteURL)
+	envStr("GOCLAW_BROWSER_BACKEND", &c.Tools.Browser.Backend)
 	if c.Tools.Browser.RemoteURL != "" {
 		c.Tools.Browser.Enabled = true
 	}
+
+	// Cron job execution
+	envStr("GOCLAW_CRON_JOB_TIMEOUT", &c.Cron.JobTimeout)
 }
 
 // Save writes the config to a JSON file.

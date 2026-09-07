@@ -10,6 +10,9 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/nextlevelbuilder/goclaw/internal/config"
 )
 
 // ContentHash returns a short SHA256 hex digest of the content (first 16 bytes).
@@ -144,6 +147,7 @@ type OpenAIEmbeddingProvider struct {
 	apiKey     string
 	apiURL     string
 	dimensions int // optional: truncate output to this many dimensions (0 = use model default)
+	httpClient *http.Client
 }
 
 // NewOpenAIEmbeddingProvider creates a provider for OpenAI-compatible embedding APIs.
@@ -154,12 +158,17 @@ func NewOpenAIEmbeddingProvider(name, apiKey, apiURL, model string) *OpenAIEmbed
 	if model == "" {
 		model = "text-embedding-3-small"
 	}
+	// Rewrite loopback hosts to host.docker.internal when running inside Docker,
+	// centralized here so no call site (verify handler, runtime memory embedding)
+	// can reach the container itself instead of a host service like Ollama.
+	apiURL = config.DockerLocalhost(apiURL)
 
 	return &OpenAIEmbeddingProvider{
-		name:   name,
-		model:  model,
-		apiKey: apiKey,
-		apiURL: apiURL,
+		name:       name,
+		model:      model,
+		apiKey:     apiKey,
+		apiURL:     apiURL,
+		httpClient: &http.Client{Timeout: 60 * time.Second},
 	}
 }
 
@@ -194,7 +203,7 @@ func (p *OpenAIEmbeddingProvider) Embed(ctx context.Context, texts []string) ([]
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+p.apiKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := p.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("embedding request: %w", err)
 	}
@@ -208,6 +217,7 @@ func (p *OpenAIEmbeddingProvider) Embed(ctx context.Context, texts []string) ([]
 	var result struct {
 		Data []struct {
 			Embedding []float32 `json:"embedding"`
+			Index     *int      `json:"index"`
 		} `json:"data"`
 	}
 
@@ -215,9 +225,37 @@ func (p *OpenAIEmbeddingProvider) Embed(ctx context.Context, texts []string) ([]
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 
+	if len(result.Data) != len(texts) {
+		return nil, fmt.Errorf("embedding response count: got %d vectors for %d inputs", len(result.Data), len(texts))
+	}
+
 	embeddings := make([][]float32, len(result.Data))
-	for i, d := range result.Data {
-		embeddings[i] = d.Embedding
+	indexed := false
+	for _, d := range result.Data {
+		indexed = indexed || d.Index != nil
+	}
+	seen := make([]bool, len(result.Data))
+	for responseIndex, d := range result.Data {
+		targetIndex := responseIndex
+		if indexed {
+			if d.Index == nil || *d.Index < 0 || *d.Index >= len(result.Data) || seen[*d.Index] {
+				return nil, fmt.Errorf("embedding response has invalid index at position %d", responseIndex)
+			}
+			targetIndex = *d.Index
+		}
+		seen[targetIndex] = true
+		if len(d.Embedding) == 0 {
+			return nil, fmt.Errorf("embedding response has empty vector at index %d", targetIndex)
+		}
+		if p.dimensions > 0 && len(d.Embedding) != p.dimensions {
+			return nil, fmt.Errorf("embedding response dimension at index %d: got %d, want %d", targetIndex, len(d.Embedding), p.dimensions)
+		}
+		for _, value := range d.Embedding {
+			if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+				return nil, fmt.Errorf("embedding response has non-finite value at index %d", targetIndex)
+			}
+		}
+		embeddings[targetIndex] = d.Embedding
 	}
 
 	return embeddings, nil

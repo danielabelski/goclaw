@@ -40,6 +40,7 @@ export const queryKeys = {
     list: (params: Record<string, unknown>) => ["channels", params] as const,
     detail: (id: string) => ["channels", "detail", id] as const,
     memoryExtraction: (id: string) => ["channels", "detail", id, "memory-extraction"] as const,
+    memoryExtractionGroups: (id: string) => ["channels", "detail", id, "memory-extraction", "groups"] as const,
     memoryExtractionItems: (id: string, params: Record<string, unknown>) =>
       ["channels", "detail", id, "memory-extraction", "items", params] as const,
     contexts: (id: string) => ["channels", "detail", id, "contexts"] as const,
@@ -70,6 +71,12 @@ export const queryKeys = {
     all: ["hooks"] as const,
     detail: (id: string) => ["hooks", id] as const,
     history: (id: string) => ["hooks", id, "history"] as const,
+  },
+  webhooks: {
+    all: ["webhooks"] as const,
+    list: (params: Record<string, unknown>) => ["webhooks", "list", params] as const,
+    calls: (id: string, params: Record<string, unknown>) => ["webhooks", id, "calls", params] as const,
+    call: (id: string, callId: string) => ["webhooks", id, "calls", callId] as const,
   },
   builtinTools: {
     all: ["builtinTools"] as const,

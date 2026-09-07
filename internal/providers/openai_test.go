@@ -293,7 +293,6 @@ func TestBuildRequestBody_MultimodalWithVideoURL(t *testing.T) {
 	}
 }
 
-
 func TestBuildRequestBody_TogetherDetectedByProviderType(t *testing.T) {
 	// Together behind reverse proxy — detected by providerType, not URL.
 	p := NewOpenAIProvider("my-proxy", "key", "https://proxy.internal/v1", "")
@@ -636,5 +635,120 @@ func TestBuildRequestBody_MistralDBProviderTypeDetected(t *testing.T) {
 	got := p.wireToolCallID(id)
 	if !mistralWireIDRe.MatchString(got) {
 		t.Fatalf("DB provider with providerType=mistral: got %q, want 9 hex chars", got)
+	}
+}
+
+func TestBuildRequestBody_OllamaDisablesThinkByDefault(t *testing.T) {
+	// Ollama thinking models (qwq, deepseek-r1) have thinking on by default.
+	// goclaw must send think=false unless the user explicitly enables thinking.
+	cases := []struct {
+		name     string
+		provider *OpenAIProvider
+	}{
+		{
+			name:     "ollama by name",
+			provider: NewOpenAIProvider("ollama", "", "http://localhost:11434/v1", ""),
+		},
+		{
+			name:     "ollama by providerType",
+			provider: NewOpenAIProvider("local", "", "http://myhost:11434/v1", "").WithProviderType("ollama"),
+		},
+		{
+			name:     "ollama_cloud by providerType",
+			provider: NewOpenAIProvider("local", "", "https://cloud.ollama.ai/v1", "").WithProviderType("ollama_cloud"),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := ChatRequest{Messages: []Message{{Role: "user", Content: "hi"}}}
+			body := tc.provider.buildRequestBody("qwq:32b", req, false)
+			think, ok := body["think"]
+			if !ok {
+				t.Fatalf("%s: expected think field in request body", tc.name)
+			}
+			if think != false {
+				t.Fatalf("%s: expected think=false, got %v", tc.name, think)
+			}
+		})
+	}
+}
+
+func TestBuildRequestBody_OllamaThinkNotDisabledWhenLevelSet(t *testing.T) {
+	// When OptThinkingLevel is explicitly set to a non-off value, think=false must NOT be sent
+	// so that thinking is allowed for users who opted in.
+	p := NewOpenAIProvider("ollama", "", "http://localhost:11434/v1", "")
+	req := ChatRequest{
+		Messages: []Message{{Role: "user", Content: "reason about this"}},
+		Options:  map[string]any{OptThinkingLevel: "high"},
+	}
+	body := p.buildRequestBody("qwq:32b", req, false)
+	if think, ok := body["think"]; ok && think == false {
+		t.Fatalf("ollama with OptThinkingLevel=high must not send think=false, got think=%v", think)
+	}
+}
+
+func TestOllamaSupportsThinkingFalse(t *testing.T) {
+	p := NewOpenAIProvider("ollama", "", "http://localhost:11434/v1", "").WithProviderType("ollama")
+	if p.SupportsThinking() {
+		t.Fatal("SupportsThinking() must return false for Ollama endpoints")
+	}
+	if p.Capabilities().Thinking {
+		t.Fatal("Capabilities().Thinking must be false for Ollama endpoints")
+	}
+}
+
+func TestNonOllamaSupportsThinkingTrue(t *testing.T) {
+	p := NewOpenAIProvider("openai", "key", "https://api.openai.com/v1", "")
+	if !p.SupportsThinking() {
+		t.Fatal("SupportsThinking() must return true for non-Ollama OpenAI-compat providers")
+	}
+}
+
+func TestBuildRequestBody_OllamaThinkingEnabledOverride(t *testing.T) {
+	// Provider-level settings.thinking_enabled overrides the default off
+	// behavior for Ollama endpoints, regardless of OptThinkingLevel.
+	trueVal := true
+	falseVal := false
+
+	cases := []struct {
+		name     string
+		override *bool
+		want     bool
+	}{
+		{name: "override true enables thinking", override: &trueVal, want: true},
+		{name: "override false disables thinking", override: &falseVal, want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewOpenAIProvider("ollama", "", "http://localhost:11434/v1", "").
+				WithThinkingEnabled(tc.override)
+			req := ChatRequest{Messages: []Message{{Role: "user", Content: "hi"}}}
+			body := p.buildRequestBody("qwq:32b", req, false)
+			think, ok := body["think"]
+			if !ok {
+				t.Fatalf("expected think field in request body")
+			}
+			if think != tc.want {
+				t.Fatalf("think = %v, want %v", think, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildRequestBody_OllamaThinkingEnabledOverrideTakesPrecedenceOverLevel(t *testing.T) {
+	// Even when OptThinkingLevel requests non-off reasoning, an explicit
+	// provider-level thinking_enabled=false must still win.
+	falseVal := false
+	p := NewOpenAIProvider("ollama", "", "http://localhost:11434/v1", "").
+		WithThinkingEnabled(&falseVal)
+	req := ChatRequest{
+		Messages: []Message{{Role: "user", Content: "reason about this"}},
+		Options:  map[string]any{OptThinkingLevel: "high"},
+	}
+	body := p.buildRequestBody("qwq:32b", req, false)
+	if think, ok := body["think"]; !ok || think != false {
+		t.Fatalf("expected think=false when provider override is false, got %v (present=%v)", think, ok)
 	}
 }

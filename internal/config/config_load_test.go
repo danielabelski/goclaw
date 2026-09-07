@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // --- Default ---
@@ -39,6 +40,9 @@ func TestDefault_SensibleDefaults(t *testing.T) {
 	if cfg.Skills.SlashCommands.EffectivePrefix() != "/" {
 		t.Fatalf("slash command prefix = %q, want /", cfg.Skills.SlashCommands.EffectivePrefix())
 	}
+	if cfg.Channels.Discord.HistoryLimit != 200 {
+		t.Fatalf("default discord history limit: got %d, want 200", cfg.Channels.Discord.HistoryLimit)
+	}
 
 }
 
@@ -51,6 +55,9 @@ func TestLoad_MissingFile_UsesDefaults(t *testing.T) {
 	}
 	if cfg.Gateway.Port != 18790 {
 		t.Fatalf("expected default port, got %d", cfg.Gateway.Port)
+	}
+	if cfg.Channels.Discord.HistoryLimit != 200 {
+		t.Fatalf("expected default discord history limit, got %d", cfg.Channels.Discord.HistoryLimit)
 	}
 }
 
@@ -86,6 +93,28 @@ func TestLoad_ValidJSON5(t *testing.T) {
 	}
 }
 
+func TestLoad_DiscordHistoryLimitExplicitZeroDisables(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json5")
+
+	content := `{
+		"channels": {
+			"discord": {
+				"history_limit": 0,
+			},
+		},
+	}`
+	os.WriteFile(cfgPath, []byte(content), 0644)
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load error: %v", err)
+	}
+	if cfg.Channels.Discord.HistoryLimit != 0 {
+		t.Fatalf("discord history_limit explicit zero: got %d, want 0", cfg.Channels.Discord.HistoryLimit)
+	}
+}
+
 // --- Load with invalid JSON5 → error ---
 
 func TestLoad_InvalidJSON5(t *testing.T) {
@@ -115,6 +144,72 @@ func TestLoad_EnvVarOverrides(t *testing.T) {
 	}
 	if cfg.Gateway.Port != 7777 {
 		t.Fatalf("env override: got port %d, want 7777", cfg.Gateway.Port)
+	}
+}
+
+func TestLoad_WebhookTimeoutsFromFileAndEnv(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json5")
+	os.WriteFile(cfgPath, []byte(`{"gateway":{"webhook_async_timeout_sec":120,"webhook_sync_timeout_sec":90}}`), 0644)
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load error: %v", err)
+	}
+	if cfg.Gateway.WebhookAsyncTimeoutSec != 120 {
+		t.Fatalf("file async timeout: got %d, want 120", cfg.Gateway.WebhookAsyncTimeoutSec)
+	}
+	if cfg.Gateway.WebhookSyncTimeoutSec != 90 {
+		t.Fatalf("file sync timeout: got %d, want 90", cfg.Gateway.WebhookSyncTimeoutSec)
+	}
+
+	// Env overrides the file values.
+	t.Setenv("GOCLAW_WEBHOOK_ASYNC_TIMEOUT_SEC", "300")
+	t.Setenv("GOCLAW_WEBHOOK_SYNC_TIMEOUT_SEC", "240")
+	cfg, err = Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load with env error: %v", err)
+	}
+	if cfg.Gateway.WebhookAsyncTimeoutSec != 300 {
+		t.Fatalf("env async timeout: got %d, want 300", cfg.Gateway.WebhookAsyncTimeoutSec)
+	}
+	if cfg.Gateway.WebhookSyncTimeoutSec != 240 {
+		t.Fatalf("env sync timeout: got %d, want 240", cfg.Gateway.WebhookSyncTimeoutSec)
+	}
+}
+
+func TestLoad_WebhookStreamFromFileAndEnv(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json5")
+
+	// Unset by default: nil pointer → ResolveStream defaults to true elsewhere.
+	os.WriteFile(cfgPath, []byte(`{"gateway":{"port":8080}}`), 0644)
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load error: %v", err)
+	}
+	if cfg.Gateway.WebhookStream != nil {
+		t.Fatalf("default webhook_stream: got %v, want nil", *cfg.Gateway.WebhookStream)
+	}
+
+	// Explicit false in file.
+	os.WriteFile(cfgPath, []byte(`{"gateway":{"webhook_stream":false}}`), 0644)
+	cfg, err = Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load error: %v", err)
+	}
+	if cfg.Gateway.WebhookStream == nil || *cfg.Gateway.WebhookStream != false {
+		t.Fatalf("file webhook_stream: got %v, want false", cfg.Gateway.WebhookStream)
+	}
+
+	// Env overrides the file value.
+	t.Setenv("GOCLAW_WEBHOOK_STREAM", "true")
+	cfg, err = Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load with env error: %v", err)
+	}
+	if cfg.Gateway.WebhookStream == nil || *cfg.Gateway.WebhookStream != true {
+		t.Fatalf("env webhook_stream: got %v, want true", cfg.Gateway.WebhookStream)
 	}
 }
 
@@ -454,5 +549,57 @@ func TestLoad_OwnerIDsEmpty(t *testing.T) {
 		if id == "" {
 			t.Fatal("empty owner ID should not be included")
 		}
+	}
+}
+
+// --- Cron job timeout env override ---
+
+func TestLoad_CronJobTimeout_EnvVar(t *testing.T) {
+	t.Setenv("GOCLAW_CRON_JOB_TIMEOUT", "1h")
+
+	cfg, err := Load("/nonexistent/path")
+	if err != nil {
+		t.Fatalf("load error: %v", err)
+	}
+	if got := cfg.Cron.JobTimeoutDuration(); got != time.Hour {
+		t.Fatalf("cron timeout: got %v, want 1h", got)
+	}
+}
+
+func TestLoad_CronJobTimeout_Invalid_FallsBackToDefault(t *testing.T) {
+	t.Setenv("GOCLAW_CRON_JOB_TIMEOUT", "not-a-duration")
+
+	cfg, err := Load("/nonexistent/path")
+	if err != nil {
+		t.Fatalf("load error: %v", err)
+	}
+	if got := cfg.Cron.JobTimeoutDuration(); got != DefaultJobTimeout {
+		t.Fatalf("invalid duration should fall back to default %v, got %v", DefaultJobTimeout, got)
+	}
+}
+
+func TestLoad_CronJobTimeout_Unset_UsesDefault(t *testing.T) {
+	cfg, err := Load("/nonexistent/path")
+	if err != nil {
+		t.Fatalf("load error: %v", err)
+	}
+	if got := cfg.Cron.JobTimeoutDuration(); got != DefaultJobTimeout {
+		t.Fatalf("unset env should use default %v, got %v", DefaultJobTimeout, got)
+	}
+}
+
+func TestLoad_CronJobTimeout_EnvOverridesFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json5")
+	os.WriteFile(cfgPath, []byte(`{"cron":{"job_timeout":"5m"}}`), 0644)
+
+	t.Setenv("GOCLAW_CRON_JOB_TIMEOUT", "30m")
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load error: %v", err)
+	}
+	if got := cfg.Cron.JobTimeoutDuration(); got != 30*time.Minute {
+		t.Fatalf("env should override file: got %v, want 30m", got)
 	}
 }
