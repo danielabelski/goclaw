@@ -151,6 +151,14 @@ func TestClassifyTooManyTokens(t *testing.T) {
 	}
 }
 
+func TestClassifyContextOverflowLlamaCpp(t *testing.T) {
+	classifier := NewDefaultClassifier()
+	result := classifier.Classify(nil, 400, `{"error":{"code":400,"message":"request (218678 tokens) exceeds the available context size (204800 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":218678,"n_ctx":204800}}`)
+	if result.Kind != "context_overflow" {
+		t.Errorf("expected context_overflow for llama.cpp message, got %s", result.Kind)
+	}
+}
+
 func TestClassifyNetworkTimeoutError(t *testing.T) {
 	classifier := NewDefaultClassifier()
 	timeoutErr := &net.DNSError{
