@@ -144,6 +144,8 @@ func openAIModelsAPIBase(providerType, apiBase string) string {
 	switch providerType {
 	case store.ProviderAtlasCloud:
 		return store.AtlasCloudDefaultAPIBase
+	case store.ProviderAPIRoute:
+		return store.APIRouteDefaultAPIBase
 	case store.ProviderKimiCoding:
 		return store.KimiCodingDefaultAPIBase
 	default:

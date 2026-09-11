@@ -37,6 +37,7 @@ const (
 	ProviderVertex          = "vertex"          // Google Cloud Vertex AI (OAuth2 service account + ADC)
 	ProviderKimiCoding      = "kimi_coding"     // Moonshot Kimi Coding (OpenAI-compat, requires fixed User-Agent)
 	ProviderAtlasCloud      = "atlascloud"      // Atlas Cloud (OpenAI-compatible endpoint)
+	ProviderAPIRoute        = "api_route"       // API Route (OpenAI-compatible endpoint)
 
 	// MiniMax defaults.
 	MiniMaxDefaultAPIBase = "https://api.minimax.io/v1"
@@ -66,6 +67,10 @@ const (
 	// Atlas Cloud defaults.
 	AtlasCloudDefaultAPIBase = "https://api.atlascloud.ai/v1"
 	AtlasCloudDefaultModel   = "qwen/qwen3.5-flash"
+
+	// API Route defaults.
+	APIRouteDefaultAPIBase = "https://global.api-route.com/v1"
+	APIRouteDefaultModel   = "gpt-5.4-mini"
 )
 
 // Vertex AI constants live in internal/providers/vertex.go to avoid a store→providers import cycle
@@ -102,6 +107,7 @@ var ValidProviderTypes = map[string]bool{
 	ProviderVertex:          true,
 	ProviderKimiCoding:      true,
 	ProviderAtlasCloud:      true,
+	ProviderAPIRoute:        true,
 }
 
 // VertexProviderSettings holds Vertex-specific config stored in llm_providers.settings JSONB.

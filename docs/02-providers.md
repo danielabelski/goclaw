@@ -97,6 +97,7 @@ Supported price units: input, output, cache read, cache write, reasoning, reques
 |----------|----------|---------------|-------|
 | openai | `https://api.openai.com/v1` | `gpt-4o` | |
 | atlascloud | `https://api.atlascloud.ai/v1` | `qwen/qwen3.5-flash` | Atlas Cloud OpenAI-compatible LLM endpoint |
+| api_route | `https://global.api-route.com/v1` | `gpt-5.4-mini` | API Route branded OpenAI-compatible endpoint |
 | openrouter | `https://openrouter.ai/api/v1` | `anthropic/claude-sonnet-4-5-20250929` | Model must contain `/` |
 | groq | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` | |
 | deepseek | `https://api.deepseek.com/v1` | `deepseek-chat` | |
@@ -112,6 +113,27 @@ Supported price units: input, output, cache read, cache write, reasoning, reques
 | zai-coding | `https://api.z.ai/api/coding/paas/v4` | `glm-5.2` | 1M context, 128K max output |
 | byteplus | `https://ark.ap-southeast.bytepluses.com/api/v3` | `seed-2-0-lite-260228` | Seed 2.0 models |
 | byteplus_coding | `https://ark.ap-southeast.bytepluses.com/api/coding/v3` | `seed-2-0-lite-260228` | Seed 2.0 Coding Plan |
+
+### API Route setup
+
+Set `GOCLAW_API_ROUTE_API_KEY` in the environment, or add the key through the setup wizard. The base URL and model below are defaults and can be overridden:
+
+```json5
+{
+  providers: {
+    api_route: {
+      api_key: "your-api-route-key",
+      api_base: "https://global.api-route.com/v1"
+    }
+  },
+  agents: {
+    defaults: {
+      provider: "api_route",
+      model: "gpt-5.4-mini"
+    }
+  }
+}
+```
 
 ---
 
