@@ -12,15 +12,20 @@
     "senderId": "발신자 ID",
     "paired": "페어링됨",
     "by": "처리자",
+    "expires": "만료",
     "actions": "작업"
   },
   "approve": "승인",
   "deny": "거부",
   "revoke": "취소",
+  "never": "없음",
+  "makePermanent": "영구로 설정",
+  "makeExpiring": "만료 설정",
   "confirmApprove": {
     "title": "페어링 승인",
     "description": "{{channel}}:{{senderId}}의 페어링 요청을 승인하시겠습니까 (코드: {{code}})? 이 기기가 에이전트와 상호작용할 수 있게 됩니다.",
-    "confirmLabel": "승인"
+    "confirmLabel": "승인",
+    "permanent": "만료 없음 (기본값 30일)"
   },
   "confirmDeny": {
     "title": "페어링 거부",
@@ -31,5 +36,15 @@
     "title": "기기 취소",
     "description": "{{channel}}:{{senderId}}의 페어링을 취소하시겠습니까? 기기는 다시 페어링해야 합니다.",
     "confirmLabel": "취소"
+  },
+  "confirmPermanent": {
+    "title": "영구 페어링",
+    "description": "{{channel}}:{{senderId}} 페어링을 영구로 설정하시겠습니까? 수동으로 해제할 때까지 유지됩니다.",
+    "confirmLabel": "영구로 설정"
+  },
+  "confirmExpiring": {
+    "title": "페어링 만료 설정",
+    "description": "{{channel}}:{{senderId}} 페어링을 기본 기간으로 되돌리시겠습니까? 지금부터 30일 후 만료됩니다.",
+    "confirmLabel": "만료 설정"
   }
 }

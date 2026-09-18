@@ -15,13 +15,15 @@ type PairingRequestData struct {
 }
 
 // PairedDeviceData represents an approved pairing.
+// ExpiresAt is Unix ms; nil means the pairing never expires.
 type PairedDeviceData struct {
-	SenderID string            `json:"sender_id" db:"sender_id"`
-	Channel  string            `json:"channel" db:"channel"`
-	ChatID   string            `json:"chat_id" db:"chat_id"`
-	PairedAt int64             `json:"paired_at" db:"paired_at"`
-	PairedBy string            `json:"paired_by" db:"paired_by"`
-	Metadata map[string]string `json:"metadata,omitempty" db:"metadata"`
+	SenderID  string            `json:"sender_id" db:"sender_id"`
+	Channel   string            `json:"channel" db:"channel"`
+	ChatID    string            `json:"chat_id" db:"chat_id"`
+	PairedAt  int64             `json:"paired_at" db:"paired_at"`
+	PairedBy  string            `json:"paired_by" db:"paired_by"`
+	ExpiresAt *int64            `json:"expires_at" db:"expires_at"`
+	Metadata  map[string]string `json:"metadata,omitempty" db:"metadata"`
 }
 
 // PairingStore manages device pairing.
@@ -31,6 +33,9 @@ type PairingStore interface {
 	DenyPairing(ctx context.Context, code string) error
 	RevokePairing(ctx context.Context, senderID, channel string) error
 	IsPaired(ctx context.Context, senderID, channel string) (bool, error)
+	// SetPairingPermanent clears the expiry of an existing pairing (permanent=true)
+	// or restarts the default TTL from now (permanent=false).
+	SetPairingPermanent(ctx context.Context, senderID, channel string, permanent bool) error
 	ListPending(ctx context.Context) []PairingRequestData
 	ListPaired(ctx context.Context) []PairedDeviceData
 	// MigrateGroupChatID updates all references from oldChatID to newChatID

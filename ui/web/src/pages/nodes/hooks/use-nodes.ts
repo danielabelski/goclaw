@@ -20,6 +20,8 @@ export interface PairedDevice {
   chat_id: string;
   paired_at: number;
   paired_by: string;
+  /** Unix ms; null means the pairing never expires. */
+  expires_at: number | null;
 }
 
 export function useNodes() {
@@ -59,8 +61,8 @@ export function useNodes() {
   });
 
   const approvePairing = useCallback(
-    async (code: string) => {
-      await ws.call(Methods.PAIRING_APPROVE, { code });
+    async (code: string, permanent = false) => {
+      await ws.call(Methods.PAIRING_APPROVE, { code, permanent });
       load();
     },
     [ws, load],
@@ -82,5 +84,22 @@ export function useNodes() {
     [ws, load],
   );
 
-  return { pendingPairings, pairedDevices, loading, refresh: load, approvePairing, denyPairing, revokePairing };
+  const setPairingPermanent = useCallback(
+    async (senderId: string, channel: string, permanent: boolean) => {
+      await ws.call(Methods.PAIRING_UPDATE, { senderId, channel, permanent });
+      load();
+    },
+    [ws, load],
+  );
+
+  return {
+    pendingPairings,
+    pairedDevices,
+    loading,
+    refresh: load,
+    approvePairing,
+    denyPairing,
+    revokePairing,
+    setPairingPermanent,
+  };
 }

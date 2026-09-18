@@ -29,6 +29,10 @@ func (s *fakeBitrixPairingStore) ApprovePairing(context.Context, string, string)
 }
 func (s *fakeBitrixPairingStore) DenyPairing(context.Context, string) error           { return nil }
 func (s *fakeBitrixPairingStore) RevokePairing(context.Context, string, string) error { return nil }
+func (s *fakeBitrixPairingStore) SetPairingPermanent(context.Context, string, string, bool) error {
+	return nil
+}
+
 func (s *fakeBitrixPairingStore) IsPaired(context.Context, string, string) (bool, error) {
 	return false, nil
 }

@@ -12,15 +12,20 @@
     "senderId": "发送者 ID",
     "paired": "配对时间",
     "by": "操作人",
+    "expires": "过期时间",
     "actions": "操作"
   },
   "approve": "批准",
   "deny": "拒绝",
   "revoke": "撤销",
+  "never": "永不",
+  "makePermanent": "设为永久",
+  "makeExpiring": "设置期限",
   "confirmApprove": {
     "title": "批准配对",
     "description": "批准来自 {{channel}}:{{senderId}} 的配对请求（代码：{{code}}）？该设备将能与Agent交互。",
-    "confirmLabel": "批准"
+    "confirmLabel": "批准",
+    "permanent": "永不过期（默认 30 天）"
   },
   "confirmDeny": {
     "title": "拒绝配对",
@@ -31,5 +36,15 @@
     "title": "撤销设备",
     "description": "撤销 {{channel}}:{{senderId}} 的配对？该设备将需要重新配对。",
     "confirmLabel": "撤销"
+  },
+  "confirmPermanent": {
+    "title": "永久配对",
+    "description": "将 {{channel}}:{{senderId}} 的配对设为永久？在手动撤销之前一直有效。",
+    "confirmLabel": "设为永久"
+  },
+  "confirmExpiring": {
+    "title": "设置配对期限",
+    "description": "将 {{channel}}:{{senderId}} 的配对恢复为默认期限？将从现在起 30 天后过期。",
+    "confirmLabel": "设置期限"
   }
 }

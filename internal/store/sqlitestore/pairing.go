@@ -110,13 +110,15 @@ func (s *SQLitePairingStore) ApprovePairing(ctx context.Context, code, approvedB
 		json.Unmarshal(metaJSON, &meta)
 	}
 
+	expiresAtMs := expiresAt.UnixMilli()
 	return &store.PairedDeviceData{
-		SenderID: senderID,
-		Channel:  channel,
-		ChatID:   chatID,
-		PairedAt: now.UnixMilli(),
-		PairedBy: approvedBy,
-		Metadata: meta,
+		SenderID:  senderID,
+		Channel:   channel,
+		ChatID:    chatID,
+		PairedAt:  now.UnixMilli(),
+		PairedBy:  approvedBy,
+		ExpiresAt: &expiresAtMs,
+		Metadata:  meta,
 	}, nil
 }
 
@@ -135,6 +137,30 @@ func (s *SQLitePairingStore) DenyPairing(ctx context.Context, code string) error
 func (s *SQLitePairingStore) RevokePairing(ctx context.Context, senderID, channel string) error {
 	tid := tenantIDForInsert(ctx)
 	result, err := s.db.ExecContext(ctx, "DELETE FROM paired_devices WHERE sender_id = ? AND channel = ? AND tenant_id = ?", senderID, channel, tid)
+	if err != nil {
+		return err
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("paired device not found: %s/%s", channel, senderID)
+	}
+	return nil
+}
+
+// SetPairingPermanent clears (permanent=true) or restarts (permanent=false)
+// the expiry of a live pairing. An already expired pairing is not revived.
+func (s *SQLitePairingStore) SetPairingPermanent(ctx context.Context, senderID, channel string, permanent bool) error {
+	tid := tenantIDForInsert(ctx)
+	now := time.Now().Round(0)
+	var expiresAt any
+	if !permanent {
+		expiresAt = now.Add(pairedDeviceTTL)
+	}
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE paired_devices SET expires_at = ?
+		 WHERE sender_id = ? AND channel = ? AND tenant_id = ? AND (expires_at IS NULL OR expires_at > ?)`,
+		expiresAt, senderID, channel, tid, now,
+	)
 	if err != nil {
 		return err
 	}
@@ -204,7 +230,7 @@ func (s *SQLitePairingStore) ListPaired(ctx context.Context) []store.PairedDevic
 	s.db.ExecContext(ctx, "DELETE FROM paired_devices WHERE expires_at IS NOT NULL AND expires_at < ?", now)
 
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT sender_id, channel, chat_id, paired_by, paired_at, COALESCE(metadata, '{}')
+		`SELECT sender_id, channel, chat_id, paired_by, paired_at, expires_at, COALESCE(metadata, '{}')
 		 FROM paired_devices WHERE tenant_id = ? ORDER BY paired_at DESC`, tid)
 	if err != nil {
 		return nil
@@ -215,12 +241,17 @@ func (s *SQLitePairingStore) ListPaired(ctx context.Context) []store.PairedDevic
 	for rows.Next() {
 		var d store.PairedDeviceData
 		var pairedAtStr string
+		var expiresAtStr sql.NullString
 		var metaJSON []byte
-		if err := rows.Scan(&d.SenderID, &d.Channel, &d.ChatID, &d.PairedBy, &pairedAtStr, &metaJSON); err != nil {
+		if err := rows.Scan(&d.SenderID, &d.Channel, &d.ChatID, &d.PairedBy, &pairedAtStr, &expiresAtStr, &metaJSON); err != nil {
 			slog.Warn("pairing: scan paired error", "error", err)
 			continue
 		}
 		d.PairedAt = parseTimeToMillis(pairedAtStr)
+		if expiresAtStr.Valid {
+			ms := parseTimeToMillis(expiresAtStr.String)
+			d.ExpiresAt = &ms
+		}
 		if len(metaJSON) > 0 {
 			json.Unmarshal(metaJSON, &d.Metadata)
 		}

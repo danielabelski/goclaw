@@ -144,6 +144,10 @@ func (m *mockPairingStore) ApprovePairing(context.Context, string, string) (*sto
 }
 func (m *mockPairingStore) DenyPairing(context.Context, string) error           { return nil }
 func (m *mockPairingStore) RevokePairing(context.Context, string, string) error { return nil }
+func (s *mockPairingStore) SetPairingPermanent(context.Context, string, string, bool) error {
+	return nil
+}
+
 func (m *mockPairingStore) IsPaired(_ context.Context, senderID, channel string) (bool, error) {
 	return m.paired[senderID+":"+channel], nil
 }

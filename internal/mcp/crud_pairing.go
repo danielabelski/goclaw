@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"regexp"
 	"strings"
@@ -89,6 +90,7 @@ func registerPairingCRUDTools(srv *mcpserver.MCPServer, deps pairingCRUDDeps) {
 		mcpgo.WithDescription("Approve a pending pairing code."),
 		mcpgo.WithString("code", mcpgo.Required(), mcpgo.Description("Pairing code.")),
 		mcpgo.WithString("approved_by", mcpgo.Description("Approver identifier; defaults to \"operator\".")),
+		mcpgo.WithBoolean("permanent", mcpgo.Description("Pairing never expires; defaults to false (30-day TTL).")),
 	), handlePairingDeviceApprove(deps))
 
 	srv.AddTool(mcpgo.NewTool("goclaw_pairing_device_deny",
@@ -148,6 +150,12 @@ func handlePairingDeviceApprove(deps pairingCRUDDeps) mcpserver.ToolHandlerFunc 
 		paired, err := deps.pairing.ApprovePairing(ctx, code, approvedBy)
 		if err != nil {
 			return toolError("pairing.approve", err)
+		}
+		if req.GetBool("permanent", false) {
+			if err := deps.pairing.SetPairingPermanent(ctx, paired.SenderID, paired.Channel, true); err != nil {
+				return toolError("pairing.approve", fmt.Errorf("paired, but could not make it permanent: %w", err))
+			}
+			paired.ExpiresAt = nil
 		}
 		notifyPairingApproved(ctx, deps, paired)
 		return jsonToolResult(map[string]any{"paired": paired})

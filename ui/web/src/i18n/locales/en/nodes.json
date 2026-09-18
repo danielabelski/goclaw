@@ -12,15 +12,20 @@
     "senderId": "Sender ID",
     "paired": "Paired",
     "by": "By",
+    "expires": "Expires",
     "actions": "Actions"
   },
   "approve": "Approve",
   "deny": "Deny",
   "revoke": "Revoke",
+  "never": "Never",
+  "makePermanent": "Make permanent",
+  "makeExpiring": "Set expiry",
   "confirmApprove": {
     "title": "Approve Pairing",
     "description": "Approve pairing request from {{channel}}:{{senderId}} (code: {{code}})? This device will be able to interact with agents.",
-    "confirmLabel": "Approve"
+    "confirmLabel": "Approve",
+    "permanent": "Never expires (otherwise 30 days)"
   },
   "confirmDeny": {
     "title": "Deny Pairing",
@@ -31,5 +36,15 @@
     "title": "Revoke Device",
     "description": "Revoke pairing for {{channel}}:{{senderId}}? The device will need to re-pair.",
     "confirmLabel": "Revoke"
+  },
+  "confirmPermanent": {
+    "title": "Make Pairing Permanent",
+    "description": "Make the pairing for {{channel}}:{{senderId}} permanent? It will stay until revoked manually.",
+    "confirmLabel": "Make permanent"
+  },
+  "confirmExpiring": {
+    "title": "Set Pairing Expiry",
+    "description": "Return the pairing for {{channel}}:{{senderId}} to the standard term? It will expire in 30 days from now.",
+    "confirmLabel": "Set expiry"
   }
 }

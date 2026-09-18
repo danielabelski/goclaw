@@ -26,7 +26,8 @@ func isValidSenderID(id string) bool {
 // senderID identifies the paired entity (e.g., "group:XXXX" for group pairings).
 type PairingApproveCallback func(ctx context.Context, channel, chatID, senderID string)
 
-// PairingMethods handles device.pair.request, device.pair.approve, device.pair.list, device.pair.revoke.
+// PairingMethods handles device.pair.request, device.pair.approve, device.pair.list, device.pair.revoke,
+// device.pair.update.
 type PairingMethods struct {
 	service     store.PairingStore
 	msgBus      *bus.MessageBus
@@ -55,6 +56,7 @@ func (m *PairingMethods) Register(router *gateway.MethodRouter) {
 	router.Register(protocol.MethodPairingDeny, m.handleDeny)
 	router.Register(protocol.MethodPairingList, m.handleList)
 	router.Register(protocol.MethodPairingRevoke, m.handleRevoke)
+	router.Register(protocol.MethodPairingUpdate, m.handleUpdate)
 	router.Register(protocol.MethodBrowserPairingStatus, m.handleBrowserPairingStatus)
 }
 
@@ -100,6 +102,7 @@ func (m *PairingMethods) handleApprove(ctx context.Context, client *gateway.Clie
 	var params struct {
 		Code       string `json:"code"`
 		ApprovedBy string `json:"approvedBy"`
+		Permanent  bool   `json:"permanent"`
 	}
 	if req.Params != nil {
 		json.Unmarshal(req.Params, &params)
@@ -117,6 +120,14 @@ func (m *PairingMethods) handleApprove(ctx context.Context, client *gateway.Clie
 	if err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, err.Error()))
 		return
+	}
+	if params.Permanent {
+		if err := m.service.SetPairingPermanent(ctx, paired.SenderID, paired.Channel, true); err != nil {
+			// The pairing itself is in place with the default TTL; report the partial result.
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "paired, but could not make it permanent: "+err.Error()))
+			return
+		}
+		paired.ExpiresAt = nil
 	}
 
 	// Notify the user via channel (matching TS notifyPairingApproved).
@@ -217,6 +228,48 @@ func (m *PairingMethods) handleRevoke(ctx context.Context, client *gateway.Clien
 	emitAudit(m.msgBus, client, "pairing.revoked", "pairing", params.SenderID)
 	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"revoked": true,
+	}))
+}
+
+// handleUpdate switches an existing pairing between permanent (never expires)
+// and the default TTL counted from now.
+func (m *PairingMethods) handleUpdate(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	locale := store.LocaleFromContext(ctx)
+	var params struct {
+		SenderID  string `json:"senderId"`
+		Channel   string `json:"channel"`
+		Permanent *bool  `json:"permanent"`
+	}
+	if req.Params != nil {
+		json.Unmarshal(req.Params, &params)
+	}
+
+	if params.SenderID == "" || params.Channel == "" {
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgSenderChannelRequired)))
+		return
+	}
+	if !isValidSenderID(params.SenderID) {
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid sender_id format"))
+		return
+	}
+	if params.Permanent == nil {
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "permanent is required"))
+		return
+	}
+
+	if err := m.service.SetPairingPermanent(ctx, params.SenderID, params.Channel, *params.Permanent); err != nil {
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, err.Error()))
+		return
+	}
+
+	if m.broadcaster != nil {
+		m.broadcaster(*protocol.NewEvent(protocol.EventDevicePairRes, map[string]any{"action": "updated"}))
+	}
+
+	emitAudit(m.msgBus, client, "pairing.updated", "pairing", params.SenderID)
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
+		"updated":   true,
+		"permanent": *params.Permanent,
 	}))
 }
 

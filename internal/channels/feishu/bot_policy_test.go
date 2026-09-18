@@ -231,6 +231,10 @@ func (s *feishuPolicyPairingStore) RequestPairing(_ context.Context, senderID, c
 	return "PAIR1234", nil
 }
 
+func (s *feishuPolicyPairingStore) SetPairingPermanent(context.Context, string, string, bool) error {
+	return nil
+}
+
 func (s *feishuPolicyPairingStore) IsPaired(_ context.Context, senderID, channel string) (bool, error) {
 	return s.paired[senderID+"|"+channel], nil
 }
