@@ -173,7 +173,7 @@ func (s *PGPairingStore) SetPairingPermanent(ctx context.Context, senderID, chan
 	}
 	n, _ := result.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("paired device not found: %s/%s", channel, senderID)
+		return fmt.Errorf("%w: %s/%s", store.ErrPairedDeviceNotFound, channel, senderID)
 	}
 	return nil
 }

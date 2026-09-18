@@ -2,6 +2,7 @@ package pg
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -92,8 +93,8 @@ func TestPGPairing_SetPermanentDoesNotReviveExpired(t *testing.T) {
 		t.Fatalf("expire pairing: %v", err)
 	}
 
-	if err := s.SetPairingPermanent(ctx, "u1", "telegram", true); err == nil {
-		t.Fatal("SetPairingPermanent on expired pairing: want error, got nil")
+	if err := s.SetPairingPermanent(ctx, "u1", "telegram", true); !errors.Is(err, store.ErrPairedDeviceNotFound) {
+		t.Fatalf("SetPairingPermanent on expired pairing: want ErrPairedDeviceNotFound, got %v", err)
 	}
 	if ok, _ := s.IsPaired(ctx, "u1", "telegram"); ok {
 		t.Fatal("expired pairing was revived")

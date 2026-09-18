@@ -451,7 +451,7 @@ Browser pairing allows web UI clients to authenticate without full admin credent
 |-----------|--------|
 | Pairing code | 8-character alphanumeric code (A-Z, 2-9, excludes I/O/L for clarity), generated via `generatePairingCode()` in `internal/store/pg/pairing.go` |
 | Code TTL | 60 minutes; expired codes are auto-pruned from database |
-| Paired device TTL | 30 days; provides defense-in-depth expiry (paired devices auto-cleaned if unused) |
+| Paired device TTL | 30 days by default; provides defense-in-depth expiry (expired pairings are auto-cleaned). An admin can opt a single pairing out of expiry (`device.pair.approve` with `permanent`, or `device.pair.update`); such a pairing lasts until revoked |
 | Pending limit | Max 3 pending pairing requests per account; prevents spam/enumeration |
 | HTTP access | Paired browsers access HTTP APIs via `X-GoClaw-Sender-Id` header (requires `channel=browser`). Fail-closed: `IsPaired()` check blocks unpaired sessions. Logs failed HTTP pairing auth attempts for security monitoring. |
 | Approval flow | Requires WebSocket `device.pair.approve` method from authenticated admin session, triggered by `pairing.approve` command. Admin approval adds sender to `paired_devices` table with `paired_by` audit field. |

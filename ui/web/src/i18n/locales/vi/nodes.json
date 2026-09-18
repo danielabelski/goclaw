@@ -46,5 +46,9 @@
     "title": "Đặt thời hạn ghép nối",
     "description": "Đưa ghép nối {{channel}}:{{senderId}} về thời hạn mặc định? Nó sẽ hết hạn sau 30 ngày kể từ bây giờ.",
     "confirmLabel": "Đặt thời hạn"
+  },
+  "toast": {
+    "approveFailed": "Không thể phê duyệt ghép nối",
+    "updateFailed": "Không thể thay đổi thời hạn ghép nối"
   }
 }

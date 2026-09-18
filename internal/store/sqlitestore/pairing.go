@@ -166,7 +166,7 @@ func (s *SQLitePairingStore) SetPairingPermanent(ctx context.Context, senderID, 
 	}
 	n, _ := result.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("paired device not found: %s/%s", channel, senderID)
+		return fmt.Errorf("%w: %s/%s", store.ErrPairedDeviceNotFound, channel, senderID)
 	}
 	return nil
 }
@@ -249,6 +249,8 @@ func (s *SQLitePairingStore) ListPaired(ctx context.Context) []store.PairedDevic
 		}
 		d.PairedAt = parseTimeToMillis(pairedAtStr)
 		if expiresAtStr.Valid {
+			// A parse miss yields 0: the pairing still expires (SQL compares the
+			// raw value), only the date is unknown. Never report it as permanent.
 			ms := parseTimeToMillis(expiresAtStr.String)
 			d.ExpiresAt = &ms
 		}

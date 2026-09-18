@@ -46,5 +46,9 @@
     "title": "设置配对期限",
     "description": "将 {{channel}}:{{senderId}} 的配对恢复为默认期限？将从现在起 30 天后过期。",
     "confirmLabel": "设置期限"
+  },
+  "toast": {
+    "approveFailed": "无法批准配对",
+    "updateFailed": "无法更改配对期限"
   }
 }

@@ -4,6 +4,7 @@ package sqlitestore
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -102,8 +103,8 @@ func TestSQLitePairing_SetPermanentDoesNotReviveExpired(t *testing.T) {
 		t.Fatalf("expire pairing: %v", err)
 	}
 
-	if err := s.SetPairingPermanent(ctx, "u1", "telegram", true); err == nil {
-		t.Fatal("SetPairingPermanent on expired pairing: want error, got nil")
+	if err := s.SetPairingPermanent(ctx, "u1", "telegram", true); !errors.Is(err, store.ErrPairedDeviceNotFound) {
+		t.Fatalf("SetPairingPermanent on expired pairing: want ErrPairedDeviceNotFound, got %v", err)
 	}
 	if ok, _ := s.IsPaired(ctx, "u1", "telegram"); ok {
 		t.Fatal("expired pairing was revived")
@@ -113,7 +114,23 @@ func TestSQLitePairing_SetPermanentDoesNotReviveExpired(t *testing.T) {
 func TestSQLitePairing_SetPermanentUnknownDevice(t *testing.T) {
 	s, ctx := newTestSQLitePairingStore(t)
 
-	if err := s.SetPairingPermanent(ctx, "nobody", "telegram", true); err == nil {
-		t.Fatal("want error for unknown device, got nil")
+	if err := s.SetPairingPermanent(ctx, "nobody", "telegram", true); !errors.Is(err, store.ErrPairedDeviceNotFound) {
+		t.Fatalf("want ErrPairedDeviceNotFound for unknown device, got %v", err)
+	}
+}
+
+// An expiry the parser cannot read must not turn into "never expires".
+func TestSQLitePairing_UnreadableExpiryIsNotPermanent(t *testing.T) {
+	s, ctx := newTestSQLitePairingStore(t)
+	pairTestDevice(t, s, ctx, "u1")
+
+	if _, err := s.db.ExecContext(ctx, "UPDATE paired_devices SET expires_at = ? WHERE sender_id = ?",
+		"9999-garbage", "u1"); err != nil {
+		t.Fatalf("corrupt expiry: %v", err)
+	}
+
+	got := findPaired(s.ListPaired(ctx), "u1")
+	if got == nil || got.ExpiresAt == nil || *got.ExpiresAt != 0 {
+		t.Fatalf("want u1 with ExpiresAt=0 (unknown date), got %+v", got)
 	}
 }

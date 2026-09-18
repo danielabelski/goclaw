@@ -1,6 +1,13 @@
 package store
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrPairedDeviceNotFound is returned by SetPairingPermanent when there is no
+// live (non-expired) pairing for the sender/channel.
+var ErrPairedDeviceNotFound = errors.New("paired device not found")
 
 // PairingRequest represents a pending pairing code.
 type PairingRequestData struct {
@@ -15,7 +22,8 @@ type PairingRequestData struct {
 }
 
 // PairedDeviceData represents an approved pairing.
-// ExpiresAt is Unix ms; nil means the pairing never expires.
+// ExpiresAt is Unix ms; nil means the pairing never expires, 0 means it
+// expires but the stored date could not be read.
 type PairedDeviceData struct {
 	SenderID  string            `json:"sender_id" db:"sender_id"`
 	Channel   string            `json:"channel" db:"channel"`

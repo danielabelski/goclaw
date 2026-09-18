@@ -46,5 +46,9 @@
     "title": "Set Pairing Expiry",
     "description": "Return the pairing for {{channel}}:{{senderId}} to the standard term? It will expire in 30 days from now.",
     "confirmLabel": "Set expiry"
+  },
+  "toast": {
+    "approveFailed": "Could not approve pairing",
+    "updateFailed": "Could not change pairing expiry"
   }
 }

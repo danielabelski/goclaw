@@ -3,6 +3,7 @@ package methods
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"regexp"
 
@@ -258,7 +259,11 @@ func (m *PairingMethods) handleUpdate(ctx context.Context, client *gateway.Clien
 	}
 
 	if err := m.service.SetPairingPermanent(ctx, params.SenderID, params.Channel, *params.Permanent); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, err.Error()))
+		code := protocol.ErrInternal
+		if errors.Is(err, store.ErrPairedDeviceNotFound) {
+			code = protocol.ErrNotFound
+		}
+		client.SendResponse(protocol.NewErrorResponse(req.ID, code, err.Error()))
 		return
 	}
 

@@ -151,8 +151,10 @@ export function NodesPage() {
                               <Badge variant="secondary" className="gap-1">
                                 <InfinityIcon className="h-3 w-3" /> {t("never")}
                               </Badge>
-                            ) : (
+                            ) : d.expires_at > 0 ? (
                               formatDate(new Date(d.expires_at))
+                            ) : (
+                              "--"
                             )}
                           </td>
                           <td className="px-4 py-3 text-right whitespace-nowrap">
