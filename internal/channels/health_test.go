@@ -504,6 +504,9 @@ func TestMergeChannelHealthTracksFailureTimelineAndRecovery(t *testing.T) {
 	recovered.CheckedAt = recoveredAt
 	recovered = mergeChannelHealth(second, recovered)
 
+	if recovered.FailureKind != "" {
+		t.Fatalf("expected failure kind to clear after recovery, got %q", recovered.FailureKind)
+	}
 	if recovered.ConsecutiveFailures != 0 {
 		t.Fatalf("expected consecutive failures reset, got %d", recovered.ConsecutiveFailures)
 	}
