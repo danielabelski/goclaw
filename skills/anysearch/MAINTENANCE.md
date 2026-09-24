@@ -136,6 +136,10 @@ GoClaw's repository license is CC BY-NC 4.0 (plus a commercial license for produ
 
 **L1 open question (maintainer decision):** accept Apache-2.0 files under `skills/anysearch/` inside the CC BY-NC repository when items 1–3 are followed? Default shipping strategy is **L1** (vendored sources + retained license files). Fallback is **L2** if L1 is rejected. Ask this in the proposal issue; do not treat silence as approval.
 
+## Acceptance / bounty evidence
+
+See `ACCEPTANCE.md` in this directory for the filled AnySearch integration checklist (basic built-in + extension coverage + live smoke notes) used for claim `goclaw#001` review.
+
 ## Release checklist for a PR touching this skill
 
 - [ ] `SKILL.md` frontmatter parses; `name: anysearch`

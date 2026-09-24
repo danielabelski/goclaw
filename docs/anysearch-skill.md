@@ -118,5 +118,6 @@ Cache `get_sub_domains` results per domain for the session; do not call repeated
 ## More
 
 - Maintenance / upgrade guide: [`skills/anysearch/MAINTENANCE.md`](../skills/anysearch/MAINTENANCE.md)
+- Acceptance checklist (integration evidence): [`skills/anysearch/ACCEPTANCE.md`](../skills/anysearch/ACCEPTANCE.md)
 - Interface spec: `skills/anysearch/scripts/shared/doc_spec.md`
 - Upstream project: [anysearch-ai/anysearch-skill](https://github.com/anysearch-ai/anysearch-skill) (Apache-2.0, vendored `v3.1.1`)
