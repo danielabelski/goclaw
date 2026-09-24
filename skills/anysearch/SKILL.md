@@ -100,17 +100,15 @@ Create a key at https://anysearch.com/console/api-keys (or register via `POST ht
 
 ## Platform Detection / Runtime
 
-Priority: **Python ≥ 3.6 (`requests`) > Node.js ≥ 12 > PowerShell 5.1+ > Bash 3.2+ (`curl` + `jq`)**.
+Priority: **Python ≥ 3.6 (`requests`) > Node.js ≥ 12 (zero third-party deps)**.
 
-On GoClaw Docker images: `latest` ships Python 3; `full` ships Python + Node; `base` has neither — use PowerShell/Bash only if those runtimes and tools exist, otherwise install Python and `pip3 install requests`.
+This bundle ships **two** CLI ports on purpose (smaller review/maintenance surface): `anysearch_cli.py` and `anysearch_cli.js`. On GoClaw Docker images: `latest` ships Python 3; `full` ships Python + Node; `base` has neither — install Python + `requests`, or use a host that provides Node.js.
 
 ### Step 1 — Detect runtime
 
 ```bash
 python --version   # or python3 --version
-node --version     # optional fallback
-# PowerShell: powershell -ExecutionPolicy Bypass -File <skill_dir>/scripts/anysearch_cli.ps1 doc
-# Bash:        bash <skill_dir>/scripts/anysearch_cli.sh doc
+node --version     # zero-dep fallback
 ```
 
 ### Step 2 — Entry test

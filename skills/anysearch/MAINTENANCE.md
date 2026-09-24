@@ -41,11 +41,9 @@ skills/anysearch/
 ├── .env.example             # ANYSEARCH_API_KEY template (never commit .env)
 ├── requirements.txt         # Python CLI: requests>=2.20
 └── scripts/
-    ├── anysearch_cli.py     # Primary CLI (Python)
+    ├── anysearch_cli.py     # Primary CLI (Python + requests)
     ├── anysearch_cli.js     # Node.js CLI (no third-party deps)
-    ├── anysearch_cli.ps1    # PowerShell CLI
-    ├── anysearch_cli.sh     # Bash CLI (requires curl + jq)
-    ├── generate.py          # Regenerates shared blocks in the 4 CLIs
+    ├── generate.py          # Upstream regenerator (also writes sh/ps1; we only ship py/js)
     ├── test_cli.py          # Offline fixture tests
     └── shared/
         ├── constants.json   # API endpoint + vertical domain list
@@ -71,7 +69,7 @@ Auth header: `Authorization: Bearer <ANYSEARCH_API_KEY>` (optional). Anonymous w
 |---------------|--------|------|-----------------|
 | `latest` | yes | no | `anysearch_cli.py` + `pip3 install requests` |
 | `full` | yes | yes | Python or Node |
-| `base` | no | no | PS/Sh only if host provides them; otherwise document Python install |
+| `base` | no | no | Install Python + `requests`, or run on a host with Node.js |
 | Desktop / bare binary | host-dependent | host-dependent | Detect via `runtime.conf` |
 
 Python dependency is declared in `requirements.txt` (`requests>=2.20`). GoClaw's `dep_scanner` will surface `pip:requests` if missing; install with `pip3 install -r requirements.txt` (or `pip3 install requests`).
@@ -85,7 +83,7 @@ Python dependency is declared in `requirements.txt` (`requests>=2.20`). GoClaw's
 5. Run offline tests and a live smoke (see below)
 6. Open a PR to GoClaw `dev`
 
-`scripts/generate.py` (upstream) regenerates shared blocks across the four CLIs — run it only when intentionally changing `scripts/shared/`.
+GoClaw intentionally vendors **only** the Python and Node ports (review feedback on PR #1578: four parallel CLIs enlarge the maintenance/security surface). `scripts/generate.py` (upstream) can regenerate all four ports — run it only when changing `scripts/shared/`, then keep `anysearch_cli.py` / `anysearch_cli.js` and drop the Sh/PS outputs again.
 
 ## Testing
 

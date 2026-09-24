@@ -20,7 +20,7 @@ Anonymous access works (lower rate limits). An API key raises limits.
 | GoClaw image | Requirement |
 |--------------|-------------|
 | `latest` / `full` | Python 3 + `requests` (`pip3 install requests`) |
-| `base` | No Python/Node — install Python or use a host that provides PowerShell/Bash CLIs |
+| `base` | No Python/Node — install Python + `requests`, or use a host with Node.js |
 | Desktop / binary | Python 3 recommended |
 
 ## Configure an API key (optional)
@@ -79,7 +79,7 @@ $CMD batch_search --query "quantum computing" --max_results 3
 $CMD extract "https://example.com"
 ```
 
-All CLIs (Python / Node / PowerShell / Bash) expose the same commands. Prefer `runtime.conf`'s `Command` for routine calls.
+Both CLIs (Python and Node) expose the same commands. Prefer `runtime.conf`'s `Command` for routine calls. Node has no third-party dependencies.
 
 ## Decision rules for agents
 

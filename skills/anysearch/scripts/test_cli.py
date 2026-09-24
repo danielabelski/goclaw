@@ -197,12 +197,6 @@ def runtimes(selected):
     }
     if shutil.which("node"):
         found["node"] = ["node", str(SCRIPTS / "anysearch_cli.js")]
-    shell = shutil.which("bash")
-    if shell and shutil.which("jq") and shutil.which("curl"):
-        found["bash"] = [shell, str(SCRIPTS / "anysearch_cli.sh")]
-    powershell = shutil.which("pwsh") or shutil.which("powershell")
-    if powershell:
-        found["powershell"] = [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPTS / "anysearch_cli.ps1")]
     if selected:
         wanted = set(selected.split(","))
         found = {name: command for name, command in found.items() if name in wanted}
