@@ -13,7 +13,7 @@ flowchart LR
         DC["Discord"]
         SL["Slack"]
         FS["Feishu/Lark"]
-        ZL["Zalo OA"]
+        ZL["Zalo Bot"]
         ZLP["Zalo Personal"]
         WA["WhatsApp"]
     end
@@ -169,8 +169,8 @@ Every channel must implement the base interface:
 | `WebhookChannel` | Webhook HTTP handler mounting | Facebook, Feishu/Lark, Pancake |
 | `ReactionChannel` | Status reactions on messages | Telegram, Slack, Feishu |
 | `ActivityIndicatorChannel` | Ephemeral "agent is working" indicator | Bitrix24 |
-| `BlockReplyChannel` | Override gateway block_reply setting | Discord, Feishu/Lark, Pancake, Slack, Zalo OA, Zalo Personal |
-| `ChatBehaviorChannel` | Override gateway chat_behavior setting | Bitrix24, Discord, Feishu/Lark, Pancake, Slack, Telegram, WhatsApp, Zalo OA, Zalo Personal |
+| `BlockReplyChannel` | Override gateway block_reply setting | Discord, Feishu/Lark, Pancake, Slack, Zalo Bot, Zalo Personal |
+| `ChatBehaviorChannel` | Override gateway chat_behavior setting | Bitrix24, Discord, Feishu/Lark, Pancake, Slack, Telegram, WhatsApp, Zalo Bot, Zalo Personal |
 | `ReasoningDeliveryChannel` | Override channel-visible reasoning delivery | Telegram |
 
 `BaseChannel` provides a shared implementation that all channels embed: allowlist matching, `HandleMessage()`, `CheckPolicy()`, and user ID extraction.
@@ -257,7 +257,7 @@ flowchart TD
 
 ## 4. Channel Comparison
 
-| Feature | Telegram | Feishu/Lark | Discord | Slack | WhatsApp | Zalo OA | Zalo Personal | Bitrix24 |
+| Feature | Telegram | Feishu/Lark | Discord | Slack | WhatsApp | Zalo Bot | Zalo Personal | Bitrix24 |
 |---------|----------|-------------|---------|-------|----------|---------|---------------|----------|
 | Connection | Long polling | WS (default) / Webhook | Gateway events | Socket Mode | Direct protocol (in-process) | Long polling | Internal protocol | Long polling (REST) |
 | DM support | Yes | Yes | Yes | Yes | Yes | Yes (DM only) | Yes | Yes |
@@ -662,9 +662,9 @@ The WhatsApp channel connects directly to the WhatsApp network via the multi-dev
 
 ---
 
-## 10. Zalo OA
+## 10. Zalo Bot
 
-The Zalo OA (Official Account) channel connects to the Zalo OA Bot API.
+The Zalo Bot channel uses the official Zalo Bot API via long polling. It connects to a Zalo bot created with Zalo Bot Manager/Creator and does not require a Zalo Official Account.
 
 ### Key Behaviors
 
@@ -681,16 +681,16 @@ The Zalo OA (Official Account) channel connects to the Zalo OA Bot API.
 
 The Zalo Personal channel provides access to personal Zalo accounts using a reverse-engineered protocol. This is an unofficial integration.
 
-### Key Differences from Zalo OA
+### Key Differences from Zalo Bot
 
-| Aspect | Zalo OA | Zalo Personal |
+| Aspect | Zalo Bot | Zalo Personal |
 |--------|---------|---------------|
 | Protocol | Official Bot API | Reverse-engineered (zcago, MIT) |
 | DM support | Yes | Yes |
 | Group support | No | Yes |
 | Default DM policy | `pairing` | `allowlist` (restrictive) |
 | Default group policy | N/A | `allowlist` (restrictive) |
-| Authentication | API credentials | Pre-loaded credentials or QR scan |
+| Authentication | Bot credentials | Pre-loaded credentials or QR scan |
 | Risk | None | Account may be locked/banned |
 
 ### Security Warning
