@@ -36,6 +36,10 @@ func (s whatsappInboundPairingStore) RevokePairing(context.Context, string, stri
 	return nil
 }
 
+func (s whatsappInboundPairingStore) SetPairingPermanent(context.Context, string, string, bool) error {
+	return nil
+}
+
 func (s whatsappInboundPairingStore) IsPaired(_ context.Context, senderID, channel string) (bool, error) {
 	return s.paired[senderID+"|"+channel], nil
 }

@@ -378,10 +378,11 @@ Get JSON schema for config form generation.
 | Method | Description | Auth |
 |--------|-------------|------|
 | `device.pair.request` | Request pairing (from device) | Unauthenticated |
-| `device.pair.approve` | Approve request (from admin) | Admin |
+| `device.pair.approve` | Approve request (from admin); optional `permanent: true` skips the 30-day TTL | Admin |
 | `device.pair.deny` | Deny request | Admin |
 | `device.pair.list` | List pending + paired devices | Admin |
 | `device.pair.revoke` | Revoke device | Admin |
+| `device.pair.update` | `{senderId, channel, permanent}` — `true` clears expiry, `false` restarts the 30-day TTL from now; an expired pairing is not revived | Admin |
 | `browser.pairing.status` | Poll pairing status | Unauthenticated |
 
 ### Pairing Flow
@@ -391,7 +392,7 @@ sequenceDiagram
     Device->>Gateway: device.pair.request {senderId, channel}
     Gateway-->>Device: {code: "A1B2C3D4"}
     Device->>Gateway: browser.pairing.status {sender_id} (poll)
-    Admin->>Gateway: device.pair.approve {code, approvedBy}
+    Admin->>Gateway: device.pair.approve {code, approvedBy, permanent?}
     Gateway-->>Device: {status: "approved"}
 ```
 
@@ -816,7 +817,7 @@ Methods are gated by role. The role is determined at `connect` time from the tok
 
 ### Admin-Only Methods
 
-`config.apply`, `config.patch`, `agents.create`, `agents.update`, `agents.delete`, `channels.toggle`, `device.pair.approve`, `device.pair.deny`, `device.pair.revoke`, `teams.*`, `api_keys.*`, `tenants.*`
+`config.apply`, `config.patch`, `agents.create`, `agents.update`, `agents.delete`, `channels.toggle`, `device.pair.approve`, `device.pair.deny`, `device.pair.revoke`, `device.pair.update`, `teams.*`, `api_keys.*`, `tenants.*`
 
 ### Write Methods (Operator+)
 

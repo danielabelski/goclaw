@@ -1,8 +1,10 @@
 import { useState, useMemo } from "react";
-import { Link as LinkIcon, RefreshCw, Check, X, Trash2 } from "lucide-react";
+import { Link as LinkIcon, RefreshCw, Check, X, Trash2, Infinity as InfinityIcon, Timer } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Switch } from "@/components/ui/switch";
+import { Label } from "@/components/ui/label";
 import { PageHeader } from "@/components/shared/page-header";
 import { EmptyState } from "@/components/shared/empty-state";
 import { TableSkeleton } from "@/components/shared/loading-skeleton";
@@ -20,7 +22,16 @@ import { formatUserLabel } from "@/lib/format-user-label";
 
 export function NodesPage() {
   const { t } = useTranslation("nodes");
-  const { pendingPairings, pairedDevices, loading, refresh, approvePairing, denyPairing, revokePairing } = useNodes();
+  const {
+    pendingPairings,
+    pairedDevices,
+    loading,
+    refresh,
+    approvePairing,
+    denyPairing,
+    revokePairing,
+    setPairingPermanent,
+  } = useNodes();
   const spinning = useMinLoading(loading);
   const senderIds = useMemo(() => [
     ...pendingPairings.map((p) => p.sender_id),
@@ -32,6 +43,8 @@ export function NodesPage() {
   const showSkeleton = useDeferredLoading(loading && isEmpty);
   const [revokeTarget, setRevokeTarget] = useState<PairedDevice | null>(null);
   const [approveTarget, setApproveTarget] = useState<PendingPairing | null>(null);
+  const [approvePermanent, setApprovePermanent] = useState(false);
+  const [expiryTarget, setExpiryTarget] = useState<PairedDevice | null>(null);
   const [denyTarget, setDenyTarget] = useState<PendingPairing | null>(null);
 
   return (
@@ -89,7 +102,10 @@ export function NodesPage() {
                         </Button>
                         <Button
                           size="sm"
-                          onClick={() => setApproveTarget(p)}
+                          onClick={() => {
+                            setApprovePermanent(false);
+                            setApproveTarget(p);
+                          }}
                           className="gap-1"
                         >
                           <Check className="h-3.5 w-3.5" /> {t("approve")}
@@ -115,6 +131,7 @@ export function NodesPage() {
                         <th className="px-4 py-3 text-left font-medium">{t("columns.senderId")}</th>
                         <th className="px-4 py-3 text-left font-medium">{t("columns.paired")}</th>
                         <th className="px-4 py-3 text-left font-medium">{t("columns.by")}</th>
+                        <th className="px-4 py-3 text-left font-medium">{t("columns.expires")}</th>
                         <th className="px-4 py-3 text-right font-medium">{t("columns.actions")}</th>
                       </tr>
                     </thead>
@@ -129,7 +146,34 @@ export function NodesPage() {
                             {formatDate(new Date(d.paired_at))}
                           </td>
                           <td className="px-4 py-3 text-muted-foreground">{d.paired_by ? formatUserLabel(d.paired_by, resolve) : "--"}</td>
-                          <td className="px-4 py-3 text-right">
+                          <td className="px-4 py-3 text-muted-foreground">
+                            {d.expires_at == null ? (
+                              <Badge variant="secondary" className="gap-1">
+                                <InfinityIcon className="h-3 w-3" /> {t("never")}
+                              </Badge>
+                            ) : d.expires_at > 0 ? (
+                              formatDate(new Date(d.expires_at))
+                            ) : (
+                              "--"
+                            )}
+                          </td>
+                          <td className="px-4 py-3 text-right whitespace-nowrap">
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => setExpiryTarget(d)}
+                              className="gap-1"
+                            >
+                              {d.expires_at == null ? (
+                                <>
+                                  <Timer className="h-3.5 w-3.5" /> {t("makeExpiring")}
+                                </>
+                              ) : (
+                                <>
+                                  <InfinityIcon className="h-3.5 w-3.5" /> {t("makePermanent")}
+                                </>
+                              )}
+                            </Button>
                             <Button
                               variant="ghost"
                               size="sm"
@@ -158,8 +202,32 @@ export function NodesPage() {
           description={t("confirmApprove.description", { channel: approveTarget.channel, senderId: approveTarget.sender_id, code: approveTarget.code })}
           confirmLabel={t("confirmApprove.confirmLabel")}
           onConfirm={async () => {
-            await approvePairing(approveTarget.code);
+            await approvePairing(approveTarget.code, approvePermanent);
             setApproveTarget(null);
+          }}
+        >
+          <div className="flex items-center gap-3">
+            <Switch id="approve-permanent" checked={approvePermanent} onCheckedChange={setApprovePermanent} />
+            <Label htmlFor="approve-permanent" className="font-normal">
+              {t("confirmApprove.permanent")}
+            </Label>
+          </div>
+        </ConfirmDialog>
+      )}
+
+      {expiryTarget && (
+        <ConfirmDialog
+          open
+          onOpenChange={() => setExpiryTarget(null)}
+          title={t(expiryTarget.expires_at == null ? "confirmExpiring.title" : "confirmPermanent.title")}
+          description={t(
+            expiryTarget.expires_at == null ? "confirmExpiring.description" : "confirmPermanent.description",
+            { channel: expiryTarget.channel, senderId: expiryTarget.sender_id },
+          )}
+          confirmLabel={t(expiryTarget.expires_at == null ? "confirmExpiring.confirmLabel" : "confirmPermanent.confirmLabel")}
+          onConfirm={async () => {
+            await setPairingPermanent(expiryTarget.sender_id, expiryTarget.channel, expiryTarget.expires_at != null);
+            setExpiryTarget(null);
           }}
         />
       )}

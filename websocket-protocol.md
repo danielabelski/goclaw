@@ -42,6 +42,7 @@ The first request must be a `connect` handshake. Authentication supports three p
 | `device.pair.approve` | Approve a pairing code |
 | `device.pair.list` | List pending and approved pairings |
 | `device.pair.revoke` | Revoke a pairing |
+| `device.pair.update` | Make a pairing permanent or restore the default TTL |
 
 ## Events (server push)
 

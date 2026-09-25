@@ -30,6 +30,10 @@ func (s *slackPolicyPairingStore) DenyPairing(context.Context, string) error { r
 
 func (s *slackPolicyPairingStore) RevokePairing(context.Context, string, string) error { return nil }
 
+func (s *slackPolicyPairingStore) SetPairingPermanent(context.Context, string, string, bool) error {
+	return nil
+}
+
 func (s *slackPolicyPairingStore) IsPaired(_ context.Context, senderID, channel string) (bool, error) {
 	if s.paired[senderID] == nil {
 		return false, nil

@@ -12,15 +12,20 @@
     "senderId": "Sender ID",
     "paired": "Đã ghép nối",
     "by": "Bởi",
+    "expires": "Hết hạn",
     "actions": "Thao tác"
   },
   "approve": "Phê duyệt",
   "deny": "Từ chối",
   "revoke": "Thu hồi",
+  "never": "Không bao giờ",
+  "makePermanent": "Đặt vĩnh viễn",
+  "makeExpiring": "Đặt thời hạn",
   "confirmApprove": {
     "title": "Phê duyệt ghép nối",
     "description": "Phê duyệt yêu cầu ghép nối từ {{channel}}:{{senderId}} (mã: {{code}})? Thiết bị này sẽ có thể tương tác với các agent.",
-    "confirmLabel": "Phê duyệt"
+    "confirmLabel": "Phê duyệt",
+    "permanent": "Không hết hạn (mặc định 30 ngày)"
   },
   "confirmDeny": {
     "title": "Từ chối ghép nối",
@@ -31,5 +36,19 @@
     "title": "Thu hồi thiết bị",
     "description": "Thu hồi ghép nối cho {{channel}}:{{senderId}}? Thiết bị sẽ cần ghép nối lại.",
     "confirmLabel": "Thu hồi"
+  },
+  "confirmPermanent": {
+    "title": "Ghép nối vĩnh viễn",
+    "description": "Đặt ghép nối {{channel}}:{{senderId}} thành vĩnh viễn? Nó sẽ tồn tại cho đến khi bị thu hồi thủ công.",
+    "confirmLabel": "Đặt vĩnh viễn"
+  },
+  "confirmExpiring": {
+    "title": "Đặt thời hạn ghép nối",
+    "description": "Đưa ghép nối {{channel}}:{{senderId}} về thời hạn mặc định? Nó sẽ hết hạn sau 30 ngày kể từ bây giờ.",
+    "confirmLabel": "Đặt thời hạn"
+  },
+  "toast": {
+    "approveFailed": "Không thể phê duyệt ghép nối",
+    "updateFailed": "Không thể thay đổi thời hạn ghép nối"
   }
 }

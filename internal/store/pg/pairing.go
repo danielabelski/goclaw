@@ -116,13 +116,15 @@ func (s *PGPairingStore) ApprovePairing(ctx context.Context, code, approvedBy st
 		json.Unmarshal(metaJSON, &meta)
 	}
 
+	expiresAtMs := expiresAt.UnixMilli()
 	return &store.PairedDeviceData{
-		SenderID: senderID,
-		Channel:  channel,
-		ChatID:   chatID,
-		PairedAt: now.UnixMilli(),
-		PairedBy: approvedBy,
-		Metadata: meta,
+		SenderID:  senderID,
+		Channel:   channel,
+		ChatID:    chatID,
+		PairedAt:  now.UnixMilli(),
+		PairedBy:  approvedBy,
+		ExpiresAt: &expiresAtMs,
+		Metadata:  meta,
 	}, nil
 }
 
@@ -148,6 +150,30 @@ func (s *PGPairingStore) RevokePairing(ctx context.Context, senderID, channel st
 	n, _ := result.RowsAffected()
 	if n == 0 {
 		return fmt.Errorf("paired device not found: %s/%s", channel, senderID)
+	}
+	return nil
+}
+
+// SetPairingPermanent clears (permanent=true) or restarts (permanent=false)
+// the expiry of a live pairing. An already expired pairing is not revived.
+func (s *PGPairingStore) SetPairingPermanent(ctx context.Context, senderID, channel string, permanent bool) error {
+	tid := tenantIDForInsert(ctx)
+	var expiresAt *time.Time
+	if !permanent {
+		t := time.Now().Add(pairedDeviceTTL)
+		expiresAt = &t
+	}
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE paired_devices SET expires_at = $1
+		 WHERE sender_id = $2 AND channel = $3 AND tenant_id = $4 AND (expires_at IS NULL OR expires_at > NOW())`,
+		expiresAt, senderID, channel, tid,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("%w: %s/%s", store.ErrPairedDeviceNotFound, channel, senderID)
 	}
 	return nil
 }
@@ -180,12 +206,13 @@ type pairingRequestRow struct {
 
 // pairedDeviceRow is an sqlx scan struct for paired_devices.
 type pairedDeviceRow struct {
-	SenderID string    `json:"sender_id" db:"sender_id"`
-	Channel  string    `json:"channel" db:"channel"`
-	ChatID   string    `json:"chat_id" db:"chat_id"`
-	PairedBy string    `json:"paired_by" db:"paired_by"`
-	PairedAt time.Time `json:"paired_at" db:"paired_at"`
-	Metadata []byte    `json:"metadata" db:"metadata"`
+	SenderID  string     `json:"sender_id" db:"sender_id"`
+	Channel   string     `json:"channel" db:"channel"`
+	ChatID    string     `json:"chat_id" db:"chat_id"`
+	PairedBy  string     `json:"paired_by" db:"paired_by"`
+	PairedAt  time.Time  `json:"paired_at" db:"paired_at"`
+	ExpiresAt *time.Time `json:"expires_at" db:"expires_at"`
+	Metadata  []byte     `json:"metadata" db:"metadata"`
 }
 
 func (s *PGPairingStore) ListPending(ctx context.Context) []store.PairingRequestData {
@@ -224,7 +251,7 @@ func (s *PGPairingStore) ListPaired(ctx context.Context) []store.PairedDeviceDat
 
 	var rows []pairedDeviceRow
 	err := pkgSqlxDB.SelectContext(ctx, &rows,
-		`SELECT sender_id, channel, chat_id, paired_by, paired_at, COALESCE(metadata, '{}') AS metadata
+		`SELECT sender_id, channel, chat_id, paired_by, paired_at, expires_at, COALESCE(metadata, '{}') AS metadata
 		 FROM paired_devices WHERE tenant_id = $1 ORDER BY paired_at DESC`, tid)
 	if err != nil {
 		return []store.PairedDeviceData{}
@@ -235,6 +262,10 @@ func (s *PGPairingStore) ListPaired(ctx context.Context) []store.PairedDeviceDat
 		result[i] = store.PairedDeviceData{
 			SenderID: r.SenderID, Channel: r.Channel, ChatID: r.ChatID,
 			PairedBy: r.PairedBy, PairedAt: r.PairedAt.UnixMilli(),
+		}
+		if r.ExpiresAt != nil {
+			ms := r.ExpiresAt.UnixMilli()
+			result[i].ExpiresAt = &ms
 		}
 		if len(r.Metadata) > 0 {
 			json.Unmarshal(r.Metadata, &result[i].Metadata)

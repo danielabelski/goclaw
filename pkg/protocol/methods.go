@@ -73,6 +73,7 @@ const (
 	MethodPairingDeny    = "device.pair.deny"
 	MethodPairingList    = "device.pair.list"
 	MethodPairingRevoke  = "device.pair.revoke"
+	MethodPairingUpdate  = "device.pair.update"
 
 	MethodBrowserPairingStatus = "browser.pairing.status"
 

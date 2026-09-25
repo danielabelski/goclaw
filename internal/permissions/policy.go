@@ -268,6 +268,7 @@ func isAdminMethod(method string) bool {
 		protocol.MethodPairingDeny,
 		protocol.MethodPairingList,
 		protocol.MethodPairingRevoke,
+		protocol.MethodPairingUpdate,
 
 		// Teams — create/delete/update/member management.
 		protocol.MethodTeamsCreate,

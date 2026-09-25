@@ -22,6 +22,10 @@ func newMockPairingStore() *mockPairingStore {
 	}
 }
 
+func (s *mockPairingStore) SetPairingPermanent(context.Context, string, string, bool) error {
+	return nil
+}
+
 func (m *mockPairingStore) IsPaired(ctx context.Context, senderID, channel string) (bool, error) {
 	if m.failIsPaired {
 		return false, errors.New("pairing service error")
