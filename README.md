@@ -231,6 +231,10 @@ When `GOCLAW_*_API_KEY` environment variables are set, the gateway auto-onboards
 > For custom builds (Tailscale, Redis): `docker build --build-arg ENABLE_TSNET=true ...`
 > See the [Deployment Guide](https://docs.goclaw.sh/#deploy-docker-compose) for details.
 
+## Easypanel
+
+[Easypanel](https://easypanel.io) is a self-hosted Docker deployment platform, and GoClaw has a one-click deployment template there: https://easypanel.io/templates/goclaw. It deploys the full stack (Postgres with pgvector, the GoClaw backend, headless Chrome for browser automation, and the web UI) - you'll still need to set your `GOCLAW_*_API_KEY` after deploying.
+
 ## Updating
 
 ### Docker
