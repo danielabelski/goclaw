@@ -1,0 +1,4 @@
+# Dependency for the Python CLI (scripts/anysearch_cli.py).
+# The Node.js CLI requires nothing from this file (zero third-party deps).
+#   pip install -r requirements.txt
+requests>=2.20

@@ -1,0 +1,4 @@
+upstream_repo: anysearch-ai/anysearch-skill
+upstream_tag: v3.1.1
+vendored_at: 2026-09-24
+license: Apache-2.0
