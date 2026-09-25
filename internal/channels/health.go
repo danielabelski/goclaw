@@ -304,6 +304,7 @@ func mergeChannelHealth(previous, snapshot ChannelHealth) ChannelHealth {
 		}
 		snapshot.ConsecutiveFailures = 0
 		snapshot.FirstFailedAt = time.Time{}
+		snapshot.FailureKind = ""
 		if snapshot.LastFailedAt.IsZero() {
 			snapshot.LastFailedAt = previous.LastFailedAt
 		}
