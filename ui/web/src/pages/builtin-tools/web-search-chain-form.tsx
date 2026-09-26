@@ -25,7 +25,7 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 
-type ProviderKey = "exa" | "tavily" | "brave" | "parallel" | "duckduckgo";
+type ProviderKey = "exa" | "tavily" | "brave" | "parallel" | "serply" | "duckduckgo";
 
 interface ProviderEntry {
   id: string;
@@ -44,15 +44,16 @@ interface Props {
   onCancel: () => void;
 }
 
-const SORTABLE_PROVIDERS: ProviderKey[] = ["exa", "tavily", "brave", "parallel"];
+const SORTABLE_PROVIDERS: ProviderKey[] = ["exa", "tavily", "brave", "parallel", "serply"];
 const LOCKED_PROVIDER: ProviderKey = "duckduckgo";
-const DEFAULT_ORDER: ProviderKey[] = ["exa", "tavily", "brave", "parallel"];
+const DEFAULT_ORDER: ProviderKey[] = ["exa", "tavily", "brave", "parallel", "serply"];
 
 const RAIL_COLOR: Record<ProviderKey, string> = {
   exa: "bg-blue-600",
   tavily: "bg-cyan-500",
   brave: "bg-orange-500",
   parallel: "bg-violet-500",
+  serply: "bg-emerald-500",
   duckduckgo: "bg-slate-500",
 };
 
@@ -62,9 +63,12 @@ function parseInitialEntries(settings: Record<string, unknown>): ProviderEntry[]
         SORTABLE_PROVIDERS.includes(p as ProviderKey),
       )
     : DEFAULT_ORDER;
-  const rawOrder: ProviderKey[] = savedOrder.includes("parallel")
-    ? savedOrder
-    : [...savedOrder, "parallel"];
+  // Append providers added after this tenant last saved an order, so a stored
+  // provider_order never hides a newer entry from the form.
+  const rawOrder: ProviderKey[] = [
+    ...savedOrder,
+    ...SORTABLE_PROVIDERS.filter((p) => !savedOrder.includes(p)),
+  ];
 
   return rawOrder.map((name) => {
     const cfg = (settings[name] ?? {}) as Record<string, unknown>;
@@ -183,7 +187,13 @@ function SortableProviderCard({ entry, index, secretsSet, onUpdate }: SortableCa
   );
 }
 
-function LockedDuckDuckGoCard({ settings }: { settings: Record<string, unknown> }) {
+function LockedDuckDuckGoCard({
+  settings,
+  index,
+}: {
+  settings: Record<string, unknown>;
+  index: number;
+}) {
   const { t } = useTranslation("tools");
   const cfg = (settings[LOCKED_PROVIDER] ?? {}) as Record<string, unknown>;
   const enabled = Boolean(cfg.enabled ?? true);
@@ -194,7 +204,7 @@ function LockedDuckDuckGoCard({ settings }: { settings: Record<string, unknown> 
       <div className="flex-1 px-3 py-3">
         <div className="flex items-center gap-2">
           <Lock className="size-4 text-muted-foreground shrink-0" />
-          <span className="text-xs text-muted-foreground font-mono shrink-0">#5</span>
+          <span className="text-xs text-muted-foreground font-mono shrink-0">#{index + 1}</span>
           <Switch size="sm" checked disabled />
           <span className="text-sm font-medium flex-1">
             {t("builtin.searchChain.providers.duckduckgo")}
@@ -277,7 +287,7 @@ export function WebSearchChainForm({ initialSettings, secretsSet, onSave, onCanc
             ))}
           </SortableContext>
         </DndContext>
-        <LockedDuckDuckGoCard settings={initialSettings} />
+        <LockedDuckDuckGoCard settings={initialSettings} index={entries.length} />
       </div>
 
       <DialogFooter>

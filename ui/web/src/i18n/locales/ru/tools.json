@@ -166,6 +166,7 @@
         "tavily": "Tavily",
         "brave": "Brave Search",
         "parallel": "Parallel",
+        "serply": "Serply",
         "duckduckgo": "DuckDuckGo"
       },
       "apiKey": "Ключ API",

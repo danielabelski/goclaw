@@ -23,6 +23,7 @@ const (
 	braveSearchEndpoint  = "https://api.search.brave.com/res/v1/web/search"
 	exaSearchEndpoint    = "https://api.exa.ai/search"
 	tavilySearchEndpoint = "https://api.tavily.com/search"
+	serplySearchEndpoint = "https://api.serply.io/v1/search"
 	webSearchUserAgent   = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
@@ -31,6 +32,7 @@ const (
 	searchProviderTavily     = "tavily"
 	searchProviderBrave      = "brave"
 	searchProviderParallel   = "parallel"
+	searchProviderSerply     = "serply"
 	searchProviderDuckDuckGo = "duckduckgo"
 )
 
@@ -38,6 +40,7 @@ var defaultSearchProviderOrder = []string{
 	searchProviderExa,
 	searchProviderTavily,
 	searchProviderBrave,
+	searchProviderSerply,
 	searchProviderDuckDuckGo,
 }
 
@@ -166,7 +169,7 @@ func (t *WebSearchTool) Parameters() map[string]any {
 			},
 			"provider": map[string]any{
 				"type":        "string",
-				"description": "Optional: force a specific provider (e.g., 'tavily', 'exa', 'brave', 'parallel', 'duckduckgo'). When omitted, the tenant's configured provider chain is used (first-success-wins). Use this to force cross-engine corroboration — call once with each provider and compare results.",
+				"description": "Optional: force a specific provider (e.g., 'tavily', 'exa', 'brave', 'parallel', 'serply', 'duckduckgo'). When omitted, the tenant's configured provider chain is used (first-success-wins). Use this to force cross-engine corroboration — call once with each provider and compare results.",
 			},
 		},
 		"required": []string{"query"},

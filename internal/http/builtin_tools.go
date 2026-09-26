@@ -40,6 +40,7 @@ var toolSecretKeys = map[string]map[string]string{
 		"exa.api_key":    "tools.web.exa.api_key",
 		"tavily.api_key": "tools.web.tavily.api_key",
 		"brave.api_key":  "tools.web.brave.api_key",
+		"serply.api_key": "tools.web.serply.api_key",
 	},
 }
 

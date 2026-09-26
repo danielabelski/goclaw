@@ -21,6 +21,8 @@ func buildProviderByName(name, apiKey string, maxResults int) SearchProvider {
 		return newBraveSearchProvider(apiKey, maxResults)
 	case searchProviderParallel:
 		return newParallelSearchProvider(maxResults)
+	case searchProviderSerply:
+		return newSerplySearchProvider(apiKey, maxResults)
 	case searchProviderDuckDuckGo:
 		return newDuckDuckGoSearchProvider(maxResults)
 	default:
